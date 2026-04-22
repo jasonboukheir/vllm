@@ -48,7 +48,7 @@ def test_auto_round(vllm_runner, model):
 
 
 # ---------------------------------------------------------------------------
-# Unit tests (formerly test_inc.py)
+# Unit tests for INCConfig and related classes
 # ---------------------------------------------------------------------------
 
 

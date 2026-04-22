@@ -58,25 +58,29 @@ class INCWNA16LinearScheme(INCLinearScheme):
                 GPTQMarlinLinearMethod,
             )
 
-            return GPTQMarlinLinearMethod(GPTQMarlinConfig(
-                weight_bits=self.layer_config.bits,
-                group_size=self.layer_config.group_size,
-                desc_act=False,
-                is_sym=self.layer_config.sym,
-                lm_head_quantized=False,
-                dynamic={},
-                full_config={},
-            ))
+            return GPTQMarlinLinearMethod(
+                GPTQMarlinConfig(
+                    weight_bits=self.layer_config.bits,
+                    group_size=self.layer_config.group_size,
+                    desc_act=False,
+                    is_sym=self.layer_config.sym,
+                    lm_head_quantized=False,
+                    dynamic={},
+                    full_config={},
+                )
+            )
 
         from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
 
-        return GPTQLinearMethod(GPTQConfig(
-            weight_bits=self.layer_config.bits,
-            group_size=self.layer_config.group_size,
-            desc_act=False,
-            lm_head_quantized=False,
-            dynamic={},
-        ))
+        return GPTQLinearMethod(
+            GPTQConfig(
+                weight_bits=self.layer_config.bits,
+                group_size=self.layer_config.group_size,
+                desc_act=False,
+                lm_head_quantized=False,
+                dynamic={},
+            )
+        )
 
     def _build_awq_method(self):
         awq_type_map = {
@@ -98,22 +102,26 @@ class INCWNA16LinearScheme(INCLinearScheme):
                 AWQMarlinLinearMethod,
             )
 
-            return AWQMarlinLinearMethod(AWQMarlinConfig(
-                weight_bits=self.layer_config.bits,
-                group_size=self.layer_config.group_size,
-                zero_point=not self.layer_config.sym,
-                lm_head_quantized=False,
-                modules_to_not_convert=[],
-                full_config={},
-            ))
+            return AWQMarlinLinearMethod(
+                AWQMarlinConfig(
+                    weight_bits=self.layer_config.bits,
+                    group_size=self.layer_config.group_size,
+                    zero_point=not self.layer_config.sym,
+                    lm_head_quantized=False,
+                    modules_to_not_convert=[],
+                    full_config={},
+                )
+            )
 
         from vllm.model_executor.layers.quantization.awq import AWQLinearMethod
 
-        return AWQLinearMethod(AWQConfig(
-            weight_bits=self.layer_config.bits,
-            group_size=self.layer_config.group_size,
-            zero_point=not self.layer_config.sym,
-        ))
+        return AWQLinearMethod(
+            AWQConfig(
+                weight_bits=self.layer_config.bits,
+                group_size=self.layer_config.group_size,
+                zero_point=not self.layer_config.sym,
+            )
+        )
 
     def create_weights(
         self,

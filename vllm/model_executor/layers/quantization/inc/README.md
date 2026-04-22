@@ -2,7 +2,7 @@
 
 ## High-Level Architecture and Call Flow
 
-```
+```bash
                         ┌─────────────────────────────┐
                         │      HuggingFace Config      │
                         │   (quantization_config.json)  │
@@ -46,7 +46,7 @@
 
 ### Dispatch flow (same 3 steps for all layer types)
 
-```
+```bash
 resolve config → resolve scheme → scheme.get_xxx_method()
 ```
 
@@ -55,10 +55,9 @@ resolve config → resolve scheme → scheme.get_xxx_method()
 - **Linear**: `INCLinearScheme` defines a different lifecycle API (`create_weights`/`process_weights_after_loading`/`apply_weights`) than `LinearMethodBase`, so `INCLinearMethod` bridges them.
 - **MoE**: Concrete methods already implement `FusedMoEMethodBase` directly. Wrapping would break class identity checks in vLLM's MoE layer.
 
-
 ## Package layout
 
-```
+```bash
 inc/
 ├── inc.py              # INCConfig (entry point + dispatch)
 ├── resolver.py         # INCLayerConfig + INCConfigResolver
