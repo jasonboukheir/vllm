@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
     from vllm.model_executor.layers.fused_moe.layer import FusedMoEMethodBase
     from vllm.model_executor.layers.linear import LinearMethodBase
-    from vllm.model_executor.layers.quantization import QuantizeMethodBase
+    from vllm.model_executor.layers.quantization import QuantizationMethods
 
     from ..inc import INCConfig
     from ..resolver import INCLayerConfig
@@ -62,7 +62,7 @@ class INCScheme(ABC):
         layer: "torch.nn.Module",
         prefix: str,
         layer_config: "INCLayerConfig",
-    ) -> "QuantizeMethodBase":
+    ) -> "QuantizationMethods":
         """Optional. Override if this scheme supports KV cache quantization.
         Default raises NotImplementedError."""
         raise NotImplementedError(
