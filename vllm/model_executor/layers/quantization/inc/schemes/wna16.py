@@ -61,6 +61,9 @@ class INCWna16Scheme(INCScheme):
         layer_config: "INCLayerConfig",
     ):
         del config, prefix
+        # XPU and CPU do not support MoE quantization yet
+        if current_platform.is_xpu() or current_platform.is_cpu():
+            return None
         if layer_config.is_gptq:
             return _resolve_gptq_moe(layer, layer_config)
         if layer_config.is_awq:

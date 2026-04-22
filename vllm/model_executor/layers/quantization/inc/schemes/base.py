@@ -48,7 +48,7 @@ class INCScheme(ABC):
         layer: "torch.nn.Module",
         prefix: str,
         layer_config: "INCLayerConfig",
-    ) -> "FusedMoEMethodBase":
+    ) -> "FusedMoEMethodBase | None":
         """Optional. Override if this scheme supports MoE.
         Default raises NotImplementedError."""
         raise NotImplementedError(

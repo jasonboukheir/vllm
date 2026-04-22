@@ -130,7 +130,10 @@ class INCConfigResolver:
                 self._config.sym if quantized else True,
             )
 
-        if self._config.extra_config and self._lookup_extra_config(layer_name) is not None:
+        if (
+            self._config.extra_config
+            and self._lookup_extra_config(layer_name) is not None
+        ):
             return get_config(layer_name)
 
         quantized = not isinstance(layer, ParallelLMHead)

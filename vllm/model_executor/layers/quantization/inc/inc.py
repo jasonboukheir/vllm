@@ -151,6 +151,15 @@ class INCConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return None
 
+        logger.debug(
+            "[%s] Type: %s, Bits: %s, Group Size: %s, Sym: %s",
+            prefix,
+            layer.__class__.__name__,
+            layer_config.bits,
+            layer_config.group_size,
+            layer_config.sym,
+        )
+
         scheme = resolve_scheme(layer_config)
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             return scheme.get_linear_method(self, layer, prefix, layer_config)
