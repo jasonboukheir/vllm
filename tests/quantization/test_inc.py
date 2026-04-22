@@ -70,6 +70,33 @@ def test_inc_resolver_exact_match() -> None:
     assert layer_config.quantized is True
 
 
+def test_inc_resolver_model_prefix_fallback() -> None:
+    """extra_config keys may use model. prefix while vLLM passes bare names."""
+    config = make_config(
+        extra_config={
+            "model.layers.0.self_attn.q_proj": {
+                "bits": 8,
+                "group_size": 64,
+                "sym": False,
+            },
+            "model.layers.1.mlp.gate_proj": {
+                "bits": 16,
+            },
+        }
+    )
+
+    # Bare name resolves via model. prefix fallback
+    lc = config.resolver.resolve(DummyLayer(), "layers.0.self_attn.q_proj")
+    assert lc.bits == 8
+    assert lc.group_size == 64
+    assert lc.quantized is True
+
+    # bits=16 → unquantized
+    lc2 = config.resolver.resolve(DummyLayer(), "layers.1.mlp.gate_proj")
+    assert lc2.bits == 16
+    assert lc2.quantized is False
+
+
 def test_inc_resolver_regex_match() -> None:
     config = make_config(
         extra_config={
