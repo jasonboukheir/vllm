@@ -11,6 +11,7 @@ Run `pytest tests/quantization/test_auto_round.py`.
 import pytest
 
 from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
@@ -296,14 +297,15 @@ def test_inc_get_quant_method_unquantized_linear_returns_unquantized() -> None:
 
 
 def test_inc_get_quant_method_unquantized_moe_returns_unquantized() -> None:
-    """Original behavior: early-exit returns UnquantizedLinearMethod for any
-    layer type when extra_config has bits >= 16."""
+    """Early-exit returns UnquantizedFusedMoEMethod for FusedMoE layers
+    when extra_config has bits >= 16."""
     config = make_config(extra_config={"layer": {"bits": 16}})
     layer = object.__new__(FusedMoE)
+    layer.moe_config = None  # UnquantizedFusedMoEMethod accepts moe_config
 
     method = config.get_quant_method(layer, "layer")
 
-    assert isinstance(method, UnquantizedLinearMethod)
+    assert isinstance(method, UnquantizedFusedMoEMethod)
 
 
 def test_inc_get_quant_method_linear_uses_resolved_scheme(monkeypatch) -> None:
