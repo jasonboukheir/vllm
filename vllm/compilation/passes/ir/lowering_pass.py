@@ -10,7 +10,6 @@ from torch._inductor.pattern_matcher import (
     PatternMatcherPass,
     register_graph_pattern,
 )
-from torch._ops import OpOverload, OpOverloadPacket
 
 from vllm.config import VllmConfig
 from vllm.ir.op import IrOp
@@ -111,7 +110,7 @@ class VllmIRLoweringPass(VllmInductorPass):
 
         if failed_nodes or failed_ops:
             logger.warning("Failed to lower vLLM IR ops: %s", ",".join(failed_ops))
-            logger.warning("Full node list: %s", ",".join(failed_nodes))
+            logger.warning("Full node list: %s", ",".join(str(n) for n in failed_nodes))
 
     def uuid(self) -> str:
         """
