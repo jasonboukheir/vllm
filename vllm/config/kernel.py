@@ -145,8 +145,8 @@ class KernelConfig:
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels (BF16 input)
     - "flashinfer_trtllm_afp8": Use FlashInfer with TRTLLM-GEN kernels (FP8 input)
-    - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels (BF16 output)
-    - "flashinfer_cutlass_afp8": Use FlashInfer with CUTLASS kernels (FP8 output)
+    - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels (BF16 input)
+    - "flashinfer_cutlass_afp8": Use FlashInfer with CUTLASS kernels (FP8 input)
     - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)
     - "marlin": Use Marlin kernels (weight-only quantization)
     - "aiter": Use AMD AITer kernels (ROCm only)
