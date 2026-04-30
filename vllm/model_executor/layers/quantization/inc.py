@@ -516,10 +516,24 @@ class INCConfig(QuantizationConfig):
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> "QuantizationMethods | None":
-        """Override the `auto-round` method to `inc`."""
-        is_auto_round_format = hf_quant_cfg.get("quant_method", None) == "auto-round"
-        if is_auto_round_format:
+        """Override the `auto-round` method to `inc`.
+
+        On XPU, also claim vanilla GPTQ sym int4 desc_act=false checkpoints:
+        gptq_marlin / awq_marlin gate on CUDA/CPU, and the moe_wna16 fallback
+        runs Triton kernels that don't execute on Intel GPUs. INC routes the
+        linear path through INCXPULinearMethod (oneDNN int4_gemm_w4a16) and
+        the MoE path through INCXPUMoEMethod (vllm-xpu-kernels
+        xpu_fused_moe(is_int4=True)) — the only working W4A16 path on XPU.
+        """
+        quant_method = hf_quant_cfg.get("quant_method", None)
+        if quant_method == "auto-round":
             return cls.get_name()
+        if current_platform.is_xpu() and quant_method == "gptq":
+            bits = hf_quant_cfg.get("bits")
+            sym = hf_quant_cfg.get("sym")
+            desc_act = hf_quant_cfg.get("desc_act", False)
+            if bits == 4 and sym is True and not desc_act:
+                return cls.get_name()
         return None
 
 
