@@ -175,6 +175,24 @@ class TurboQuantConfig:
         return [str(i) for i in indices]
 
     @staticmethod
+    def get_boundary_skip_layers_from_indices(
+        attention_layer_indices: list[int], n: int = 2
+    ) -> list[str]:
+        """Boundary protection for hybrid (attention + Mamba/linear-attention) models.
+
+        Picks first-N and last-N from the *attention layer indices* — Mamba
+        / linear-attention layers don't carry a TQ-quantizable KV cache so
+        applying boundary protection by absolute layer index is meaningless
+        for them.
+        """
+        if n <= 0 or not attention_layer_indices:
+            return []
+        n = min(n, len(attention_layer_indices) // 2)
+        first = attention_layer_indices[:n]
+        last = attention_layer_indices[-n:]
+        return [str(i) for i in sorted(set(first + last))]
+
+    @staticmethod
     def from_cache_dtype(cache_dtype: str, head_dim: int) -> "TurboQuantConfig":
         """Create config from a named preset.
 
