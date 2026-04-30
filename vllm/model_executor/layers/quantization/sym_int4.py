@@ -161,6 +161,8 @@ class SymInt4Config(QuantizationConfig):
 
 
 class SymInt4LinearMethod(LinearMethodBase):
+    quantizes_on_cpu: bool = True
+
     def __init__(self, quant_config: SymInt4Config):
         self.quant_config = quant_config
         # Ensure lib is loaded on init
@@ -268,6 +270,8 @@ class SymInt4LinearMethod(LinearMethodBase):
 
 
 class XPUGPTQInt4LinearMoEMethod(FusedMoEMethodBase):
+    quantizes_on_cpu: bool = True
+
     def __init__(
         self,
         quant_config: SymInt4Config,

@@ -96,18 +96,41 @@ def initialize_model(
     return model
 
 
+# Module-name substrings whose quant_method.process_weights_after_loading
+# should be skipped (vision/multimodal towers loaded as fp16). Layers whose
+# names contain any _ALWAYS_QUANT_NAME_SUBSTRINGS substring override the
+# skip — needed for vision_experts in MoE+vision models like ERNIE.
+_SKIP_QUANT_NAME_SUBSTRINGS: tuple[str, ...] = (
+    "visual",
+    "vision",
+    "vpm",
+    "resampler",
+)
+_ALWAYS_QUANT_NAME_SUBSTRINGS: tuple[str, ...] = ("vision_experts",)
+
+
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
-    for _, module in model.named_modules():
+    for name, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
+            if any(s in name for s in _SKIP_QUANT_NAME_SUBSTRINGS) and not any(
+                s in name for s in _ALWAYS_QUANT_NAME_SUBSTRINGS
+            ):
+                continue
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the
             # case where cpu offloading is used, where we will move the
             # parameters onto device for processing and back off after.
-            with device_loading_context(module, target_device):
+            # Some methods (e.g. sym_int4) pack weights on CPU and move
+            # only the quantized result to the device — for them we
+            # skip the pre-move so the quant routine sees CPU tensors.
+            quantizes_on_cpu = getattr(quant_method, "quantizes_on_cpu", False)
+            with device_loading_context(
+                module, target_device, quantization_on_cpu=quantizes_on_cpu
+            ):
                 quant_method.process_weights_after_loading(module)
 
     # Initialize post-load attention weights for Attention, MLA, and MM encoder.
@@ -128,7 +151,11 @@ def process_weights_after_loading(
 
 
 @contextmanager
-def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+def device_loading_context(
+    module: torch.nn.Module,
+    target_device: torch.device,
+    quantization_on_cpu: bool = False,
+):
     if target_device.type == "cpu":
         # If target is CPU, no need to move anything
         yield module
@@ -137,14 +164,18 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
     original_device_states: dict[str, torch.device] = {}
     uva_offloaded_parameters: list[str] = []
 
-    # Store original device states and move parameters to GPU if they're on CPU
-    for name, p in module.named_parameters():
-        if p.device.type == "cpu":
-            original_device_states[name] = p.device
-            p.data = p.data.to(target_device)
-        if getattr(p, "_vllm_is_uva_offloaded", False):
-            uva_offloaded_parameters.append(name)
-        # Parameters already on target device are not touched
+    # Store original device states and move parameters to GPU if they're on
+    # CPU. Methods that pack on CPU and only move the quantized result to
+    # the device (sym_int4 / IPEX woq) ask us to skip this pre-move so the
+    # quant routine sees CPU tensors.
+    if not quantization_on_cpu:
+        for name, p in module.named_parameters():
+            if p.device.type == "cpu":
+                original_device_states[name] = p.device
+                p.data = p.data.to(target_device)
+            if getattr(p, "_vllm_is_uva_offloaded", False):
+                uva_offloaded_parameters.append(name)
+            # Parameters already on target device are not touched
 
     try:
         yield module
