@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8DynamicTensorSym,
     kFp8StaticTensorSym,
+    kInt4Static,
     kMxfp4Static,
 )
 from vllm.platforms import current_platform
@@ -46,6 +47,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             num_dispatchers,
         )
         self.is_fp8 = False
+        self.is_int4 = False
         self.is_mxfp4 = False
 
     @property
@@ -147,6 +149,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             ep_size=self.moe_config.ep_size,
             output=output,
             is_fp8=self.is_fp8,
+            is_int4=self.is_int4,
             is_mxfp4=self.is_mxfp4,
         )
 
@@ -166,6 +169,42 @@ class XPUExpertsFp8(XPUExperts):
             num_dispatchers,
         )
         self.is_fp8 = True
+
+
+class XPUExpertsWNA16(XPUExperts):
+    """W4A16 INT4-symmetric MoE backed by `xpu_fused_moe(is_int4=True)`.
+
+    Weight layout when `is_int4=True` (per `xpu_fused_moe` docstring):
+        w13: [num_experts, 2*inter_size, hidden_size]   contiguous int4-packed
+        w13_scales: [num_experts, 2*inter_size, hidden_size // group_size]
+        w2:  [num_experts, hidden_size, inter_size]     contiguous int4-packed
+        w2_scales:  [num_experts, hidden_size, inter_size // group_size]
+
+    Pairs with `INCXPULinearMethod` for the linear layers; together they
+    cover full-attn + MoE on Intel XPU end-to-end without IPEX.
+    """
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        max_num_tokens: int | None = None,
+        num_dispatchers: int | None = None,
+    ):
+        super().__init__(
+            moe_config,
+            quant_config,
+            max_num_tokens,
+            num_dispatchers,
+        )
+        self.is_int4 = True
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return (weight_key, activation_key) == (kInt4Static, None)
 
 
 class XPUExpertsMXFp4(XPUExperts):
