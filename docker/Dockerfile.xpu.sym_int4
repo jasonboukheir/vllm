@@ -2,18 +2,27 @@
 #
 # Layers two extra dependencies onto the existing vllm-xpu-tq build:
 #   - intel_extension_for_pytorch (IPEX) matching torch's major.minor
-#   - arctic-inference 0.1.1 (provides /usr/local/.../vllm_int4_for_multi_arc.so
-#     used by VLLM_QUANTIZE_Q40_LIB)
+#   - bigdl-core 2.4.0b2 (ships vllm_int4_for_multi_arc.so used by
+#     VLLM_QUANTIZE_Q40_LIB)
 #
 # Status (2026-04-30): runtime-blocked. vLLM upstream main pins
 # `torch == 2.11.0` in pyproject.toml. Latest public IPEX-XPU wheel for
-# Python 3.12 on Linux is intel_extension_for_pytorch-2.7.10+xpu, which
-# is built against torch 2.7.x. Installing IPEX 2.7.10+xpu on torch 2.11
-# fails on import (torch._C symbol mismatch). When Intel ships IPEX
-# 2.11+xpu, swap the version below and the build should complete.
+# Python 3.12 on Linux is intel_extension_for_pytorch-2.7.10+xpu, built
+# against torch 2.7.x. Installing 2.7.10 with --no-deps keeps torch 2.11
+# intact and the build completes, but `import intel_extension_for_pytorch`
+# bails with:
+#   "Intel® Extension for PyTorch* needs to work with PyTorch 2.7.*,
+#    but PyTorch 2.11.0+xpu is found."
+# IPEX hard-checks torch major.minor on import — no runtime workaround.
+# The other half of the runtime (bigdl-core's vllm_int4_for_multi_arc.so)
+# loads cleanly, so the GGML Q4_0 packing path is fine in isolation; the
+# IPEX inference path (IPEXWeightOnlyQuantizedLinear, GatedMLPMOE) is what
+# blocks.
 #
-# Until then, treat this Dockerfile as documentation of the recipe.
-# Building it today will fail at the IPEX install step.
+# When Intel ships intel_extension_for_pytorch-2.11.x+xpu, drop the
+# --no-deps and bump IPEX_VERSION; the build should produce a runnable
+# image. Until then, the Q4_0 lib loads but the full sym_int4 path can't
+# run on upstream main.
 #
 # Build (when IPEX 2.11+xpu exists):
 #   podman build --format=docker -f docker/Dockerfile.xpu.sym_int4 \
@@ -45,25 +54,30 @@ ENV IPEX_XPU_INDEX="https://pytorch-extension.intel.com/release-whl/stable/xpu/u
 # 2.11.10+xpu). For now this line is the build's expected failure point.
 ARG IPEX_VERSION="2.11.10+xpu"
 
+# --no-deps preserves torch 2.11 + base oneAPI 2025.3; without it,
+# IPEX 2.7's pinned oneMKL/umf get downgraded and libur_loader.so.0
+# loses LIBUR_LOADER_0.10, which then breaks `import torch` itself.
+# Once IPEX 2.11+xpu ships, drop --no-deps so transitive constraints
+# can resolve normally.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --extra-index-url "${IPEX_XPU_INDEX}" \
+    uv pip install --no-deps --extra-index-url "${IPEX_XPU_INDEX}" \
         "intel-extension-for-pytorch==${IPEX_VERSION}"
 
-# arctic-inference ships the GGML Q4_0 packing shared library that
-# sym_int4's _get_quant_lib() loads via VLLM_QUANTIZE_Q40_LIB.
+# bigdl-core ships vllm_int4_for_multi_arc.so (the GGML Q4_0 packing
+# library that sym_int4's _get_quant_lib() loads via
+# VLLM_QUANTIZE_Q40_LIB). 102 KB wheel, 15 KB .so. Public PyPI.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --no-deps "arctic-inference==0.1.1"
+    uv pip install --no-deps "bigdl-core==2.4.0b2"
 
 # Locate the .so installed by arctic-inference (path depends on Python
 # install layout). The lookup runs at build time and bakes the absolute
 # path into the image so VLLM_QUANTIZE_Q40_LIB can be set without
 # reading dist-packages at runtime.
 RUN mkdir -p /opt/lib && \
-    SO_PATH="$(python3 -c \"import sysconfig, glob, os; \
-    paths = glob.glob(os.path.join(sysconfig.get_paths()['purelib'], '**', \
-    'vllm_int4_for_multi_arc.so'), recursive=True); \
-    print(paths[0] if paths else '')\")" && \
-    test -n "$SO_PATH" && echo "Q40 lib at $SO_PATH" && \
+    set -e && \
+    SO_PATH=$(find /opt/venv /usr/local/lib /usr/lib -name 'vllm_int4_for_multi_arc.so' 2>/dev/null | head -1) && \
+    if [ -z "$SO_PATH" ]; then echo "vllm_int4_for_multi_arc.so not found in venv/system paths" >&2; exit 1; fi && \
+    echo "Q40 lib at $SO_PATH" && \
     ln -sf "$SO_PATH" /opt/lib/vllm_int4_for_multi_arc.so
 
 # Match llm-scaler's defaults — the patched vllm reads these.
