@@ -1701,25 +1701,50 @@ class EngineArgs:
         # These layers are most sensitive to quantization error.
         # Users can add extra layers via --kv-cache-dtype-skip-layers.
         if resolved_cache_dtype.startswith("turboquant_"):
-            if model_config.is_hybrid:
-                raise NotImplementedError(
-                    "TurboQuant KV cache is not supported for hybrid "
-                    "(attention + Mamba) models. Boundary layer protection "
-                    "requires uniform attention layers."
-                )
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
 
-            num_layers = model_config.hf_text_config.num_hidden_layers
-            boundary = TurboQuantConfig.get_boundary_skip_layers(num_layers)
+            if model_config.is_hybrid:
+                layer_types = getattr(
+                    model_config.hf_text_config, "layer_types", None
+                )
+                if layer_types is None:
+                    raise NotImplementedError(
+                        "TurboQuant on hybrid model requires "
+                        "hf_config.layer_types; %s does not expose it."
+                        % model_config.model
+                    )
+                attn_indices = [
+                    i for i, t in enumerate(layer_types)
+                    if t == "full_attention"
+                ]
+                if not attn_indices:
+                    raise ValueError(
+                        "TurboQuant: no full_attention layers in %s — "
+                        "nothing to quantize." % model_config.model
+                    )
+                boundary = (
+                    TurboQuantConfig.get_boundary_skip_layers_from_indices(
+                        attn_indices
+                    )
+                )
+                log_n = len(layer_types)
+            else:
+                num_layers = model_config.hf_text_config.num_hidden_layers
+                boundary = TurboQuantConfig.get_boundary_skip_layers(
+                    num_layers
+                )
+                log_n = num_layers
+
             existing = set(cache_config.kv_cache_dtype_skip_layers)
             merged = sorted(existing | set(boundary), key=lambda x: int(x))
             cache_config.kv_cache_dtype_skip_layers = merged
             logger.info(
-                "TQ: skipping layers %s for boundary protection (num_layers=%d)",
+                "TQ: skipping layers %s for boundary protection "
+                "(num_layers=%d)",
                 merged,
-                num_layers,
+                log_n,
             )
 
         ray_runtime_env = None
