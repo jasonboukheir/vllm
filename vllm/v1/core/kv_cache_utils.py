@@ -1031,14 +1031,30 @@ def unify_kv_cache_spec_page_size(
             new_kv_cache_spec[layer_name] = layer_spec
         else:
             layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size != 0:
-                raise NotImplementedError(
-                    "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
+            if max_page_size % layer_page_size == 0:
+                ratio = max_page_size // layer_page_size
+                new_block_size = layer_spec.block_size * ratio
+                new_spec = replace(layer_spec, block_size=new_block_size)
+            else:
+                # Page sizes have no integer ratio (e.g. quantized attention
+                # layers whose per-token byte count shares no clean divisor
+                # with full-precision layers in the same model). Block-size
+                # scaling cannot equalize them, so pad the smaller-page layer
+                # via page_size_padded. Wastes memory on these layers, but
+                # preserves correctness and lets the per-spec grouping in
+                # _get_kv_cache_groups_uniform_page_size still keep them in
+                # their own kv_cache_group.
+                logger.warning_once(
+                    "KV cache spec %s has page_size_bytes=%d which is not a "
+                    "divisor of max page_size_bytes=%d; padding via "
+                    "page_size_padded. Wastes %.1f%% of these layers' KV "
+                    "memory.",
+                    type(layer_spec).__name__,
+                    layer_page_size,
+                    max_page_size,
+                    100 * (max_page_size - layer_page_size) / max_page_size,
                 )
-            ratio = max_page_size // layer_page_size
-            new_block_size = layer_spec.block_size * ratio
-            new_spec = replace(layer_spec, block_size=new_block_size)
+                new_spec = replace(layer_spec, page_size_padded=max_page_size)
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
