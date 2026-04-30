@@ -1724,11 +1724,11 @@ class EngineArgs:
                         "TurboQuant: no full_attention layers in %s — "
                         "nothing to quantize." % model_config.model
                     )
-                boundary = (
-                    TurboQuantConfig.get_boundary_skip_layers_from_indices(
-                        attn_indices
-                    )
-                )
+                # Boundary skips disabled for hybrid: BF16-skip pages
+                # are incommensurate with TQ slot pages, and
+                # _reshape_kv_cache_tensors cannot view a padded mixed
+                # layout when num_blocks_per_kv_block > 1.
+                boundary: list[str] = []
                 log_n = len(layer_types)
             else:
                 num_layers = model_config.hf_text_config.num_hidden_layers
