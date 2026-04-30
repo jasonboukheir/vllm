@@ -1,0 +1,73 @@
+# Sketch image for vLLM upstream main + sym_int4 IPEX INT4 weight quant.
+#
+# Layers two extra dependencies onto the existing vllm-xpu-tq build:
+#   - intel_extension_for_pytorch (IPEX) matching torch's major.minor
+#   - arctic-inference 0.1.1 (provides /usr/local/.../vllm_int4_for_multi_arc.so
+#     used by VLLM_QUANTIZE_Q40_LIB)
+#
+# Status (2026-04-30): runtime-blocked. vLLM upstream main pins
+# `torch == 2.11.0` in pyproject.toml. Latest public IPEX-XPU wheel for
+# Python 3.12 on Linux is intel_extension_for_pytorch-2.7.10+xpu, which
+# is built against torch 2.7.x. Installing IPEX 2.7.10+xpu on torch 2.11
+# fails on import (torch._C symbol mismatch). When Intel ships IPEX
+# 2.11+xpu, swap the version below and the build should complete.
+#
+# Until then, treat this Dockerfile as documentation of the recipe.
+# Building it today will fail at the IPEX install step.
+#
+# Build (when IPEX 2.11+xpu exists):
+#   podman build --format=docker -f docker/Dockerfile.xpu.sym_int4 \
+#     -t vllm-xpu-tq:sym_int4-<sha> .
+#
+# Smoke run after build:
+#   podman run -d --name vllm-tq-qwen36-int4 \
+#     --device /dev/dri --group-add keep-groups --ipc=host \
+#     -p 8005:8000 -v /home/jasonbk/scratch/vllm-cache:/root/.cache/huggingface:z \
+#     -e VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 \
+#     vllm-xpu-tq:sym_int4-<sha> Qwen/Qwen3.6-35B-A3B \
+#     --quantization sym_int4 --kv-cache-dtype turboquant_k8v4 \
+#     --max-model-len 1024 --gpu-memory-utilization 0.85 \
+#     --enforce-eager --max-num-seqs 1 --max-logprobs 50 \
+#     --limit-mm-per-prompt '{"image":0,"video":0}' \
+#     --host 0.0.0.0 --port 8000
+
+ARG BASE_IMAGE=vllm-xpu-tq:hybrid-noskip-4088d3dd0
+FROM ${BASE_IMAGE} AS vllm-sym_int4
+
+# Honor pip behind a corporate proxy if set; harmless otherwise.
+ARG https_proxy
+ARG http_proxy
+
+# IPEX index — Intel's stable XPU wheels.
+ENV IPEX_XPU_INDEX="https://pytorch-extension.intel.com/release-whl/stable/xpu/us/"
+
+# When IPEX 2.11+xpu ships, set this to the matching version (e.g.
+# 2.11.10+xpu). For now this line is the build's expected failure point.
+ARG IPEX_VERSION="2.11.10+xpu"
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --extra-index-url "${IPEX_XPU_INDEX}" \
+        "intel-extension-for-pytorch==${IPEX_VERSION}"
+
+# arctic-inference ships the GGML Q4_0 packing shared library that
+# sym_int4's _get_quant_lib() loads via VLLM_QUANTIZE_Q40_LIB.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-deps "arctic-inference==0.1.1"
+
+# Locate the .so installed by arctic-inference (path depends on Python
+# install layout). The lookup runs at build time and bakes the absolute
+# path into the image so VLLM_QUANTIZE_Q40_LIB can be set without
+# reading dist-packages at runtime.
+RUN mkdir -p /opt/lib && \
+    SO_PATH="$(python3 -c \"import sysconfig, glob, os; \
+    paths = glob.glob(os.path.join(sysconfig.get_paths()['purelib'], '**', \
+    'vllm_int4_for_multi_arc.so'), recursive=True); \
+    print(paths[0] if paths else '')\")" && \
+    test -n "$SO_PATH" && echo "Q40 lib at $SO_PATH" && \
+    ln -sf "$SO_PATH" /opt/lib/vllm_int4_for_multi_arc.so
+
+# Match llm-scaler's defaults — the patched vllm reads these.
+ENV VLLM_QUANTIZE_Q40_LIB="/opt/lib/vllm_int4_for_multi_arc.so"
+ENV VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT="1"
+
+ENTRYPOINT ["vllm", "serve"]
