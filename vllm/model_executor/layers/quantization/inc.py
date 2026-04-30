@@ -141,6 +141,26 @@ class INCConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "INCConfig":
+        # GPTQModel checkpoints carry per-module overrides under `dynamic`
+        # rather than `extra_config`. Translate `-:<regex>` (skip) and
+        # `+:<regex>` / bare (override) entries into INC's extra_config
+        # format so get_layer_config() handles them via its existing regex
+        # path. For "skip", we set bits=16 (= unquantized in check_quantized).
+        extra_config = cls.get_from_keys_or(config, ["extra_config"], None)
+        dynamic = cls.get_from_keys_or(config, ["dynamic"], None)
+        if dynamic:
+            extra_config = dict(extra_config) if extra_config else {}
+            for raw_pattern, override in dynamic.items():
+                if raw_pattern.startswith("-:"):
+                    extra_config[raw_pattern.removeprefix("-:")] = {
+                        "bits": 16,
+                        "group_size": -1,
+                        "sym": True,
+                    }
+                else:
+                    pattern = raw_pattern.removeprefix("+:")
+                    extra_config[pattern] = override or {}
+
         return cls(
             weight_bits=cls.get_from_keys(config, ["bits"]),
             group_size=cls.get_from_keys(config, ["group_size"]),
@@ -151,7 +171,7 @@ class INCConfig(QuantizationConfig):
             block_name_to_quantize=cls.get_from_keys_or(
                 config, ["block_name_to_quantize", "to_quant_block_names"], None
             ),
-            extra_config=cls.get_from_keys_or(config, ["extra_config"], None),
+            extra_config=extra_config,
             data_type=cls.get_from_keys_or(config, ["data_type"], "int"),
             backend=cls.get_from_keys_or(config, ["backend", "vllm_backend"], "auto"),
         )
