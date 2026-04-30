@@ -534,7 +534,24 @@ class Platform:
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
         # Compute attention page size for 1 token
-        if model_config.use_mla:
+        if cache_config.cache_dtype.startswith("turboquant_"):
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
+
+            tq_cfg = TurboQuantConfig.from_cache_dtype(
+                cache_config.cache_dtype, model_config.get_head_size()
+            )
+            attn_page_size_1_token = TQFullAttentionSpec(
+                block_size=1,
+                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                head_size=model_config.get_head_size(),
+                dtype=kv_cache_dtype,
+                kv_quant_mode=kv_quant_mode,
+                tq_slot_size=tq_cfg.slot_size_aligned,
+            ).page_size_bytes
+        elif model_config.use_mla:
             attn_page_size_1_token = MLAAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
