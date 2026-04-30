@@ -54,6 +54,8 @@ if TYPE_CHECKING:
     VLLM_CPU_ATTN_SPLIT_KV: bool = True
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
     VLLM_CPU_INT4_W4A8: bool = True
+    VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT: bool = False
+    VLLM_QUANTIZE_Q40_LIB: str = "/opt/lib/vllm_int4_for_multi_arc.so"
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
@@ -673,6 +675,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_USAGE_STATS_SERVER", "https://stats.vllm.ai"
     ),
     "VLLM_NO_USAGE_STATS": lambda: os.environ.get("VLLM_NO_USAGE_STATS", "0") == "1",
+    # If set, sym_int4 / online IPEX quantization runs the model load on CPU
+    # and only the quantized weights are placed on the XPU. Avoids needing
+    # enough device memory to hold the unquantized model.
+    "VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT": lambda: os.environ.get(
+        "VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT", "0"
+    ) == "1",
+    # Path to the GGML Q4_0 packing shared library used by sym_int4 weight
+    # quantization. Bundled with arctic-inference (intel/llm-scaler ships it
+    # at /usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so).
+    "VLLM_QUANTIZE_Q40_LIB": lambda: os.environ.get(
+        "VLLM_QUANTIZE_Q40_LIB", "/opt/lib/vllm_int4_for_multi_arc.so"
+    ),
     "VLLM_DO_NOT_TRACK": lambda: (
         (
             os.environ.get("VLLM_DO_NOT_TRACK", None)

@@ -35,6 +35,7 @@ QuantizationMethods = Literal[
     "deepseek_v4_fp8",
     "cpu_awq",
     "online",
+    "sym_int4",
     # Below are values of the OnlineQuantScheme enum, specified as strings to
     # avoid circular import issues. This is here to provide a shortcut where
     # the user can specify "LLM(..., quantization='fp8_per_tensor')" as
@@ -140,6 +141,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .moe_wna16 import MoeWNA16Config
     from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
     from .online.base import OnlineQuantizationConfig
+    from .sym_int4 import SymInt4Config
     from .torchao import TorchAOConfig
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
@@ -169,6 +171,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "cpu_awq": CPUAWQConfig,
         "humming": HummingConfig,
         "online": OnlineQuantizationConfig,
+        "sym_int4": SymInt4Config,
     }
 
     # Below are values of the OnlineQuantScheme enum. This is here to provide
