@@ -146,20 +146,39 @@ class INCConfig(QuantizationConfig):
         # `+:<regex>` / bare (override) entries into INC's extra_config
         # format so get_layer_config() handles them via its existing regex
         # path. For "skip", we set bits=16 (= unquantized in check_quantized).
+        #
+        # GPTQModel matches its `dynamic` keys with `re.match` (anchored at
+        # start), but INC's get_layer_config uses `re.search` and only treats
+        # a key as a regex when it contains regex special characters. We
+        # therefore anchor every translated key with `^` and append `.*` for
+        # bare prefixes so they reach the regex matcher. Override values can
+        # be a dict (config), True/None (= use defaults), or False (= skip).
+        skip_cfg = {"bits": 16, "group_size": -1, "sym": True}
         extra_config = cls.get_from_keys_or(config, ["extra_config"], None)
         dynamic = cls.get_from_keys_or(config, ["dynamic"], None)
         if dynamic:
             extra_config = dict(extra_config) if extra_config else {}
             for raw_pattern, override in dynamic.items():
                 if raw_pattern.startswith("-:"):
-                    extra_config[raw_pattern.removeprefix("-:")] = {
-                        "bits": 16,
-                        "group_size": -1,
-                        "sym": True,
-                    }
+                    pattern = raw_pattern.removeprefix("-:")
+                    cfg: dict[str, Any] = dict(skip_cfg)
                 else:
                     pattern = raw_pattern.removeprefix("+:")
-                    extra_config[pattern] = override or {}
+                    if override is False:
+                        cfg = dict(skip_cfg)
+                    elif override is None or override is True:
+                        cfg = {}
+                    elif isinstance(override, dict):
+                        cfg = override
+                    else:
+                        raise ValueError(
+                            f"INC `dynamic` override for {raw_pattern!r} must "
+                            f"be a dict, bool, or None; got {type(override).__name__}."
+                        )
+                anchored = pattern if pattern.startswith("^") else f"^{pattern}"
+                if not any(c in r"*+?^$()[]{}|\\" for c in anchored.removeprefix("^")):
+                    anchored = f"{anchored}.*"
+                extra_config[anchored] = cfg
 
         return cls(
             weight_bits=cls.get_from_keys(config, ["bits"]),
@@ -550,9 +569,19 @@ class INCConfig(QuantizationConfig):
         quant_method = hf_quant_cfg.get("quant_method", None)
         if quant_method == "auto-round":
             return cls.get_name()
-        if current_platform.is_xpu() and quant_method == "gptq":
+        # On XPU, also claim vanilla GPTQ sym int4 desc_act=false. Honor an
+        # explicit user `--quantization` flag: only take over when the user
+        # didn't ask for a specific method or asked for `inc` directly, so
+        # `--quantization gptq_marlin` still routes through the marlin path
+        # for users who want it (it would then no-op on XPU; that's the
+        # user's call, not ours).
+        if (
+            current_platform.is_xpu()
+            and quant_method == "gptq"
+            and user_quant in (None, "inc")
+        ):
             bits = hf_quant_cfg.get("bits")
-            sym = hf_quant_cfg.get("sym")
+            sym = hf_quant_cfg.get("sym", True)
             desc_act = hf_quant_cfg.get("desc_act", False)
             if bits == 4 and sym is True and not desc_act:
                 return cls.get_name()
@@ -714,9 +743,15 @@ class INCXPUMoEMethod(FusedMoEMethodBase):
         moe: FusedMoEConfig,
     ) -> None:
         super().__init__(moe)
-        assert weight_bits == 4 and sym, (
-            "INC XPU MoE only supports 4-bit symmetric quantization."
-        )
+        if weight_bits != 4:
+            raise NotImplementedError(
+                f"INC XPU MoE only supports 4-bit quantization, "
+                f"got weight_bits={weight_bits}."
+            )
+        if not sym:
+            raise NotImplementedError(
+                "INC XPU MoE only supports symmetric quantization for now."
+            )
         self.weight_bits = weight_bits
         self.group_size = group_size
         self.sym = sym
@@ -743,6 +778,18 @@ class INCXPUMoEMethod(FusedMoEMethodBase):
         # Drop intermediate_size_full (used by Marlin act-order); not relevant
         # here since INC checkpoints have desc_act=false.
         extra_weight_attrs.pop("intermediate_size_full", None)
+
+        if hidden_size % self.group_size != 0:
+            raise ValueError(
+                f"INC XPU MoE requires hidden_size ({hidden_size}) to be "
+                f"divisible by group_size ({self.group_size})."
+            )
+        if intermediate_size_per_partition % self.group_size != 0:
+            raise ValueError(
+                f"INC XPU MoE requires intermediate_size_per_partition "
+                f"({intermediate_size_per_partition}) to be divisible by "
+                f"group_size ({self.group_size}); check tensor-parallel size."
+            )
 
         scales_size13 = hidden_size // self.group_size
         scales_size2 = intermediate_size_per_partition // self.group_size

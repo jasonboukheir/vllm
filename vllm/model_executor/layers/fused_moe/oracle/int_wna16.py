@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -434,9 +435,21 @@ def _process_weights_xpu(
         w2_scales:  [E, N // group_size, K] params_dtype
 
     Transpose dim 1 ↔ dim 2 then view int32 → uint8 to recover sequential
-    int4-packed bytes along the input dim.
+    int4-packed bytes along the input dim. Each packed int32 holds 8 nibbles
+    `(n7<<28)|(n6<<24)|...|(n1<<4)|n0` in ascending K order; on a
+    little-endian host the int32→uint8 view exposes them as bytes
+    `[n1<<4|n0, n3<<4|n2, n5<<4|n4, n7<<4|n6]`, i.e. two nibbles per byte
+    with the lower nibble = lower input-K index. xpu_fused_moe(is_int4=True)
+    expects this convention; on a big-endian host the byte order reverses
+    and the kernel would silently miscompute, so we hard-fail.
     """
     del layer, quant_config  # unused — kept for parity with the marlin helper
+
+    if sys.byteorder != "little":
+        raise NotImplementedError(
+            "_process_weights_xpu requires a little-endian host: the GPTQ "
+            "int32 → uint8 nibble repack relies on LE byte ordering."
+        )
 
     w13_xpu = w13_qweight.transpose(1, 2).contiguous().view(torch.uint8)
     w2_xpu = w2_qweight.transpose(1, 2).contiguous().view(torch.uint8)
