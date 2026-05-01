@@ -132,6 +132,15 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         apply_router_weight_on_input: bool,
     ):
         topk = topk_ids.size(-1)
+        # The kernel takes is_fp8/is_int4/is_mxfp4 as independent booleans.
+        # In this hierarchy each subclass flips exactly one to True; assert
+        # the invariant so a future subclass that sets two doesn't silently
+        # miscompute (kernel-side priority is undocumented).
+        assert sum([self.is_fp8, self.is_int4, self.is_mxfp4]) <= 1, (
+            "XPUExperts: at most one of is_fp8, is_int4, is_mxfp4 may be True; "
+            f"got is_fp8={self.is_fp8}, is_int4={self.is_int4}, "
+            f"is_mxfp4={self.is_mxfp4}."
+        )
         xpu_fused_moe(
             hidden_states=hidden_states,
             w13=w1,
