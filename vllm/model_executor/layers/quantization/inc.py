@@ -506,6 +506,8 @@ class INCConfig(QuantizationConfig):
             )
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             return self.apply_gptq_quant_layer(layer, prefix)
+        # FusedMoE on CPU is not yet supported by INC; XPU has its own
+        # INCXPUMoEMethod path above.
         return None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -857,6 +859,8 @@ class INCXPUMoEMethod(FusedMoEMethodBase):
         replace_parameter(layer, "w13_scales", w13_scale)
         replace_parameter(layer, "w2_scales", w2_scale)
 
+        self._assert_no_g_idx_reordering(layer)
+
         empty = torch.empty((0,), dtype=torch.int32, device=w13.device)
         for name in ("w13_qzeros", "w2_qzeros", "w13_g_idx", "w2_g_idx"):
             if hasattr(layer, name):
@@ -864,14 +868,33 @@ class INCXPUMoEMethod(FusedMoEMethodBase):
 
         self._setup_kernel(layer)
 
-    def _setup_kernel(self, layer) -> None:
+    @staticmethod
+    def _assert_no_g_idx_reordering(layer: torch.nn.Module) -> None:
+        """xpu_fused_moe(is_int4=True) does not implement desc_act / g_idx
+        activation reordering. Verify any loaded g_idx is monotonically
+        non-decreasing (the desc_act=false pattern) so that the hardcoded
+        is_k_full=True passed into make_wna16_moe_kernel below is safe."""
+        for name in ("w13_g_idx", "w2_g_idx"):
+            if not hasattr(layer, name):
+                continue
+            g_idx = getattr(layer, name)
+            if g_idx.numel() == 0:
+                continue
+            if (g_idx[..., 1:] < g_idx[..., :-1]).any():
+                raise NotImplementedError(
+                    f"INC XPU MoE requires desc_act=false GPTQ checkpoints; "
+                    f"got non-monotonic {name} indicating activation reordering, "
+                    f"which xpu_fused_moe does not support."
+                )
+
+    def _setup_kernel(self, layer: torch.nn.Module) -> None:
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         self.moe_kernel = make_wna16_moe_kernel(
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             experts_cls=self.experts_cls,
             layer=layer,
-            is_k_full=True,  # desc_act=false for INC checkpoints
+            is_k_full=True,  # validated above via _assert_no_g_idx_reordering
             w13_g_idx=None,
             w2_g_idx=None,
             w13_g_idx_sort_indices=None,
@@ -893,7 +916,7 @@ class INCXPUMoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer,
+        layer: torch.nn.Module,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
