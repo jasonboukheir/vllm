@@ -121,6 +121,18 @@ def _gdn_attention_core_xpu_impl(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
     )
 
+    # Under PIECEWISE cudagraph capture the model runner pads inputs to the
+    # captured size; metadata's `num_actual_tokens` stays unpadded, and the
+    # SYCL kernel asserts `core_attn_out.size(0) == num_actual_tokens`.
+    # Slice to the actual count (mirrors gdn_linear_attn.py:803-808 on the
+    # CUDA path); slicing dim 0 of contiguous tensors yields contiguous
+    # views that share storage with the originals.
+    num_actual_tokens = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+    core_attn_out = core_attn_out[:num_actual_tokens]
+    z = z[:num_actual_tokens]
+    projected_states_qkvz = projected_states_qkvz[:num_actual_tokens]
+    projected_states_ba = projected_states_ba[:num_actual_tokens]
+
     torch.ops._xpu_C.gdn_attention(
         core_attn_out,
         z,
