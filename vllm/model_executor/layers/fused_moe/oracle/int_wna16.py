@@ -186,8 +186,7 @@ def make_wna16_moe_kernel(
 
     if experts_cls is XPUExpertsWNA16:
         assert (
-            prepare_finalize.activation_format
-            == mk.FusedMoEActivationFormat.Standard
+            prepare_finalize.activation_format == mk.FusedMoEActivationFormat.Standard
         ), (
             "XPUExpertsWNA16 only supports the Standard activation format; "
             "xpu_fused_moe(is_int4=True) does not implement BatchedExperts."
@@ -196,7 +195,9 @@ def make_wna16_moe_kernel(
             moe_config=moe_config,
             quant_config=moe_quant_config,
         )
-    elif prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
+    elif (
+        prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts
+    ):
         assert experts_cls == BatchedMarlinExperts
         max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
         assert max_num_tokens is not None
