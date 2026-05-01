@@ -185,6 +185,13 @@ def make_wna16_moe_kernel(
     assert isinstance(prepare_finalize, mk.FusedMoEPrepareAndFinalizeModular)
 
     if experts_cls is XPUExpertsWNA16:
+        assert (
+            prepare_finalize.activation_format
+            == mk.FusedMoEActivationFormat.Standard
+        ), (
+            "XPUExpertsWNA16 only supports the Standard activation format; "
+            "xpu_fused_moe(is_int4=True) does not implement BatchedExperts."
+        )
         experts: mk.FusedMoEExperts = XPUExpertsWNA16(
             moe_config=moe_config,
             quant_config=moe_quant_config,
