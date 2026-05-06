@@ -92,6 +92,88 @@ if hasattr(torch.ops._xpu_C, "int4_gemm_w4a16"):
         return torch.empty((M, N), dtype=input.dtype, device=input.device)
 
 
+def _gdn_xpu_spec_python_path(
+    core_attn_out: torch.Tensor,
+    z: torch.Tensor,
+    projected_states_qkvz: torch.Tensor,
+    projected_states_ba: torch.Tensor,
+    layer,
+) -> None:
+    """Spec-decode fallback for XPU GDN: route through the FLA Triton
+    flow used by forward_cuda.
+
+    The fused SYCL gdn_attention kernel has no spec-aware path
+    (per-candidate state evolution + rollback on rejection driven by
+    num_accepted_tokens). The custom op is opaque to torch.compile, so
+    branching on attn_metadata.spec_sequence_masks at runtime here is
+    safe — it is not baked into the compiled graph the way a check in
+    forward_xpu's body would be.
+
+    Mirrors the input prep in GatedDeltaNetAttention.forward_cuda
+    (gdn_linear_attn.py:543-564) and then defers to
+    GatedDeltaNetAttention._forward_core which contains the spec-aware
+    Python branching using FLA Triton kernels with IS_SPEC_DECODING.
+    """
+    from einops import rearrange
+
+    if layer.gqa_interleaved_layout:
+        # Qwen3-Next: unpack the interleaved GQA layout
+        query, key, value, z_split, b, a = layer.fix_query_key_value_ordering(
+            projected_states_qkvz, projected_states_ba
+        )
+        query, key, value = map(
+            lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
+        )
+        mixed_qkv = torch.cat((query, key, value), dim=-1)
+    else:
+        # Qwen3.5: weights are already in [q, k, v, z] and [b, a] order
+        qkv_size = (layer.key_dim * 2 + layer.value_dim) // layer.tp_size
+        z_size = layer.value_dim // layer.tp_size
+        mixed_qkv, z_split = projected_states_qkvz.split([qkv_size, z_size], dim=-1)
+        z_split = z_split.reshape(z_split.size(0), -1, layer.head_v_dim)
+        b, a = projected_states_ba.chunk(2, dim=-1)
+        b = b.contiguous()
+        a = a.contiguous()
+
+    # Surface z to the caller's z buffer so the subsequent norm in
+    # forward_xpu sees the correct gating tensor. Shapes match because
+    # forward_xpu allocated z = empty_like(core_attn_out) which is
+    # [num_tokens, num_v_heads / tp_size, head_v_dim] — same as z_split.
+    z.copy_(z_split)
+
+    # _forward_core writes into core_attn_out. It reads attn_metadata
+    # from forward_context, so spec_sequence_masks / num_accepted_tokens
+    # are already in scope.
+    layer._forward_core(
+        mixed_qkv=mixed_qkv,
+        b=b,
+        a=a,
+        core_attn_out=core_attn_out,
+    )
+
+
+_VLLM_XPU_FORCE_FLA_GDN = None
+
+
+def _force_fla_gdn() -> bool:
+    """One-shot lookup of VLLM_XPU_FORCE_FLA_GDN env var.
+
+    When set, every GDN call (spec AND non-spec) is routed through the
+    FLA Triton flow used by forward_cuda. Useful for byte-equality
+    validation: comparing baseline+force_fla against mtp-k3+force_fla
+    isolates spec-path correctness from cross-backend bf16 drift
+    between SYCL and FLA Triton.
+    """
+    global _VLLM_XPU_FORCE_FLA_GDN
+    if _VLLM_XPU_FORCE_FLA_GDN is None:
+        import os
+
+        _VLLM_XPU_FORCE_FLA_GDN = os.environ.get(
+            "VLLM_XPU_FORCE_FLA_GDN", ""
+        ).lower() in ("1", "true", "yes", "on")
+    return _VLLM_XPU_FORCE_FLA_GDN
+
+
 def _gdn_attention_core_xpu_impl(
     core_attn_out: torch.Tensor,
     z: torch.Tensor,
@@ -114,8 +196,24 @@ def _gdn_attention_core_xpu_impl(
     attn_metadata = attn_metadata_raw[self.prefix]
     assert isinstance(attn_metadata, GDNAttentionMetadata)
 
-    # TODO: xpu does not support speculative decoding yet
-    assert attn_metadata.spec_sequence_masks is None  # type: ignore[attr-defined]
+    if (
+        attn_metadata.spec_sequence_masks is not None  # type: ignore[attr-defined]
+        or _force_fla_gdn()
+    ):
+        # See _gdn_xpu_spec_python_path docstring. The custom op is
+        # opaque to torch.compile, so this runtime branch survives
+        # graph capture; the equivalent check in forward_xpu's body
+        # would be specialized at trace time when attn_metadata is None.
+        # When VLLM_XPU_FORCE_FLA_GDN=1, the same path is used even for
+        # non-spec batches, for verification.
+        _gdn_xpu_spec_python_path(
+            core_attn_out,
+            z,
+            projected_states_qkvz,
+            projected_states_ba,
+            self,
+        )
+        return
 
     conv_weights = self.conv1d.weight.view(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
