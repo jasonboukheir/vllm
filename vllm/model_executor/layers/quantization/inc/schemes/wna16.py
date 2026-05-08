@@ -57,8 +57,17 @@ class INCWna16Scheme(INCScheme):
         layer_config: "INCLayerConfig",
     ):
         del config, prefix
-        # XPU and CPU do not support MoE quantization yet
-        if current_platform.is_xpu() or current_platform.is_cpu():
+        if current_platform.is_xpu():
+            if layer_config.bits == 4 and layer_config.sym:
+                from .xpu_w4a16_moe import INCXPUMoEMethod
+
+                return INCXPUMoEMethod(layer_config, layer.moe_config)
+            from vllm.model_executor.layers.fused_moe.layer import (
+                UnquantizedFusedMoEMethod,
+            )
+
+            return UnquantizedFusedMoEMethod(layer.moe_config)
+        if current_platform.is_cpu():
             from vllm.model_executor.layers.fused_moe.layer import (
                 UnquantizedFusedMoEMethod,
             )

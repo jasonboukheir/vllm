@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization import (
     QuantizationMethods,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.platforms import current_platform
 
 from .resolver import INCConfigResolver
 
@@ -115,17 +116,56 @@ class INCConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "INCConfig":
+        # GPTQModel checkpoints carry per-module overrides under `dynamic`
+        # rather than `extra_config`. Translate `-:<regex>` (skip) and
+        # `+:<regex>` / bare (override) entries into INC's extra_config
+        # format so the resolver handles them via its existing regex path.
+        # For "skip", we set bits=16 (= unquantized in check_quantized).
+        #
+        # GPTQModel matches its `dynamic` keys with `re.match` (anchored at
+        # start), but INC's resolver uses `re.search` and only treats a key
+        # as a regex when it contains regex special characters. We anchor
+        # every translated key with `^` and append `.*` for bare prefixes
+        # so they reach the regex matcher. Override values can be a dict
+        # (config), True/None (= use defaults), or False (= skip).
+        skip_cfg = {"bits": 16, "group_size": -1, "sym": True}
+        extra_config = cls.get_from_keys_or(config, ["extra_config"], None)
+        dynamic = cls.get_from_keys_or(config, ["dynamic"], None)
+        if dynamic:
+            extra_config = dict(extra_config) if extra_config else {}
+            for raw_pattern, override in dynamic.items():
+                if raw_pattern.startswith("-:"):
+                    pattern = raw_pattern.removeprefix("-:")
+                    cfg: dict[str, Any] = dict(skip_cfg)
+                else:
+                    pattern = raw_pattern.removeprefix("+:")
+                    if override is False:
+                        cfg = dict(skip_cfg)
+                    elif override is None or override is True:
+                        cfg = {}
+                    elif isinstance(override, dict):
+                        cfg = override
+                    else:
+                        raise ValueError(
+                            f"INC `dynamic` override for {raw_pattern!r} must "
+                            f"be a dict, bool, or None; got {type(override)}."
+                        )
+                anchored = pattern if pattern.startswith("^") else f"^{pattern}"
+                if not any(c in anchored for c in r"*+?^$()[]{}|\\"[1:]):
+                    anchored = f"{anchored}.*"
+                extra_config[anchored] = cfg
+
         return cls(
             weight_bits=cls.get_from_keys(config, ["bits"]),
             group_size=cls.get_from_keys(config, ["group_size"]),
-            sym=cls.get_from_keys(config, ["sym"]),
+            sym=cls.get_from_keys_or(config, ["sym"], True),
             packing_format=cls.get_from_keys_or(
                 config, ["packing_format"], "auto_round:auto_gptq"
             ),
             block_name_to_quantize=cls.get_from_keys_or(
                 config, ["block_name_to_quantize", "to_quant_block_names"], None
             ),
-            extra_config=cls.get_from_keys_or(config, ["extra_config"], None),
+            extra_config=extra_config,
             data_type=cls.get_from_keys_or(config, ["data_type"], "int"),
             backend=cls.get_from_keys_or(config, ["backend", "vllm_backend"], "auto"),
         )
@@ -184,8 +224,28 @@ class INCConfig(QuantizationConfig):
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> "QuantizationMethods | None":
-        """Override the `auto-round` method to `inc`."""
-        is_auto_round_format = hf_quant_cfg.get("quant_method", None) == "auto-round"
-        if is_auto_round_format:
+        """Override the `auto-round` method to `inc`.
+
+        On XPU, also claim vanilla GPTQ sym int4 desc_act=false checkpoints:
+        gptq_marlin / awq_marlin gate on CUDA/CPU, and the moe_wna16 fallback
+        runs Triton kernels that don't execute on Intel GPUs. INC routes the
+        linear path through INCXPUW4A16LinearScheme (oneDNN int4_gemm_w4a16)
+        and the MoE path through INCXPUMoEMethod (vllm-xpu-kernels
+        xpu_fused_moe(is_int4=True)) — the only working W4A16 path on XPU.
+        Honors user_quant so an explicit --quantization gptq_marlin still
+        routes to that backend.
+        """
+        quant_method = hf_quant_cfg.get("quant_method", None)
+        if quant_method == "auto-round":
             return cls.get_name()
+        if (
+            current_platform.is_xpu()
+            and quant_method == "gptq"
+            and user_quant in (None, "inc")
+        ):
+            bits = hf_quant_cfg.get("bits")
+            sym = hf_quant_cfg.get("sym", True)
+            desc_act = hf_quant_cfg.get("desc_act", False)
+            if bits == 4 and sym is True and not desc_act:
+                return cls.get_name()
         return None
