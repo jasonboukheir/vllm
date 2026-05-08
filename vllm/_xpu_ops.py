@@ -141,6 +141,21 @@ def _gdn_xpu_spec_python_path(
     # [num_tokens, num_v_heads / tp_size, head_v_dim] — same as z_split.
     z.copy_(z_split)
 
+    dump_dir = _spec_gdn_dump_dir()
+    if dump_dir is not None and _spec_gdn_can_dump():
+        _spec_gdn_dump_call(
+            dump_dir,
+            layer,
+            mixed_qkv,
+            b,
+            a,
+            core_attn_out,
+            z,
+            projected_states_qkvz,
+            projected_states_ba,
+        )
+        return
+
     # _forward_core writes into core_attn_out. It reads attn_metadata
     # from forward_context, so spec_sequence_masks / num_accepted_tokens
     # are already in scope.
@@ -150,6 +165,268 @@ def _gdn_xpu_spec_python_path(
         a=a,
         core_attn_out=core_attn_out,
     )
+
+
+# ---------------------------------------------------------------------------
+# Spec-aware SYCL gdn_attention capture harness (Rung 1 of the test ladder
+# documented in vllm/.spec-gdn-progress.md).
+#
+# When VLLM_XPU_DUMP_SPEC_GDN=<dir> is set in addition to VLLM_XPU_FORCE_FLA_GDN=1,
+# every spec-or-non-spec call that reaches _gdn_xpu_spec_python_path is
+# serialized to <dir>/tuple_<sanitized-prefix>_<step>_<flavor>.pt as a dict
+# containing the inputs to the SYCL kernel, the FLA-path outputs, and the
+# pre/post slices of the kv_cache pool indexed by the call. The replay harness
+# (Rung 2) consumes these dumps to drive a standalone pytest that diffs the
+# SYCL spec path against the FLA oracle.
+#
+# The capture path never alters numerical behaviour: it only takes snapshots
+# around the existing layer._forward_core call. Disabled (zero overhead) when
+# VLLM_XPU_DUMP_SPEC_GDN is unset.
+# ---------------------------------------------------------------------------
+
+_VLLM_XPU_DUMP_SPEC_GDN_INIT = False
+_VLLM_XPU_DUMP_SPEC_GDN: str | None = None
+_VLLM_XPU_DUMP_SPEC_GDN_MAX: int = 0
+_SPEC_GDN_DUMP_COUNT: int = 0
+_SPEC_GDN_STEP_COUNTER: dict[str, int] = {}
+
+
+def _spec_gdn_dump_dir() -> str | None:
+    global _VLLM_XPU_DUMP_SPEC_GDN_INIT
+    global _VLLM_XPU_DUMP_SPEC_GDN
+    global _VLLM_XPU_DUMP_SPEC_GDN_MAX
+    if _VLLM_XPU_DUMP_SPEC_GDN_INIT:
+        return _VLLM_XPU_DUMP_SPEC_GDN
+    import os
+
+    path = os.environ.get("VLLM_XPU_DUMP_SPEC_GDN", "").strip()
+    if path:
+        os.makedirs(path, exist_ok=True)
+        _VLLM_XPU_DUMP_SPEC_GDN = path
+        try:
+            _VLLM_XPU_DUMP_SPEC_GDN_MAX = int(
+                os.environ.get("VLLM_XPU_DUMP_SPEC_GDN_MAX", "200")
+            )
+        except ValueError:
+            _VLLM_XPU_DUMP_SPEC_GDN_MAX = 200
+        logger.warning(
+            "VLLM_XPU_DUMP_SPEC_GDN enabled — capturing GDN spec tuples to %s "
+            "(cap=%d). Disable for production runs.",
+            path,
+            _VLLM_XPU_DUMP_SPEC_GDN_MAX,
+        )
+    else:
+        _VLLM_XPU_DUMP_SPEC_GDN = None
+    _VLLM_XPU_DUMP_SPEC_GDN_INIT = True
+    return _VLLM_XPU_DUMP_SPEC_GDN
+
+
+def _spec_gdn_can_dump() -> bool:
+    return _SPEC_GDN_DUMP_COUNT < _VLLM_XPU_DUMP_SPEC_GDN_MAX
+
+
+def _spec_gdn_step(prefix: str) -> int:
+    n = _SPEC_GDN_STEP_COUNTER.get(prefix, 0)
+    _SPEC_GDN_STEP_COUNTER[prefix] = n + 1
+    return n
+
+
+def _spec_gdn_sanitize(name: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in name)
+
+
+def _spec_gdn_flavor(attn_md) -> str:
+    masks = getattr(attn_md, "spec_sequence_masks", None)
+    if masks is None:
+        return "non_spec"
+    nat = getattr(attn_md, "num_accepted_tokens", None)
+    spec_idx = getattr(attn_md, "spec_state_indices_tensor", None)
+    if nat is None or spec_idx is None or spec_idx.numel() == 0:
+        return "spec_unknown"
+    K = spec_idx.size(-1)
+    nat_cpu = nat.detach().to("cpu").tolist()
+    if not nat_cpu:
+        return "spec_empty"
+    mn = min(nat_cpu)
+    mx = max(nat_cpu)
+    has_non_spec = (
+        getattr(attn_md, "num_prefills", 0) + getattr(attn_md, "num_decodes", 0)
+    ) > 0
+    base = f"spec_K{K}_min{mn}_max{mx}"
+    return base + ("_mixed" if has_non_spec else "")
+
+
+_LAYER_CONFIG_KEYS = (
+    "num_k_heads",
+    "num_v_heads",
+    "head_k_dim",
+    "head_v_dim",
+    "key_dim",
+    "value_dim",
+    "tp_size",
+    "gqa_interleaved_layout",
+    "activation",
+    "prefix",
+)
+
+
+def _spec_gdn_layer_config(layer) -> dict:
+    return {k: getattr(layer, k, None) for k in _LAYER_CONFIG_KEYS}
+
+
+def _opt_to_cpu(t):
+    if t is None:
+        return None
+    if isinstance(t, torch.Tensor):
+        return t.detach().to("cpu").clone()
+    return t
+
+
+def _spec_gdn_dump_call(
+    dump_dir: str,
+    layer,
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    z: torch.Tensor,
+    projected_states_qkvz: torch.Tensor,
+    projected_states_ba: torch.Tensor,
+) -> None:
+    """Snapshot inputs around layer._forward_core, run it, snapshot outputs,
+    serialize to a .pt tuple. See module-level docstring for layout.
+    """
+    global _SPEC_GDN_DUMP_COUNT
+    import os
+
+    from vllm.forward_context import get_forward_context
+
+    forward_context = get_forward_context()
+    attn_md_raw = forward_context.attn_metadata
+    if attn_md_raw is None:
+        # V1 profile run — _forward_core warms up prefill kernels; nothing to
+        # capture because there is no real attn_metadata.
+        layer._forward_core(
+            mixed_qkv=mixed_qkv, b=b, a=a, core_attn_out=core_attn_out
+        )
+        return
+
+    assert isinstance(attn_md_raw, dict)
+    attn_md = attn_md_raw[layer.prefix]
+
+    spec_idx = getattr(attn_md, "spec_state_indices_tensor", None)
+    non_spec_idx = getattr(attn_md, "non_spec_state_indices_tensor", None)
+
+    slot_parts = []
+    if spec_idx is not None and spec_idx.numel() > 0:
+        slot_parts.append(spec_idx.flatten())
+    if non_spec_idx is not None and non_spec_idx.numel() > 0:
+        slot_parts.append(non_spec_idx.flatten())
+    if slot_parts:
+        all_slots = torch.cat(slot_parts).unique()
+        all_slots = all_slots[all_slots >= 0]
+    else:
+        all_slots = torch.empty(0, dtype=torch.long, device=core_attn_out.device)
+
+    conv_pool = layer.kv_cache[0]
+    ssm_pool = layer.kv_cache[1]
+    if all_slots.numel():
+        conv_state_pre = conv_pool[all_slots].detach().clone()
+        ssm_state_pre = ssm_pool[all_slots].detach().clone()
+    else:
+        conv_state_pre = conv_pool[:0].detach().clone()
+        ssm_state_pre = ssm_pool[:0].detach().clone()
+
+    # The actual FLA work — must run inline so kv_cache mutations persist for
+    # the rest of the forward pass.
+    layer._forward_core(mixed_qkv=mixed_qkv, b=b, a=a, core_attn_out=core_attn_out)
+
+    if all_slots.numel():
+        conv_state_post = conv_pool[all_slots].detach().clone()
+        ssm_state_post = ssm_pool[all_slots].detach().clone()
+    else:
+        conv_state_post = conv_pool[:0].detach().clone()
+        ssm_state_post = ssm_pool[:0].detach().clone()
+
+    flavor = _spec_gdn_flavor(attn_md)
+    prefix = getattr(layer, "prefix", "unknown")
+    step = _spec_gdn_step(prefix)
+    sanitized = _spec_gdn_sanitize(prefix)
+
+    try:
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            is_conv_state_dim_first,
+        )
+
+        conv_dim_first = bool(is_conv_state_dim_first())
+    except Exception:
+        conv_dim_first = None
+
+    bias = layer.conv1d.bias
+    payload = {
+        # schema_version 2: added projected_states_qkvz/ba so the SYCL
+        # custom op can be driven directly from the payload (the SYCL
+        # kernel consumes pre-rearrange projected states, not mixed_qkv).
+        "schema_version": 2,
+        "layer_prefix": prefix,
+        "step": step,
+        "flavor": flavor,
+        # SYCL kernel inputs (pre-rearrange, before _gdn_xpu_spec_python_path
+        # splits/concats them).
+        "projected_states_qkvz": projected_states_qkvz.detach().to("cpu").clone(),
+        "projected_states_ba": projected_states_ba.detach().to("cpu").clone(),
+        # FLA-pipeline inputs (post-rearrange) — kept so a future test can
+        # drive layer._forward_core directly from the payload if needed.
+        "mixed_qkv": mixed_qkv.detach().to("cpu").clone(),
+        "b": b.detach().to("cpu").clone(),
+        "a": a.detach().to("cpu").clone(),
+        # state slot snapshots (only the slots actually referenced)
+        "slot_indices": all_slots.detach().to("cpu").clone(),
+        "conv_state_pre": conv_state_pre.to("cpu"),
+        "conv_state_post": conv_state_post.to("cpu"),
+        "ssm_state_pre": ssm_state_pre.to("cpu"),
+        "ssm_state_post": ssm_state_post.to("cpu"),
+        # FLA outputs (post-call, in place)
+        "core_attn_out": core_attn_out.detach().to("cpu").clone(),
+        "z": z.detach().to("cpu").clone(),
+        # attn_metadata fields needed to drive the SYCL kernel
+        "spec_sequence_masks": _opt_to_cpu(
+            getattr(attn_md, "spec_sequence_masks", None)
+        ),
+        "spec_query_start_loc": _opt_to_cpu(
+            getattr(attn_md, "spec_query_start_loc", None)
+        ),
+        "non_spec_query_start_loc": _opt_to_cpu(
+            getattr(attn_md, "non_spec_query_start_loc", None)
+        ),
+        "spec_token_indx": _opt_to_cpu(getattr(attn_md, "spec_token_indx", None)),
+        "non_spec_token_indx": _opt_to_cpu(
+            getattr(attn_md, "non_spec_token_indx", None)
+        ),
+        "spec_state_indices_tensor": _opt_to_cpu(spec_idx),
+        "non_spec_state_indices_tensor": _opt_to_cpu(non_spec_idx),
+        "num_accepted_tokens": _opt_to_cpu(
+            getattr(attn_md, "num_accepted_tokens", None)
+        ),
+        "has_initial_state": _opt_to_cpu(
+            getattr(attn_md, "has_initial_state", None)
+        ),
+        "num_actual_tokens": int(getattr(attn_md, "num_actual_tokens", 0) or 0),
+        "num_prefills": int(getattr(attn_md, "num_prefills", 0) or 0),
+        "num_decodes": int(getattr(attn_md, "num_decodes", 0) or 0),
+        "num_spec_decodes": int(getattr(attn_md, "num_spec_decodes", 0) or 0),
+        # layer config + weights / bias snapshots (small relative to states)
+        "layer_config": _spec_gdn_layer_config(layer),
+        "conv_weight": layer.conv1d.weight.detach().to("cpu").clone(),
+        "conv_bias": (bias.detach().to("cpu").clone() if bias is not None else None),
+        "A_log": layer.A_log.detach().to("cpu").clone(),
+        "dt_bias": layer.dt_bias.detach().to("cpu").clone(),
+        "is_conv_state_dim_first": conv_dim_first,
+    }
+
+    fname = f"tuple_{sanitized}_{step:06d}_{flavor}.pt"
+    torch.save(payload, os.path.join(dump_dir, fname))
+    _SPEC_GDN_DUMP_COUNT += 1
 
 
 _VLLM_XPU_FORCE_FLA_GDN = None
@@ -174,6 +451,231 @@ def _force_fla_gdn() -> bool:
     return _VLLM_XPU_FORCE_FLA_GDN
 
 
+_VLLM_XPU_USE_SYCL_SPEC_GDN: bool | None = None
+_SYCL_SPEC_GDN_OP_VALIDATED = False
+
+
+def _use_sycl_spec_gdn() -> bool:
+    """One-shot lookup of VLLM_XPU_USE_SYCL_SPEC_GDN env var.
+
+    Tri-state:
+      - unset / ``0`` (default): spec batches go to the FLA Triton oracle.
+      - ``auto``: try SYCL spec path; on missing op or schema mismatch,
+        log once and fall back to FLA. For staged rollout / forward-compat.
+      - ``1`` / ``true``: SYCL spec path is mandatory. If the op is
+        missing (kernel built with ``GDN_KERNELS_ENABLED=OFF``) or its
+        schema lacks the spec args (older kernel), fail loudly at
+        startup with a build-fix hint. No silent fallback — the whole
+        point of this opt-in is to actually exercise SYCL.
+
+    ``VLLM_XPU_FORCE_FLA_GDN=1`` still wins regardless.
+    """
+    global _VLLM_XPU_USE_SYCL_SPEC_GDN
+    if _VLLM_XPU_USE_SYCL_SPEC_GDN is None:
+        import os
+
+        raw = os.environ.get("VLLM_XPU_USE_SYCL_SPEC_GDN", "").lower()
+        _VLLM_XPU_USE_SYCL_SPEC_GDN = raw in ("1", "true", "yes", "on", "auto")
+    return _VLLM_XPU_USE_SYCL_SPEC_GDN
+
+
+def _sycl_spec_gdn_strict() -> bool:
+    """True iff VLLM_XPU_USE_SYCL_SPEC_GDN is a hard opt-in (not 'auto')."""
+    import os
+
+    return os.environ.get("VLLM_XPU_USE_SYCL_SPEC_GDN", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _validate_sycl_spec_gdn_op() -> None:
+    """Confirm torch.ops._xpu_C.gdn_attention exists and accepts the spec
+    kwargs. Called lazily on first use of the SYCL spec path. Raises
+    RuntimeError with a build-fix hint when strict mode is set; under
+    'auto' the caller catches and falls back."""
+    global _SYCL_SPEC_GDN_OP_VALIDATED
+    if _SYCL_SPEC_GDN_OP_VALIDATED:
+        return
+    if not hasattr(torch.ops._xpu_C, "gdn_attention"):
+        raise RuntimeError(
+            "torch.ops._xpu_C.gdn_attention is not registered. The "
+            "vllm-xpu-kernels build was produced with "
+            "GDN_KERNELS_ENABLED=OFF. Rebuild with "
+            "GDN_KERNELS_ENABLED=ON, e.g. "
+            "`GDN_KERNELS_ENABLED=ON vllm-xpu-build` from the flake."
+        )
+    schema = str(torch.ops._xpu_C.gdn_attention.default._schema)
+    if "spec_state_indices_tensor" not in schema:
+        raise RuntimeError(
+            "torch.ops._xpu_C.gdn_attention is missing the spec args "
+            "(spec_state_indices_tensor / num_accepted_tokens). The "
+            "vllm-xpu-kernels build is older than the spec-decoding "
+            "patch. Rebuild from the current vllm-xpu-kernels HEAD."
+        )
+    _SYCL_SPEC_GDN_OP_VALIDATED = True
+
+
+def _gdn_xpu_spec_sycl_path(
+    core_attn_out: torch.Tensor,
+    z: torch.Tensor,
+    projected_states_qkvz: torch.Tensor,
+    projected_states_ba: torch.Tensor,
+    layer,
+    attn_metadata,
+) -> None:
+    """Dispatch the SYCL gdn_attention op for a spec batch.
+
+    Mirrors the spec/non-spec split that ``_forward_core`` does for the
+    FLA Triton path (gdn_linear_attn.py:815-1006): when both kinds of
+    sequences are present in the batch, we issue **two** kernel calls
+    (one per subset) and scatter the outputs back into the caller's
+    ``core_attn_out`` / ``z`` buffers using the captured
+    ``spec_token_indx`` / ``non_spec_token_indx`` indices.
+
+    Pre-condition: ``VLLM_XPU_FORCE_FLA_GDN`` is unset and the SYCL op
+    accepts the new ``spec_state_indices_tensor`` / ``num_accepted_tokens``
+    kwargs (validated by the caller via try/except).
+    """
+    spec_token_indx = attn_metadata.spec_token_indx
+    non_spec_token_indx = attn_metadata.non_spec_token_indx
+    spec_query_start_loc = attn_metadata.spec_query_start_loc
+    non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+    spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor
+    non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
+    num_accepted_tokens = attn_metadata.num_accepted_tokens
+    has_initial_state = attn_metadata.has_initial_state
+    num_actual_tokens = int(attn_metadata.num_actual_tokens)
+    num_prefills = int(attn_metadata.num_prefills)
+    num_decodes = int(attn_metadata.num_decodes)
+    num_spec_decodes = int(attn_metadata.num_spec_decodes or 0)
+
+    has_non_spec = (num_prefills + num_decodes) > 0
+
+    core_attn_out = core_attn_out[:num_actual_tokens]
+    z = z[:num_actual_tokens]
+    qkvz = projected_states_qkvz[:num_actual_tokens]
+    ba = projected_states_ba[:num_actual_tokens]
+
+    conv_weights = layer.conv1d.weight.view(
+        layer.conv1d.weight.size(0), layer.conv1d.weight.size(2)
+    )
+
+    common_kwargs = dict(
+        conv_state=layer.kv_cache[0],
+        ssm_state=layer.kv_cache[1],
+        conv_weights=conv_weights,
+        conv_bias=layer.conv1d.bias,
+        activation=layer.activation,
+        A_log=layer.A_log,
+        dt_bias=layer.dt_bias,
+        tp_size=layer.tp_size,
+        reorder_input=not layer.gqa_interleaved_layout,
+    )
+
+    if not has_non_spec:
+        # Spec-only batch: single kernel call against the spec slot ring.
+        torch.ops._xpu_C.gdn_attention(
+            core_attn_out,
+            z,
+            qkvz.contiguous(),
+            ba.contiguous(),
+            layer.num_k_heads,
+            layer.num_v_heads,
+            layer.head_k_dim,
+            layer.head_v_dim,
+            num_prefills=0,
+            num_decodes=num_spec_decodes,
+            has_initial_state=None,
+            non_spec_query_start_loc=spec_query_start_loc[
+                : num_spec_decodes + 1
+            ].contiguous(),
+            non_spec_state_indices_tensor=spec_state_indices_tensor[:, 0]
+            .contiguous(),
+            num_actual_tokens=num_actual_tokens,
+            spec_state_indices_tensor=spec_state_indices_tensor,
+            num_accepted_tokens=num_accepted_tokens,
+            **common_kwargs,
+        )
+        return
+
+    # Mixed batch: split, run twice, scatter.
+    spec_qkvz = qkvz.index_select(0, spec_token_indx).contiguous()
+    spec_ba = ba.index_select(0, spec_token_indx).contiguous()
+    non_spec_qkvz = qkvz.index_select(0, non_spec_token_indx).contiguous()
+    non_spec_ba = ba.index_select(0, non_spec_token_indx).contiguous()
+
+    n_spec = spec_qkvz.size(0)
+    n_non_spec = non_spec_qkvz.size(0)
+
+    out_shape_per_token = (
+        layer.num_v_heads // layer.tp_size,
+        layer.head_v_dim,
+    )
+    spec_core = torch.empty(
+        (n_spec,) + out_shape_per_token,
+        dtype=core_attn_out.dtype,
+        device=core_attn_out.device,
+    )
+    spec_z = torch.empty_like(spec_core)
+    non_spec_core = torch.empty(
+        (n_non_spec,) + out_shape_per_token,
+        dtype=core_attn_out.dtype,
+        device=core_attn_out.device,
+    )
+    non_spec_z = torch.empty_like(non_spec_core)
+
+    # Non-spec subset.
+    torch.ops._xpu_C.gdn_attention(
+        non_spec_core,
+        non_spec_z,
+        non_spec_qkvz,
+        non_spec_ba,
+        layer.num_k_heads,
+        layer.num_v_heads,
+        layer.head_k_dim,
+        layer.head_v_dim,
+        num_prefills=num_prefills,
+        num_decodes=num_decodes,
+        has_initial_state=has_initial_state,
+        non_spec_query_start_loc=non_spec_query_start_loc,
+        non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+        num_actual_tokens=n_non_spec,
+        **common_kwargs,
+    )
+
+    # Spec subset.
+    torch.ops._xpu_C.gdn_attention(
+        spec_core,
+        spec_z,
+        spec_qkvz,
+        spec_ba,
+        layer.num_k_heads,
+        layer.num_v_heads,
+        layer.head_k_dim,
+        layer.head_v_dim,
+        num_prefills=0,
+        num_decodes=num_spec_decodes,
+        has_initial_state=None,
+        non_spec_query_start_loc=spec_query_start_loc[
+            : num_spec_decodes + 1
+        ].contiguous(),
+        non_spec_state_indices_tensor=spec_state_indices_tensor[:, 0]
+        .contiguous(),
+        num_actual_tokens=n_spec,
+        spec_state_indices_tensor=spec_state_indices_tensor,
+        num_accepted_tokens=num_accepted_tokens,
+        **common_kwargs,
+    )
+
+    core_attn_out.index_copy_(0, non_spec_token_indx, non_spec_core)
+    core_attn_out.index_copy_(0, spec_token_indx, spec_core)
+    z.index_copy_(0, non_spec_token_indx, non_spec_z)
+    z.index_copy_(0, spec_token_indx, spec_z)
+
+
 def _gdn_attention_core_xpu_impl(
     core_attn_out: torch.Tensor,
     z: torch.Tensor,
@@ -196,10 +698,47 @@ def _gdn_attention_core_xpu_impl(
     attn_metadata = attn_metadata_raw[self.prefix]
     assert isinstance(attn_metadata, GDNAttentionMetadata)
 
-    if (
-        attn_metadata.spec_sequence_masks is not None  # type: ignore[attr-defined]
-        or _force_fla_gdn()
-    ):
+    is_spec_batch = attn_metadata.spec_sequence_masks is not None  # type: ignore[attr-defined]
+
+    if is_spec_batch and _use_sycl_spec_gdn() and not _force_fla_gdn():
+        # Spec batches dispatch to the SYCL kernel via the Python-side
+        # spec/non-spec split. Strict mode (=1) raises on op/schema
+        # mismatch — explicit opt-in shouldn't silently degrade.
+        # 'auto' mode catches build-availability errors and falls back
+        # to FLA for staged rollout; runtime errors from the kernel
+        # itself always propagate so we don't paper over real bugs.
+        if _sycl_spec_gdn_strict():
+            _validate_sycl_spec_gdn_op()
+            _gdn_xpu_spec_sycl_path(
+                core_attn_out,
+                z,
+                projected_states_qkvz,
+                projected_states_ba,
+                self,
+                attn_metadata,
+            )
+            return
+        try:
+            _validate_sycl_spec_gdn_op()
+        except RuntimeError as e:
+            logger.warning_once(
+                "SYCL gdn_attention spec path unavailable (%s); "
+                "falling back to FLA Triton. Set "
+                "VLLM_XPU_USE_SYCL_SPEC_GDN=1 to make this fatal.",
+                e,
+            )
+        else:
+            _gdn_xpu_spec_sycl_path(
+                core_attn_out,
+                z,
+                projected_states_qkvz,
+                projected_states_ba,
+                self,
+                attn_metadata,
+            )
+            return
+
+    if is_spec_batch or _force_fla_gdn():
         # See _gdn_xpu_spec_python_path docstring. The custom op is
         # opaque to torch.compile, so this runtime branch survives
         # graph capture; the equivalent check in forward_xpu's body
