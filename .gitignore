@@ -246,3 +246,7 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# spec-gdn disasm large artifacts (regenerable from .so via extract_section.py)
+.spec_gdn_disasm/**/OFFLOAD_DEVICE_CODE.raw
+.spec_gdn_disasm/:ud

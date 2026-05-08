@@ -1,0 +1,1102 @@
+LN:
+(W)     and (1|M0)               rN.0<1>:ud  rN.0<0;1,0>:ud    0xFFFFFFC0:ud             
+(W)     add (1|M0)               rN.0<1>:ud  rN.0<0;1,0>:ud  0x0:ud              {I@1}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0xFF000000            0x6219D500           {A@1,$0} // wr:1+0, rd:1; load.ugm.d32x16t.a32.ca.cc.bti[255]
+(W)     send.ugm (1|M0)          rN       rN  null:0  0xFF040000            0x6219C500           {$1} // wr:1+0, rd:1; load.ugm.d32x8t.a32.ca.cc.bti[255][A+0x40]
+(W)     mov (16|M0)              rN.0<1>:ud   rN.0<1;1,0>:ud                   {Compacted}
+(W)     mov (1|M0)               rN.0<1>:f     9.18355e-41:f                              
+(W)     and (1|M0)               rN.9<1>:ud    rN.5<0;1,0>:ud   0xFFFFFC00:ud              {I@1}
+(W)     or (1|M0)                cr0.0<1>:ud   cr0.0<0;1,0>:ud   0x400004C0:ud              {A@1}
+(W)     mov (8|M0)               rN.0<1>:w    0x76543210:v                               {A@1}
+(W)     cmp (32|M0)   (eq)f3.0   null<1>:d     rN.1<0;1,0>:d     0:w               {$1.dst}
+(W)     add (8|M0)               rN.8<1>:w    rN.0<1;1,0>:w    8:w               {I@2}
+(W)     mov (1|M0)               rN.15<1>:d    rN.1<0;1,0>:d                  
+(W)     add (16|M0)              rN.16<1>:w   rN.0<1;1,0>:w    16:w               {I@2}
+(W)     mov (1|M0)               rN.4<2>:b     rN.8<0;1,0>:b                  
+(W&~f3.0) jmpi                               LN                                
+LN:
+(W)     mov (1|M0)               rN.8<1>:d     -1:w                              
+(W)     jmpi                                 LN                                
+LN:
+(W)     asr (1|M0)               rN.15<1>:d    rN.1<0;1,0>:d     31:w              
+(W)     asr (1|M0)               rN.14<1>:d    rN.3<0;1,0>:d     31:w              
+(W)     add (1|M0)               rN.10<1>:d    rN.15<0;1,0>:d    rN.1<0;1,0>:d    {I@2}
+(W)     xor (1|M0)               rN.11<1>:d    rN.10<0;1,0>:d    rN.15<0;1,0>:d   {I@1}
+(W)     add (1|M0)               rN.10<1>:d    rN.14<0;1,0>:d    rN.3<0;1,0>:d   
+(W)     xor (1|M0)               rN.9<1>:d     rN.10<0;1,0>:d    rN.14<0;1,0>:d   {I@1}
+(W)     xor (1|M0)               cr0.0<1>:ud   cr0.0<0;1,0>:ud   0x30:uw              {A@1}
+(W)     mov (1|M0)               rN.7<1>:f     rN.11<0;1,0>:ud                  {A@1}
+(W)     mov (1|M0)               rN.6<1>:f     rN.9<0;1,0>:ud                   {I@2}
+(W)     mov (1|M0)               rN.10<1>:ud   rN.7<0;1,0>:f                    {F@2}
+(W)     math.inv (1|M0)          rN.10<1>:f    rN.7<0;1,0>:f                   
+(W)     add (1|M0)               rN.12<1>:d    rN.11<0;1,0>:d    -rN.10<0;1,0>:d  {I@1}
+(W)     mov (1|M0)               rN.10<1>:f    0xB4C00000:f                               {I@1}
+(W)     mov (1|M0)               rN.12<1>:f    rN.12<0;1,0>:ud                 
+(W)     mad (1|M0)               rN.14<1>:f    rN.10<0;0>:f      rN.10<0;0>:f      rN.10<0>:f       {A@1}
+(W)     mov (1|M0)               rN.10<1>:ud   rN.6<0;1,0>:f                    {F@1}
+(W)     mul (1|M0)               rN.10<1>:f    rN.6<0;1,0>:f     rN.14<0;1,0>:f  
+(W)     add (1|M0)               rN.13<1>:d    rN.9<0;1,0>:d     -rN.10<0;1,0>:d  {I@1}
+(W)     mov (1|M0)               rN.11<1>:ud   rN.10<0;1,0>:f                   {F@1}
+(W)     mov (1|M0)               rN.13<1>:f    rN.13<0;1,0>:ud                  {I@2}
+(W)     mov (1|M0)               rN.10<1>:f    rN.11<0;1,0>:ud                  {I@1}
+(W)     mad (1|M0)               rN.6<1>:f     rN.6<0;0>:f       rN.10<0;0>:f      -rN.7<0>:f       {F@1}
+(W)     mad (1|M0)               rN.10<1>:f    rN.13<0;0>:f      rN.10<0;0>:f      -rN.12<0>:f     
+(W)     add (1|M0)               rN.10<1>:f    rN.6<0;1,0>:f     rN.10<0;1,0>:f   {F@1}
+(W)     mul (1|M0)               rN.6<1>:f     rN.14<0;1,0>:f    rN.10<0;1,0>:f   {F@1}
+(W)     xor (1|M0)               cr0.0<1>:ud   cr0.0<0;1,0>:ud   0x30:uw              {A@1}
+(W)     mov (1|M0)               rN.10<1>:ud   rN.6<0;1,0>:f                    {A@1}
+(W)     xor (1|M0)               rN.7<1>:d     rN.15<0;1,0>:d    rN.14<0;1,0>:d  
+(W)     add (1|M0)               rN.6<1>:d     rN.10<0;1,0>:d    rN.11<0;1,0>:d   {I@2}
+(W)     mul (1|M0)               accN.0<1>:d   rN.6<0;1,0>:d     rN.22<0;1,0>:uw  {I@1}
+(W)     macl (1|M0)              rN.0<1>:d     rN.6<0;1,0>:d     rN.11<0;1,0>:d   {Compacted}
+(W)     add (1|M0)               rN.10<1>:d    rN.9<0;1,0>:d     -rN.0<0;1,0>:d   {I@1}
+(W)     cmp (1|M0)    (ge)f0.0   rN.10<1>:ud   rN.10<0;1,0>:ud   rN.11<0;1,0>:ud  {I@1}
+(W)     add3 (1|M0)              rN.10<1>:d    rN.6<0;0>:d       rN.7<0;0>:d       -rN.10<0>:d      {I@1}
+(W)     bfn.(s0^s1^s2) (1|M0)    rN.8<1>:ud    rN.10<0;0>:ud     rN.15<0;0>:ud     rN.14<0>:ud      {I@1}
+LN:
+(W)     mov (1|M0)               rN.10<1>:d    rN.4<0;1,0>:ub                  
+(W)     shl (1|M0)               rN.11<1>:d    rN.15<0;1,0>:d    5:w              
+(W)     shl (1|M0)               rN.10<1>:d    rN.10<0;1,0>:d    2:w               {I@2}
+(W)     add (1|M0)               rN.6<1>:d     rN.11<0;1,0>:d    rN.10<0;1,0>:d   {I@1}
+(W)     cmp (32|M0)   (lt)f2.0   null<1>:d     rN.6<0;1,0>:d     rN.4<0;1,0>:d    {I@1}
+(W&~f2.0) jmpi                               LN                                
+LN:
+(W)     mov (1|M0)               rN.7<1>:d     rN.6<0;1,0>:d                  
+(W)     shl (1|M0)               rN.7<1>:q     rN.7<0;1,0>:ud   2:w              
+(W)     shl (1|M0)               rN.6<1>:q     rN.7<0;1,0>:ud    2:w               {I@2}
+(W)     add (1|M0)               rN.0<1>:q     rN.7<0;1,0>:q     rN.7<0;1,0>:q    {Compacted,@2,$0.dst}
+(W)     add (1|M0)               rN.0<1>:q    rN.6<0;1,0>:q     rN.2<0;1,0>:q    {Compacted,I@2}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x0            0x02108580           {I@2,$2} // wr:1+0, rd:1; load.ugm.d32x1t.a64
+        sync.nop                             null                             {Compacted,$2.src}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x0            0x02108580           {I@1,$3} // wr:1+0, rd:1; load.ugm.d32x1t.a64
+(W)     shl (1|M0)               rN.7<1>:q     rN.7<0;1,0>:ud    1:w              
+(W)     mul (1|M0)               accN.0<1>:d   rN.7<0;1,0>:d     rN.4<0;1,0>:uw  
+(W)     add (1|M0)               rN.0<1>:q     rN.7<0;1,0>:q     rN.3<0;1,0>:q    {Compacted,I@2}
+(W)     macl (1|M0)              rN.0<1>:d     rN.7<0;1,0>:d     rN.2<0;1,0>:d   
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x0            0x04100B80           {I@2,$4} // wr:2+0, rd:1; load.ugm.d16u32.a64
+(W)     mul (1|M0)               accN.0<1>:d   rN.0<0;1,0>:d     rN.8<0;1,0>:uw   {I@1}
+(W)     macl (1|M0)              rN.0<1>:d     rN.0<0;1,0>:d     rN.4<0;1,0>:d    {Compacted}
+(W)     mul (1|M0)               accN.0<1>:d   rN.7<0;1,0>:d    rN.10<0;1,0>:uw 
+(W)     mov (1|M0)               rN.7<1>:d     rN.0<0;1,0>:d                    {I@2}
+(W)     macl (1|M0)              rN.0<1>:d     rN.7<0;1,0>:d    rN.5<0;1,0>:d   
+        mov (32|M0)              rN.0<1>:d   rN.0<1;1,0>:uw                 
+(W)     mov (1|M0)               rN.14<1>:d    rN.0<0;1,0>:d                    {I@2}
+        shl (32|M0)              rN.0<1>:d    rN.0<1;1,0>:d   2:w               {Compacted,I@2}
+(W)     mov (1|M0)               rN.10<1>:ud   0xBF317200:ud                             
+(W)     mov (1|M0)               rN.9<1>:f     0xB5BFBE8E:f                              
+(W)     cmp (32|M0)   (lt)f1.0   null<1>:d     rN.0<0;1,0>:d     1:w               {$2.dst}
+(W)     mul (1|M0)               rN.4<1>:f     rN.0<0;1,0>:f     1.442695e+00:f               {$3.dst}
+(W)     cmp (1|M0)    (lt)f3.0   null<1>:f     rN.0<0;1,0>:f     -105.0:f              
+(W)     rndz (1|M0)              rN.0<1>:f     rN.4<0;1,0>:f                    {Compacted,A@2}
+(W)     mov (1|M0)               rN.4<1>:f     0xBF317200:f                              
+(W)     cmp (1|M0)    (gt)f2.0   null<1>:f     rN.0<0;1,0>:f     105.0:f              
+(W)     mad (1|M0)               rN.5<1>:f     rN.0<0;0>:f       rN.4<0;0>:f       rN.0<0>:f        {F@2}
+(W)     mov (1|M0)               rN.4<1>:f     0xB5BFBE8E:f                              
+(W)     math.exp (1|M0)          rN.0<1>:f     rN.0<0;1,0>:f                    {F@2}
+(W)     mad (1|M0)               rN.4<1>:f     rN.5<0;0>:f       rN.4<0;0>:f       rN.0<0>:f        {F@1}
+(W)     shl (1|M0)               rN.14<1>:ud   rN.0<0;1,0>:uw    0x10:uw              {$4.dst}
+(W)     mul (1|M0)               rN.1<1>:f     rN.4<0;1,0>:f     1.442695e+00:f               {F@1}
+(W)     math.exp (1|M0)          rN.1<1>:f     rN.1<0;1,0>:f                    {F@1}
+(W)     mul (1|M0)               rN.4<1>:f     rN.0<0;1,0>:f     rN.1<0;1,0>:f    {Compacted,M@1}
+(W&~f3.0) sel (1|M0)             rN.4<1>:f     rN.4<0;1,0>:f     0.0:f               {F@1}
+(W&~f2.0) sel (1|M0)             rN.10<1>:f    rN.4<0;1,0>:f     inf:f               {F@1}
+(W&f1.0) jmpi                                LN                                
+LN:
+(W)     add3 (1|M0)              rN.4<1>:d     rN.14<0;0>:d      rN.0<0;0>:d       -1:w               {F@1}
+(W)     shl (1|M0)               rN.2<1>:q     rN.4<0;1,0>:d     2:w               {I@1}
+(W)     add (1|M0)               rN.0<1>:q     rN.2<0;1,0>:q     rN.6<0;1,0>:q    {I@1}
+(W)     asr (1|M0)               rN.4<1>:d     rN.0<0;1,0>:d     31:w               {Compacted}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x0            0x02108580           {I@2,$5} // wr:1+0, rd:1; load.ugm.d32x1t.a64
+(W)     mul (1|M0)               accN.0<1>:ud  rN.0<0;1,0>:ud    rN.0<0;1,0>:uw   {$5.dst}
+(W)     macl (1|M0)              rN.0<1>:ud    rN.0<0;1,0>:ud    rN.0<0;1,0>:ud   {Compacted}
+(W)     mul (1|M0)               accN.0<1>:ud  rN.0<0;1,0>:ud    rN.0<0;1,0>:uw  
+(W)     asr (1|M0)               rN.5<1>:d     rN.0<0;1,0>:d     31:w              
+(W)     mach (1|M0)              rN.0<1>:d     rN.0<0;1,0>:ud    rN.0<0;1,0>:ud  
+(W)     mul (1|M0)               accN.0<1>:d   rN.0<0;1,0>:ud    rN.8<0;1,0>:uw   {I@6}
+(W)     cmp (32|M0)   (gt)f1.0   null<1>:d     rN.0<0;1,0>:d     0:w              
+(W)     macl (1|M0)              rN.0<1>:d     rN.0<0;1,0>:ud    rN.4<0;1,0>:d   
+(W)     mul (1|M0)               accN.0<1>:d   rN.0<0;1,0>:ud    rN.10<0;1,0>:uw  {I@5}
+(W)     add (1|M0)               rN.0<1>:d     rN.0<0;1,0>:d     rN.0<0;1,0>:d    {Compacted,I@2}
+(W)     macl (1|M0)              rN.0<1>:d     rN.0<0;1,0>:ud    rN.5<0;1,0>:d   
+(W)     add (1|M0)               rN.11<1>:d    rN.0<0;1,0>:d     rN.0<0;1,0>:d    {I@1}
+(W&f1.0) jmpi                                LN                                
+LN:
+        mov (32|M0)              rN.0<1>:ud   0x0:ud                              {Compacted}
+        mov (32|M0)              rN.0<1>:ud   0x0:ud                              {Compacted}
+        mov (32|M0)              rN.0<1>:ud   0x0:ud                              {Compacted}
+        mov (32|M0)              rN.0<1>:ud   0x0:ud                              {Compacted}
+        mov (32|M0)              rN.0<1>:ud   0x0:ud                              {Compacted}
+        mov (32|M0)              rN.0<1>:ud   0x0:ud                              {Compacted}
+        mov (32|M0)              rN.0<1>:ud   0x0:ud                              {Compacted}
+        mov (32|M0)              rN.0<1>:ud   0x0:ud                              {Compacted}
+        mov (32|M0)              rN.0<1>:f    0.0:f                               {Compacted}
+        mov (32|M0)              rN.0<1>:f    0.0:f                               {Compacted}
+        mov (32|M0)              rN.0<1>:f    0.0:f                               {Compacted}
+        mov (32|M0)              rN.0<1>:f    0.0:f                               {Compacted}
+        mov (32|M0)              rN.0<1>:f    0.0:f                               {Compacted}
+        mov (32|M0)              rN.0<1>:f    0.0:f                               {Compacted}
+        mov (32|M0)              rN.0<1>:f    0.0:f                               {Compacted}
+        mov (32|M0)              rN.0<1>:f    0.0:f                               {Compacted}
+(W)     jmpi                                 LN                                
+LN:
+(W)     or (1|M0)                rN.6<1>:d     rN.6<0;1,0>:d     1:w              
+(W)     mul (1|M0)               accN.0<1>:d   rN.6<0;1,0>:d     rN.4<0;1,0>:uw  
+(W)     or (1|M0)                rN.15<1>:d    rN.6<0;1,0>:d     2:w              
+(W)     mov (1|M0)               rN.4<1>:d     rN.0<0;1,0>:d                    {Compacted}
+(W)     mov (1|M0)               rN.5<1>:d     rN.11<0;1,0>:d                  
+(W)     macl (1|M0)              rN.0<1>:d     rN.6<0;1,0>:d     rN.2<0;1,0>:d    {Compacted}
+(W)     mul (1|M0)               accN.0<1>:d   rN.6<0;1,0>:d     rN.4<0;1,0>:uw   {I@6}
+(W)     macl (1|M0)              rN.0<1>:d     rN.6<0;1,0>:d     rN.2<0;1,0>:d    {Compacted}
+(W)     mul (1|M0)               accN.0<1>:d   rN.15<0;1,0>:d    rN.4<0;1,0>:uw   {I@6}
+(W)     shl (1|M0)               rN.6<1>:q     rN.2<0;1,0>:q     1:w               {I@5}
+(W)     macl (1|M0)              rN.0<1>:d     rN.15<0;1,0>:d    rN.2<0;1,0>:d   
+(W)     add (1|M0)               rN.5<1>:d     rN.7<0;1,0>:d     rN.0<0;1,0>:d    {I@6}
+(W)     add (1|M0)               rN.4<1>:d     rN.7<0;1,0>:d     rN.0<0;1,0>:d    {I@5}
+(W)     add (1|M0)               rN.12<1>:d    rN.7<0;1,0>:d     rN.0<0;1,0>:d    {I@3}
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.5<0;1,0>:d    {Compacted,I@3}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add3 (32|M0)             rN.0<1>:d     rN.0<1;0>:d      rN.5<0;0>:d       1:w              
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add3 (32|M0)             rN.0<1>:d     rN.0<1;0>:d      rN.5<0;0>:d       2:w              
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add3 (32|M0)             rN.0<1>:d     rN.0<1;0>:d      rN.5<0;0>:d       3:w              
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted}
+(W)     mov (1|M0)               rN.8<1>:ud    a0.2<0;1,0>:ud                  
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@2}
+(W)     shr (1|M0)               a0.2<1>:ud    rN.9<0;1,0>:ud    0x4:ud              {F@1}
+        shl (16|M16)             rN.0<1>:q   rN.0<2;1,0>:d    1:w               {I@2}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+(W)     send.ugm (1|M0)          null     rN  rN:2  0x83400000:a0.2        0x4200E504           {I@2,$6} // wr:1+2, rd:0; store.ugm.d32x32t.a32.ss[a0.2][A-0xF980]
+        add3 (32|M0)             rN.0<1>:d     rN.0<1;0>:d      rN.4<0;0>:d       1:w              
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add3 (32|M0)             rN.0<1>:d     rN.0<1;0>:d      rN.4<0;0>:d       2:w              
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add3 (32|M0)             rN.0<1>:d     rN.0<1;0>:d      rN.4<0;0>:d       3:w              
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.12<0;1,0>:d  
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add3 (32|M0)             rN.0<1>:d     rN.0<1;0>:d      rN.12<0;0>:d      1:w              
+(W)     or (1|M0)                rN.5<1>:d     rN.6<0;1,0>:d     3:w              
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@2}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add3 (32|M0)             rN.0<1>:d     rN.0<1;0>:d      rN.12<0;0>:d      2:w              
+(W)     mul (1|M0)               accN.0<1>:d   rN.5<0;1,0>:d     rN.4<0;1,0>:uw   {I@4}
+(W)     macl (1|M0)              rN.0<1>:d     rN.5<0;1,0>:d     rN.2<0;1,0>:d   
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@3}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add3 (32|M0)             rN.0<1>:d     rN.0<1;0>:d      rN.12<0;0>:d      3:w              
+(W)     add (1|M0)               rN.13<1>:d    rN.7<0;1,0>:d     rN.0<0;1,0>:d    {I@4}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@2}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.13<0;1,0>:d   {I@3}
+        shl (16|M16)             rN.0<1>:q   rN.0<2;1,0>:d    1:w               {$6.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@2}
+        mov (16|M16)             rN.0<2>:ud  rN.0<1;1,0>:ud                   {Compacted}
+        add3 (32|M0)             rN.0<1>:d     rN.0<1;0>:d      rN.13<0;0>:d      1:w              
+(W)     send.ugm (1|M0)          null     rN  rN:2  0x83800000:a0.2        0x4200E504           {I@4,$7} // wr:1+2, rd:0; store.ugm.d32x32t.a32.ss[a0.2][A-0xF900]
+        shl (16|M0)              rN.0<1>:q   rN.0<2;1,0>:d    1:w               {$7.src}
+        mov (16|M0)              rN.0<2>:ud  rN.0<1;1,0>:ud                   {Compacted,I@2}
+        mov (16|M16)             rN.0<2>:ud  rN.0<1;1,0>:ud                   {Compacted}
+        add3 (32|M0)             rN.0<1>:d     rN.0<1;0>:d      rN.13<0;0>:d      2:w              
+(W)     send.ugm (1|M0)          null     rN  rN:2  0x83C00000:a0.2        0x4200E504           {I@4,$8} // wr:1+2, rd:0; store.ugm.d32x32t.a32.ss[a0.2][A-0xF880]
+        shl (16|M0)              rN.0<1>:q   rN.0<2;1,0>:d    1:w               {$8.src}
+(W)     send.ugm (1|M0)          null     rN  rN:2  0x84000000:a0.2        0x4200E504           {I@1,$9} // wr:1+2, rd:0; store.ugm.d32x32t.a32.ss[a0.2][A-0xF800]
+        add3 (32|M0)             rN.0<1>:d    rN.0<1;0>:d      rN.13<0;0>:d      3:w              
+        mov (16|M0)              rN.0<2>:ud  rN.0<1;1,0>:ud                   {Compacted}
+        shl (16|M0)              rN.0<1>:q   rN.0<2;1,0>:d   1:w               {$9.src}
+(W)     send.ugm (1|M0)          null     rN  rN:2  0x84400000:a0.2        0x4200E504           {I@1,$10} // wr:1+2, rd:0; store.ugm.d32x32t.a32.ss[a0.2][A-0xF780]
+        shl (16|M0)              rN.0<1>:q   rN.0<2;1,0>:d   1:w               {$10.src}
+        mov (16|M0)              rN.0<2>:ud    rN.0<1;1,0>:ud                  {Compacted}
+(W)     send.ugm (1|M0)          null     rN  rN:2  0x84800000:a0.2        0x4200E504           {I@2,$11} // wr:1+2, rd:0; store.ugm.d32x32t.a32.ss[a0.2][A-0xF700]
+        sync.nop                             null                             {Compacted,$11.src}
+(W)     send.ugm (1|M0)          rN     rN  null:0  0x83400000:a0.2        0x4220E500           {$12} // wr:1+0, rd:2; load.ugm.d32x32t.a32.ss[a0.2][A-0xF980]
+(W)     send.ugm (1|M0)          null     rN  rN:2  0x82C00000:a0.2        0x4200E504           {I@1,$13} // wr:1+2, rd:0; store.ugm.d32x32t.a32.ss[a0.2][A-0xFA80]
+        mov (16|M16)             rN.0<2>:ud  rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M16)             rN.0<2>:ud    rN.0<1;1,0>:ud                  {Compacted,$13.src}
+        shl (16|M16)             rN.0<1>:q     rN.0<2;1,0>:d    1:w              
+(W)     send.ugm (1|M0)          null     rN  rN:4  0x82000000:a0.2        0x4200F504           {I@1,$14} // wr:1+4, rd:0; store.ugm.d32x64t.a32.ss[a0.2][A-0xFC00]
+        shl (16|M16)             rN.0<1>:q     rN.0<2;1,0>:d    1:w               {$14.src}
+(W)     send.ugm (1|M0)          null     rN  rN:2  0x83000000:a0.2        0x4200E504           {I@1,$15} // wr:1+2, rd:0; store.ugm.d32x32t.a32.ss[a0.2][A-0xFA00]
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {$15.src}
+(W)     add (1|M0)               rN.5<1>:q     rN.6<0;1,0>:q     rN.4<0;1,0>:q   
+(W)     send.ugm (1|M0)          null     rN  rN:2  0x81C00000:a0.2        0x4200E504           {I@2,$0} // wr:1+2, rd:0; store.ugm.d32x32t.a32.ss[a0.2][A-0xFC80]
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {$0.src}
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w              
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+(W)     send.ugm (1|M0)          null     rN  rN:2  0x82800000:a0.2        0x4200E504           {I@3,$1} // wr:1+2, rd:0; store.ugm.d32x32t.a32.ss[a0.2][A-0xFB00]
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+(W)     send.ugm (1|M0)          null     rN  rN:4  0x80400000:a0.2        0x4200F504           {I@1,$2} // wr:1+4, rd:0; store.ugm.d32x64t.a32.ss[a0.2][A-0xFF80]
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+        shl (16|M16)             rN.0<1>:q   rN.0<2;1,0>:d   1:w              
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {$2.src}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+(W)     send.ugm (1|M0)          null     rN  rN:4  0x80C00000:a0.2        0x4200F504           {I@1,$3} // wr:1+4, rd:0; store.ugm.d32x64t.a32.ss[a0.2][A-0xFE80]
+        shl (16|M0)              rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {$3.src}
+        shl (16|M0)              rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+(W)     send.ugm (1|M0)          null     rN  rN:4  0x81400000:a0.2        0x4200F504           {I@1,$4} // wr:1+4, rd:0; store.ugm.d32x64t.a32.ss[a0.2][A-0xFD80]
+        shl (16|M0)              rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted}
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted}
+        shl (16|M0)              rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q  {Compacted,$12.dst}
+(W)     send.ugm (1|M0)          rN     rN  null:0  0x83800000:a0.2        0x4220E500           {I@1,$5} // wr:1+0, rd:2; load.ugm.d32x32t.a32.ss[a0.2][A-0xF900]
+        sync.nop                             null                             {Compacted,$1.src}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x82C00000:a0.2        0x4220E500           {$6} // wr:1+0, rd:2; load.ugm.d32x32t.a32.ss[a0.2][A-0xFA80]
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+        shl (16|M16)             rN.0<1>:q   rN.0<2;1,0>:d   1:w              
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@3}
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted}
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted}
+        shl (16|M0)              rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d   1:w              
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted}
+        sync.nop                             null                             {Compacted,$4.src}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x80400000:a0.2        0x4240F500           {$7} // wr:1+0, rd:4; load.ugm.d32x64t.a32.ss[a0.2][A-0xFF80]
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted}
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@4}
+        shl (16|M0)              rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted}
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@3}
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@3}
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q  {Compacted}
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {F@7,$8} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {F@5,$9} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {F@4,$10} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q  {Compacted,$5.dst}
+(W)     send.ugm (1|M0)          rN     rN  null:0  0x83C00000:a0.2        0x4220E500           {I@1,$11} // wr:1+0, rd:2; load.ugm.d32x32t.a32.ss[a0.2][A-0xF880]
+        shl (16|M0)              rN.0<1>:q   rN.0<2;1,0>:d     1:w               {$6.dst}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x82000000:a0.2        0x4240F500           {I@1,$13} // wr:1+0, rd:4; load.ugm.d32x64t.a32.ss[a0.2][A-0xFC00]
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {$14} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {F@3,$15} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        add (16|M0)              rN.0<1>:q   rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,$7.dst}
+        add (16|M16)             rN.0<1>:q   rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x80C00000:a0.2        0x4240F500           {I@1,$0} // wr:1+0, rd:4; load.ugm.d32x64t.a32.ss[a0.2][A-0xFE80]
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {$12} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q  {Compacted,$11.dst}
+(W)     send.ugm (1|M0)          rN     rN  null:0  0x84000000:a0.2        0x4220E500           {I@1,$2} // wr:1+0, rd:2; load.ugm.d32x32t.a32.ss[a0.2][A-0xF800]
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d     1:w               {$13.dst}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x83000000:a0.2        0x4220E500           {I@1,$1} // wr:1+0, rd:2; load.ugm.d32x32t.a32.ss[a0.2][A-0xFA00]
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted}
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {F@2,$3} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        add (16|M0)              rN.0<1>:q   rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,$0.dst}
+        add (16|M16)             rN.0<1>:q   rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x81400000:a0.2        0x4240F500           {I@1,$4} // wr:1+0, rd:4; load.ugm.d32x64t.a32.ss[a0.2][A-0xFD80]
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {$5} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$12.dst}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q  {Compacted,$2.dst}
+(W)     send.ugm (1|M0)          rN     rN  null:0  0x84400000:a0.2        0x4220E500           {I@1,$6} // wr:1+0, rd:2; load.ugm.d32x32t.a32.ss[a0.2][A-0xF780]
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,$1.dst}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x81C00000:a0.2        0x4220E500           {I@1,$7} // wr:1+0, rd:2; load.ugm.d32x32t.a32.ss[a0.2][A-0xFC80]
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {F@1,$11} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,$4.dst}
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted}
+        add (16|M16)             rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q  {Compacted}
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@3,$12} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@2,$13} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$5.dst}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q  {Compacted,$6.dst}
+(W)     send.ugm (1|M0)          rN     rN  null:0  0x84800000:a0.2        0x4220E500           {I@1,$0} // wr:1+0, rd:2; load.ugm.d32x32t.a32.ss[a0.2][A-0xF700]
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,$7.dst}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x82800000:a0.2        0x4220E500           {I@1,$1} // wr:1+0, rd:2; load.ugm.d32x32t.a32.ss[a0.2][A-0xFB00]
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {$2} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {$4} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        sync.nop                             null                             {Compacted,$1.src}
+(W)     mov (1|M0)               a0.2<1>:ud    rN.8<0;1,0>:ud                   {$0.src}
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$12.dst}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$8.dst}
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$13.dst}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$10.dst}
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$14.dst}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$11.dst}
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$15.dst}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q  {Compacted,$0.dst}
+        add (16|M0)              rN.0<1>:q    rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,$1.dst}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q  {Compacted}
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@3,$5} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@2,$6} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@1,$7} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$2.dst}
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$4.dst}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$9.dst}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$3.dst}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$5.dst}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$6.dst}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$7.dst}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+LN:
+(W)     add (1|M0)               rN.0<1>:q     rN.7<0;1,0>:q     rN.5<0;1,0>:q    {Compacted}
+(W)     send.ugm (1|M0)          rN      rN  null:0  0x0            0x02109580           {I@1,$8} // wr:1+0, rd:1; load.ugm.d32x2t.a64
+(W)     cmp (32|M0)   (lt)f0.0   null<1>:d     rN.0<0;1,0>:d    rN.1<0;1,0>:d   {$8.dst}
+(W&~f0.0) jmpi                               LN                                
+LN:
+(W)     mov (1|M0)               rN.10<1>:f    rN.2<0;1,0>:d                   
+        cmp (32|M0)   (eq)f3.0   null<2>:w     rN.0<1;1,0>:w    0:w              
+(W)     math.sqt (1|M0)          rN.7<1>:f     rN.10<0;1,0>:f                   {F@1}
+(W)     mov (1|M0)               rN.5<1>:q     rN.0<0;1,0>:d                    {M@1}
+(W)     mov (1|M0)               rN.5<1>:ud    0x3F317200:ud                             
+(W)     mov (1|M0)               rN.4<1>:ud    0x35BFBE8E:ud                             
+(W)     mov (1|M0)               rN.3<1>:ud    0xBF000000:ud                             
+(W)     mov (1|M0)               rN.2<1>:ud    0x3EAAAA83:ud                             
+(W)     mov (1|M0)               rN.15<1>:ud   0xBE7FFF78:ud                             
+(W)     mov (1|M0)               rN.14<1>:f    0x3E4CE814:f                              
+(W)     mov (1|M0)               rN.13<1>:f    0xBE2ACEE6:f                              
+(W)     mov (1|M0)               rN.11<1>:f    1.400587e-01:f                              
+(W)     mov (1|M0)               rN.5<1>:f     0xBDF9889E:f                              
+(W)     mov (1|M0)               rN.15<1>:f    0x3E0F335D:f                              
+(W)     mov (1|M0)               rN.11<1>:f    1.0:f                              
+(W)     mov (1|M0)               rN.15<1>:d    rN.0<0;1,0>:d                  
+(W)     mov (1|M0)               rN.0<1>:f     0xBE0402C8:f                               {I@7}
+(W)     mov (2|M0)               rN.12<1>:d    rN.10<1;1,0>:d                  
+LN:
+(W)     mul (1|M0)               accN.0<1>:d   rN.15<0;1,0>:d    rN.6<0;1,0>:uw   {I@2}
+(W)     macl (1|M0)              rN.0<1>:d     rN.15<0;1,0>:d    rN.3<0;1,0>:d    {$1.src}
+(W)     add (1|M0)               rN.5<1>:d     rN.0<0;1,0>:d     rN.7<0;1,0>:d    {I@1}
+(W)     shl (1|M0)               rN.4<1>:q     rN.5<0;1,0>:d     1:w               {I@1}
+(W)     add (1|M0)               rN.0<1>:q     rN.4<0;1,0>:q     rN.0<0;1,0>:q    {Compacted,I@1}
+(W)     add (1|M0)               rN.0<1>:q     rN.4<0;1,0>:q     rN.1<0;1,0>:q    {Compacted}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x0            0x04100B80           {I@2,$3} // wr:2+0, rd:1; load.ugm.d16u32.a64
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x0            0x04100B80           {I@1,$3} // wr:2+0, rd:1; load.ugm.d16u32.a64
+(W)     shl (1|M0)               rN.1<1>:ud    rN.0<0;1,0>:uw    0x10:uw             
+(W)     shl (1|M0)               rN.6<1>:ud    rN.0<0;1,0>:uw    0x10:uw              {$3.dst}
+(W)     mul (1|M0)               rN.8<1>:f     rN.1<0;1,0>:f     -1.442695e+00:f               {I@2}
+(W)     add (1|M0)               rN.6<1>:f     rN.6<0;1,0>:f     rN.14<0;1,0>:f   {I@1}
+(W)     rndz (1|M0)              rN.0<1>:f     rN.8<0;1,0>:f                    {Compacted,F@2}
+(W)     mov (1|M0)               rN.16<1>:bf   rN.6<0;1,0>:f                    {F@2}
+(W)     mad (1|M0)               rN.6<1>:f     -rN.1<0;0>:f      rN.10<0;0>:f      rN.0<0>:f        {F@2}
+(W)     math.exp (1|M0)          rN.0<1>:f     rN.0<0;1,0>:f                   
+(W)     mad (1|M0)               rN.6<1>:f     rN.6<0;0>:f       rN.9<0;0>:f       rN.0<0>:f        {F@1}
+(W)     cmp (1|M0)    (gt)f2.0   null<1>:f     rN.1<0;1,0>:f     105.0:f              
+(W)     mul (1|M0)               rN.1<1>:f     rN.6<0;1,0>:f     1.442695e+00:f               {F@2}
+(W)     cmp (1|M0)    (lt)f1.0   null<1>:f     rN.1<0;1,0>:f     -105.0:f              
+(W)     math.exp (1|M0)          rN.1<1>:f     rN.1<0;1,0>:f                    {F@2}
+(W)     mad (1|M0)               rN.6<1>:f     rN.11<0;0>:f      rN.0<0;0>:f       rN.1<0>:f        {M@1}
+(W)     shl (1|M0)               rN.1<1>:ud    rN.16<0;1,0>:uw   0x10:uw              {F@2}
+(W)     math.inv (1|M0)          rN.6<1>:f     rN.6<0;1,0>:f                    {F@1}
+(W)     cmp (32|M0)   (lt)f0.0   null<1>:f     rN.1<0;1,0>:f     20.0:f               {I@1}
+(W&~f2.0) sel (1|M0)             rN.6<1>:f     rN.6<0;1,0>:f     1.0:f               {M@1}
+(W&~f1.0) sel (1|M0)             rN.6<1>:f     rN.6<0;1,0>:f     0.0:f               {F@1}
+(W&~f0.0) jmpi                               LN                                
+LN:
+(W)     mul (1|M0)               rN.6<1>:f     rN.1<0;1,0>:f     1.442695e+00:f              
+(W)     cmp (1|M0)    (lt)f0.0   null<1>:f     rN.1<0;1,0>:f     -105.0:f               {I@1}
+(W)     rndz (1|M0)              rN.0<1>:f     rN.6<0;1,0>:f                    {Compacted,F@2}
+(W)     cmp (1|M0)    (gt)f2.0   null<1>:f     rN.1<0;1,0>:f     105.0:f              
+(W)     mad (1|M0)               rN.6<1>:f     rN.1<0;0>:f       rN.10<0;0>:f      rN.0<0>:f        {F@2}
+(W)     math.exp (1|M0)          rN.0<1>:f     rN.0<0;1,0>:f                   
+(W)     mad (1|M0)               rN.6<1>:f     rN.6<0;0>:f       rN.9<0;0>:f       rN.0<0>:f        {F@1}
+(W)     mul (1|M0)               rN.1<1>:f     rN.6<0;1,0>:f     1.442695e+00:f               {F@1}
+(W)     math.exp (1|M0)          rN.1<1>:f     rN.1<0;1,0>:f                    {F@1}
+(W)     mad (1|M0)               rN.6<1>:f     rN.11<0;0>:f      rN.0<0;0>:f       rN.1<0>:f        {M@1}
+(W&~f0.0) sel (1|M0)             rN.6<1>:f     rN.6<0;1,0>:f     1.0:f               {F@1}
+(W&~f2.0) sel (1|M0)             rN.6<1>:f     rN.6<0;1,0>:f     inf:f               {F@1}
+(W)     cmp (32|M0)   (gt)f0.0   null<1>:f     rN.6<0;1,0>:f     0.0:f               {F@1}
+(W)     and (1|M0)               rN.8<1>:d     rN.6<0;1,0>:d     2147483647:d              
+(W&f0.0) cmp (32|M0)  (lt)f0.0   null<1>:f     rN.8<0;1,0>:f     inf:f               {I@1}
+(W&f0.0) jmpi                                LN                                
+LN:
+(W)     math.log (1|M0)          rN.1<1>:f     rN.6<0;1,0>:f                   
+(W)     jmpi                                 LN                                
+LN:
+(W)     cmp (32|M0)   (lt)f1.0   null<1>:f     rN.6<0;1,0>:f     0x800000:f              
+(W)     mul (1|M0)               rN.9<1>:f     rN.6<0;1,0>:f     8.388608e+06:f              
+(W)     mov (1|M0)               rN.8<1>:ud    0xC1B80000:ud                              {F@3}
+(W&f1.0) sel (1|M0)              rN.6<1>:f     rN.9<0;1,0>:f     rN.6<0;1,0>:f    {A@1}
+(W&f1.0) sel (1|M0)              rN.11<1>:f    rN.8<0;1,0>:f     0.0:f               {I@1}
+(W)     add (1|M0)               rN.6<1>:d     rN.6<0;1,0>:d     -1059760811:d               {F@2}
+(W)     and (1|M0)               rN.8<1>:d     rN.6<0;1,0>:d     8388607:d               {A@1}
+(W)     asr (1|M0)               rN.6<1>:d     rN.6<0;1,0>:d     23:w              
+(W)     add (1|M0)               rN.9<1>:d     rN.8<0;1,0>:d     1059760811:d               {I@2}
+(W)     mov (1|M0)               rN.6<1>:f     rN.6<0;1,0>:d                    {I@2}
+(W)     add (1|M0)               rN.8<1>:f     rN.11<0;1,0>:f    rN.6<0;1,0>:f    {A@1}
+(W)     add (1|M0)               rN.6<1>:f     rN.9<0;1,0>:f     -1.0:f              
+(W)     mad (1|M0)               rN.9<1>:f     rN.15<0;0>:f      rN.0<0;0>:f       rN.6<0>:f        {F@1}
+(W)     mad (1|M0)               rN.9<1>:f     rN.5<0;0>:f       rN.6<0;0>:f       rN.9<0>:f        {F@1}
+(W)     mad (1|M0)               rN.9<1>:f     rN.11<0;0>:f      rN.6<0;0>:f       rN.9<0>:f        {F@1}
+(W)     mad (1|M0)               rN.9<1>:f     rN.13<0;0>:f      rN.6<0;0>:f       rN.9<0>:f        {F@1}
+(W)     mad (1|M0)               rN.9<1>:f     rN.14<0;0>:f      rN.6<0;0>:f       rN.9<0>:f        {F@1}
+(W)     mad (1|M0)               rN.9<1>:f     rN.15<0;0>:f      rN.6<0;0>:f       rN.9<0>:f        {F@1}
+(W)     mad (1|M0)               rN.9<1>:f     rN.2<0;0>:f       rN.6<0;0>:f       rN.9<0>:f        {F@1}
+(W)     mad (1|M0)               rN.9<1>:f     rN.3<0;0>:f       rN.6<0;0>:f       rN.9<0>:f        {F@1}
+(W)     mul (1|M0)               rN.9<1>:f     rN.6<0;1,0>:f     rN.9<0;1,0>:f    {F@1}
+(W)     mad (1|M0)               rN.6<1>:f     rN.6<0;0>:f       rN.6<0;0>:f       rN.9<0>:f        {F@1}
+(W)     mad (1|M0)               rN.6<1>:f     rN.6<0;0>:f       rN.4<0;0>:f       rN.8<0>:f        {F@1}
+(W)     mad (1|M0)               rN.1<1>:f     rN.6<0;0>:f       rN.5<0;0>:f       rN.8<0>:f        {F@1}
+LN:
+(W)     mul (1|M0)               rN.1<1>:f     rN.1<0;1,0>:f     -rN.10<0;1,0>:f  {F@1}
+(W)     cmp (32|M0)   (eq)f1.0   null<1>:d     rN.8<0;1,0>:d     0:w              
+(W)     mul (1|M0)               rN.6<1>:f     rN.1<0;1,0>:f     1.442695e+00:f               {F@1}
+(W)     mul (1|M0)               accN.0<1>:d   rN.15<0;1,0>:d    rN.2<0;1,0>:uw  
+(W)     rndz (1|M0)              rN.4<1>:f     rN.6<0;1,0>:f                    {F@1}
+(W)     macl (1|M0)              rN.0<1>:d     rN.15<0;1,0>:d    rN.1<0;1,0>:d   
+(W)     mad (1|M0)               rN.6<1>:f     rN.1<0;0>:f       rN.10<0;0>:f      rN.4<0>:f        {F@1}
+(W)     mad (1|M0)               rN.6<1>:f     rN.6<0;0>:f       rN.9<0;0>:f       rN.4<0>:f        {F@1}
+(W)     mul (1|M0)               rN.10<1>:f    rN.6<0;1,0>:f     1.442695e+00:f               {F@1}
+(W&~f1.0) jmpi                               LN                                
+LN:
+(W)     mov (1|M0)               rN.6<1>:d    -1:w                              
+(W)     jmpi                                 LN                                
+LN:
+(W)     asr (1|M0)               rN.11<1>:d    rN.8<0;1,0>:d     31:w              
+(W)     add (1|M0)               rN.6<1>:d     rN.11<0;1,0>:d    rN.8<0;1,0>:d    {A@1}
+(W)     xor (1|M0)               rN.6<1>:d     rN.6<0;1,0>:d     rN.11<0;1,0>:d   {I@1}
+(W)     xor (1|M0)               cr0.0<1>:ud   cr0.0<0;1,0>:ud   0x30:uw              {A@1}
+(W)     mov (1|M0)               rN.2<1>:f    rN.6<0;1,0>:ud                   {A@1}
+(W)     mov (1|M0)               rN.4<1>:f    0xB4C00000:f                               {Compacted}
+(W)     math.inv (1|M0)          rN.3<1>:f    rN.2<0;1,0>:f                   {F@2}
+(W)     mov (1|M0)               rN.15<1>:f    rN.7<0;1,0>:ud                  
+(W)     mad (1|M0)               rN.5<1>:f    rN.3<0;0>:f      rN.4<0;0>:f      rN.3<0>:f       {A@1}
+(W)     mov (1|M0)               rN.8<1>:ud    rN.2<0;1,0>:f                  
+(W)     mov (1|M0)               rN.3<1>:ud   rN.15<0;1,0>:f                   {F@1}
+(W)     mul (1|M0)               rN.4<1>:f    rN.15<0;1,0>:f    rN.5<0;1,0>:f  
+(W)     add (1|M0)               rN.12<1>:d    rN.6<0;1,0>:d     -rN.8<0;1,0>:d   {I@2}
+(W)     add (1|M0)               rN.13<1>:d    rN.7<0;1,0>:d     -rN.3<0;1,0>:d  {I@2}
+(W)     mov (1|M0)               rN.4<1>:ud   rN.4<0;1,0>:f                   {F@1}
+(W)     mov (1|M0)               rN.8<1>:f     rN.12<0;1,0>:ud                  {I@3}
+(W)     mov (1|M0)               rN.9<1>:f     rN.13<0;1,0>:ud                  {I@2}
+(W)     mov (1|M0)               rN.3<1>:f    rN.4<0;1,0>:ud                  {I@1}
+(W)     mad (1|M0)               rN.12<1>:f    rN.15<0;0>:f      rN.3<0;0>:f      -rN.2<0>:f      {F@1}
+(W)     mad (1|M0)               rN.8<1>:f     rN.9<0;0>:f       rN.3<0;0>:f      -rN.8<0>:f      
+(W)     add (1|M0)               rN.8<1>:f     rN.12<0;1,0>:f    rN.8<0;1,0>:f    {F@1}
+(W)     mul (1|M0)               rN.8<1>:f     rN.5<0;1,0>:f    rN.8<0;1,0>:f    {F@1}
+(W)     xor (1|M0)               cr0.0<1>:ud   cr0.0<0;1,0>:ud   0x30:uw              {A@1}
+(W)     mov (1|M0)               rN.8<1>:ud    rN.8<0;1,0>:f                    {A@1}
+(W)     add (1|M0)               rN.8<1>:d     rN.8<0;1,0>:d     rN.4<0;1,0>:d   {I@1}
+(W)     mul (1|M0)               accN.0<1>:d   rN.8<0;1,0>:d     rN.12<0;1,0>:uw  {I@1}
+(W)     macl (1|M0)              rN.0<1>:d     rN.8<0;1,0>:d     rN.6<0;1,0>:d    {Compacted}
+(W)     add (1|M0)               rN.9<1>:d     rN.7<0;1,0>:d     -rN.0<0;1,0>:d   {I@1}
+(W)     cmp (1|M0)    (ge)f0.0   rN.6<1>:ud    rN.9<0;1,0>:ud    rN.6<0;1,0>:ud   {I@1}
+(W)     add3 (1|M0)              rN.6<1>:d     rN.8<0;0>:d       rN.11<0;0>:d      -rN.6<0>:d       {I@1}
+(W)     xor (1|M0)               rN.6<1>:d    rN.6<0;1,0>:d     rN.11<0;1,0>:d   {I@1}
+LN:
+(W)     add (1|M0)               rN.6<1>:d     rN.0<0;1,0>:d     rN.6<0;1,0>:d   {I@1}
+        or (32|M0)               rN.0<1>:d    rN.0<1;1,0>:d    1:w               {Compacted}
+(W)     mul (1|M0)               accN.0<1>:d   rN.6<0;1,0>:d     rN.4<0;1,0>:uw   {I@2}
+(W)     macl (1|M0)              rN.0<1>:d     rN.6<0;1,0>:d     rN.2<0;1,0>:d    {Compacted}
+        or (32|M0)               rN.0<1>:d    rN.0<1;1,0>:d    2:w               {Compacted}
+        add (32|M0)              rN.0<1>:d     rN.0<0;1,0>:d     rN.0<1;1,0>:d   {Compacted,I@2}
+        or (32|M0)               rN.0<1>:d    rN.0<1;1,0>:d    3:w               {Compacted}
+        add (32|M0)              rN.0<1>:d     rN.0<0;1,0>:d     rN.0<1;1,0>:d   {Compacted}
+        add (32|M0)              rN.0<1>:d    rN.0<0;1,0>:d     rN.0<1;1,0>:d   {Compacted,I@4}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@4}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        add (32|M0)              rN.0<1>:d    rN.0<0;1,0>:d     rN.0<1;1,0>:d   {Compacted,I@5}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@5}
+        mov (16|M0)              rN.0<2>:ud    rN.0<1;1,0>:ud                   {Compacted}
+        shl (16|M0)              rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@5}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@5}
+        mov (16|M0)              rN.0<2>:ud    rN.0<1;1,0>:ud                  {Compacted}
+        shl (16|M0)              rN.0<1>:q    rN.0<2;1,0>:d     1:w               {I@4}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w              
+        shl (16|M0)              rN.0<1>:q    rN.0<2;1,0>:d     1:w               {@3,$9.src}
+        add (16|M0)              rN.0<1>:q     rN.0<1;1,0>:q    rN.2<0;1,0>:q    {Compacted}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                  {Compacted}
+        add (16|M16)             rN.0<1>:q     rN.0<1;1,0>:q    rN.2<0;1,0>:q    {Compacted}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                  {Compacted}
+        add (16|M0)              rN.0<1>:q     rN.0<1;1,0>:q    rN.2<0;1,0>:q    {Compacted,I@7}
+        add (16|M16)             rN.0<1>:q    rN.0<1;1,0>:q    rN.2<0;1,0>:q    {Compacted,I@7}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {@5,$14.src}
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@1,$4} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {$11.src}
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@1,$5} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                  {Compacted,$13.src}
+        add (16|M0)              rN.0<1>:q     rN.0<1;1,0>:q    rN.2<0;1,0>:q    {Compacted,$4.src}
+        add (16|M16)             rN.0<1>:q     rN.0<1;1,0>:q    rN.2<0;1,0>:q    {Compacted}
+        shl (16|M0)              rN.0<1>:q    rN.0<2;1,0>:d    1:w               {@3,$15.src}
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@1,$6} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        add (16|M16)             rN.0<1>:q    rN.0<1;1,0>:q    rN.2<0;1,0>:q    {Compacted,$5.src}
+        add (16|M0)              rN.0<1>:q     rN.0<1;1,0>:q    rN.2<0;1,0>:q    {Compacted}
+        add (16|M0)              rN.0<1>:q     rN.0<1;1,0>:q    rN.1<0;1,0>:q    {Compacted,$6.src}
+        add (16|M16)             rN.0<1>:q     rN.0<1;1,0>:q    rN.1<0;1,0>:q    {Compacted}
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@3,$7} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        add (16|M16)             rN.0<1>:q    rN.0<1;1,0>:q    rN.1<0;1,0>:q    {Compacted}
+        add (16|M0)              rN.0<1>:q    rN.0<1;1,0>:q    rN.1<0;1,0>:q    {Compacted}
+        add (16|M16)             rN.0<1>:q    rN.0<1;1,0>:q    rN.1<0;1,0>:q    {Compacted,$7.src}
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@1,$8} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        send.ugm (32|M0)         rN       rN  null:0  0x0            0x08200B80           {$3} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        add (16|M16)             rN.0<1>:q    rN.0<1;1,0>:q    rN.1<0;1,0>:q    {Compacted}
+        add (16|M0)              rN.0<1>:q    rN.0<1;1,0>:q    rN.1<0;1,0>:q    {Compacted}
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@1,$0} // wr:4+0, rd:2; load.ugm.d16u32.a64
+        add (16|M0)              rN.0<1>:q     rN.0<1;1,0>:q    rN.1<0;1,0>:q    {Compacted}
+        send.ugm (32|M0)         rN      rN  null:0  0x0            0x08200B80           {I@1,$15} // wr:4+0, rd:2; load.ugm.d16u32.a64
+(W)     cmp (1|M0)    (lt)f2.0   null<1>:f     rN.1<0;1,0>:f     -105.0:f              
+(W)     cmp (1|M0)    (gt)f1.0   null<1>:f     rN.1<0;1,0>:f     105.0:f              
+(W)     math.exp (1|M0)          rN.6<1>:f     rN.10<0;1,0>:f                  
+        sync.nop                             null                             {Compacted,$8.src}
+        shl (16|M0)              rN.0<1>:ud    rN.0<2;1,0>:uw   0x10:uw              {$4.dst}
+(W)     math.exp (1|M0)          rN.1<1>:f     rN.4<0;1,0>:f                    {F@1}
+(W)     mul (1|M0)               rN.12<1>:f    rN.1<0;1,0>:f     rN.6<0;1,0>:f    {M@1}
+        mov (16|M16)             rN.0<1>:uw    rN.0<2;1,0>:uw                 
+(W&~f2.0) sel (1|M0)             rN.12<1>:f    rN.12<0;1,0>:f    0.0:f               {F@1}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$15.src}
+(W&~f1.0) sel (1|M0)             rN.10<1>:f    rN.12<0;1,0>:f    inf:f               {F@1}
+        mov (16|M0)              rN.0<1>:uw    rN.0<2;1,0>:uw                 
+        sync.nop                             null                             {Compacted,$3.src}
+        mov (16|M0)              rN.0<1>:uw   rN.0<2;1,0>:uw                  {$5.dst}
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted,F@1}
+        mul (16|M0)              accN.0<1>:f   rN.0<1;1,0>:bf    rN.0<1;1,0>:f    {I@3}
+        mul (16|M16)             accN.0<1>:f   rN.0<1;1,0>:bf    rN.0<1;1,0>:f  
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$0.src}
+        mov (16|M16)             rN.0<1>:uw   rN.0<2;1,0>:uw                 
+        mad (16|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:bf     rN.0<1>:f       {I@3}
+        sync.nop                             null                             {Compacted,F@3}
+        shl (16|M0)              rN.0<1>:ud    rN.0<2;1,0>:uw   0x10:uw              {$6.dst}
+        mov (16|M0)              rN.0<1>:uw   rN.0<2;1,0>:uw                  {F@2}
+        mad (16|M16)             accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:bf     rN.0<1>:f       {I@3}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        mov (16|M16)             rN.0<1>:uw   rN.0<2;1,0>:uw                 
+        mad (16|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:bf     rN.0<1>:f        {I@3}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$7.dst}
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {F@3}
+        mov (16|M16)             rN.0<1>:uw   rN.0<2;1,0>:uw                 
+        mov (16|M0)              rN.0<1>:uw   rN.0<2;1,0>:uw                 
+        mad (16|M16)             accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:bf     rN.0<1>:f       {I@5}
+(W)     mov (32|M0)              rN.0<1>:ud   0x0:ud                              {$12.src}
+        mov (16|M0)              rN.0<1>:uw   rN.0<2;1,0>:uw                   {$3.dst}
+        shl (16|M0)              rN.0<1>:ud    rN.0<2;1,0>:uw    0x10:uw              {F@2}
+        mad (16|M0)              rN.0<1>:f    accN.0<1;0>:f     rN.0<1;0>:bf     rN.0<1>:f       {I@3}
+        mad (16|M16)             rN.0<1>:f    accN.0<1;0>:f     rN.0<1;0>:bf     rN.0<1>:f      
+        mov (16|M16)             rN.0<1>:uw   rN.0<2;1,0>:uw                   {F@2}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw    0x10:uw              {F@1}
+        shl (16|M0)              rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {$8.dst}
+        mov (16|M0)              rN.0<1>:uw    rN.0<2;1,0>:uw                 
+        mul (16|M0)              accN.0<1>:f   rN.0<1;1,0>:bf   rN.0<1;1,0>:f    {I@5}
+        mul (16|M16)             accN.0<1>:f   rN.0<1;1,0>:bf   rN.0<1;1,0>:f   {I@3}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        mov (16|M16)             rN.0<1>:uw   rN.0<2;1,0>:uw                 
+        mad (16|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:bf      rN.0<1>:f       {I@3}
+(W)     add (16|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted}
+        sync.nop                             null                             {Compacted,F@4}
+        shl (16|M0)              rN.0<1>:ud    rN.0<2;1,0>:uw   0x10:uw              {$0.dst}
+        mov (16|M0)              rN.0<1>:uw   rN.0<2;1,0>:uw                 
+        mad (16|M16)             accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:bf     rN.0<1>:f       {I@3}
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw              {F@4}
+(W)     mov (8|M0)               rN.0<1>:ud   rN.8<1;1,0>:ud                  {Compacted,F@2}
+        mov (16|M16)             rN.0<1>:uw   rN.0<2;1,0>:uw                 
+        mad (16|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:bf     rN.0<1>:f        {I@4}
+        mov (16|M0)              rN.0<1>:uw   rN.0<2;1,0>:uw                  {$15.dst}
+        shl (16|M0)              rN.0<1>:ud    rN.0<2;1,0>:uw   0x10:uw             
+        shl (16|M16)             rN.0<1>:ud   rN.0<2;1,0>:uw   0x10:uw             
+        mov (16|M16)             rN.0<1>:uw   rN.0<2;1,0>:uw                 
+(W)     add (8|M0)               rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,I@6}
+        mad (16|M16)             accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:bf     rN.0<1>:f       {I@5}
+(W)     mov (32|M0)              rN.0<1>:ud   0x0:ud                              {$0.src}
+(W)     mov (4|M0)               rN.0<1>:ud    rN.4<1;1,0>:ud                  {Compacted,F@2}
+        mad (16|M0)              rN.0<1>:f    accN.0<1;0>:f     rN.0<1;0>:bf     rN.0<1>:f        {I@2}
+        mad (16|M16)             rN.0<1>:f    accN.0<1;0>:f     rN.0<1;0>:bf     rN.0<1>:f      
+(W)     add (4|M0)               rN.0<1>:f     rN.0<1;1,0>:f    rN.0<1;1,0>:f    {Compacted,I@1}
+(W)     add (16|M0)              rN.0<1>:f     rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,F@2}
+(W)     add (1|M0)               rN.8<1>:f     rN.0<0;1,0>:f     rN.2<0;1,0>:f    {F@2}
+(W)     add (1|M0)               rN.9<1>:f     rN.1<0;1,0>:f     rN.3<0;1,0>:f   
+(W)     mov (8|M0)               rN.0<1>:ud    rN.8<1;1,0>:ud                   {Compacted,F@1}
+(W)     add (1|M0)               rN.9<1>:f     rN.8<0;1,0>:f     rN.9<0;1,0>:f   
+(W)     add (8|M0)               rN.0<1>:f     rN.0<1;1,0>:f     rN.0<1;1,0>:f    {Compacted,I@1}
+(W)     add (1|M0)               rN.13<1>:f    rN.9<0;1,0>:f     1e-06:f               {F@2}
+(W)     mov (4|M0)               rN.0<1>:ud    rN.4<1;1,0>:ud                   {Compacted,F@2}
+(W)     math.rsqt (1|M0)         rN.1<1>:f     rN.13<0;1,0>:f                   {F@1}
+(W)     add (4|M0)               rN.0<1>:f     rN.0<1;1,0>:f     rN.0<1;1,0>:f    {Compacted,I@1}
+        mul (16|M0)              rN.0<1>:f    rN.0<1;1,0>:bf    rN.1<0;1,0>:f    {M@1}
+(W)     add (1|M0)               rN.4<1>:f     rN.0<0;1,0>:f     rN.2<0;1,0>:f    {Compacted,F@2}
+(W)     add (1|M0)               rN.5<1>:f     rN.1<0;1,0>:f     rN.3<0;1,0>:f   
+        mul (16|M16)             rN.0<1>:f    rN.0<1;1,0>:bf    rN.1<0;1,0>:f   
+(W)     add (1|M0)               rN.8<1>:f     rN.4<0;1,0>:f     rN.5<0;1,0>:f    {F@2}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+(W)     add (1|M0)               rN.12<1>:f    rN.8<0;1,0>:f     1e-06:f               {F@2}
+        mul (16|M0)              rN.0<1>:f    rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+        mul (16|M16)             rN.0<1>:f    rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+        mul (16|M0)              rN.0<1>:f    rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+        mul (16|M0)              rN.0<1>:f     rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+        mul (16|M16)             rN.0<1>:f     rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+        mul (16|M16)             rN.0<1>:f    rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+(W)     math.sqt (1|M0)          rN.1<1>:f     rN.12<0;1,0>:f                   {F@1}
+        mul (32|M0)              accN.0<1>:f   accN.0<1;1,0>:f   rN.0<1;1,0>:f   {Compacted}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted}
+(W)     mul (1|M0)               rN.1<1>:f     rN.7<0;1,0>:f     rN.1<0;1,0>:f    {M@1}
+        mad (32|M0)              rN.0<1>:f    accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,F@3}
+(W)     math.inv (1|M0)          rN.1<1>:f     rN.1<0;1,0>:f                    {F@2}
+(W)     mul (1|M0)               accN.0<1>:d   rN.5<0;1,0>:d     rN.8<0;1,0>:uw   {F@1}
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+(W)     macl (1|M0)              rN.0<1>:d     rN.5<0;1,0>:d     rN.4<0;1,0>:d   
+        mul (16|M0)              rN.0<1>:f    rN.0<1;1,0>:bf   rN.1<0;1,0>:f    {M@1}
+        mul (16|M16)             rN.0<1>:f    rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+        mul (16|M0)              rN.0<1>:f    rN.0<1;1,0>:bf    rN.1<0;1,0>:f   
+        mul (16|M0)              rN.0<1>:f    rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+        mul (16|M16)             rN.0<1>:f    rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+        mul (16|M16)             rN.0<1>:f    rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+        mul (16|M16)             rN.0<1>:f    rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+        mul (16|M0)              rN.0<1>:f    rN.0<1;1,0>:bf   rN.1<0;1,0>:f   
+(W)     add (1|M0)               rN.1<1>:d     rN.0<0;1,0>:d     rN.6<0;1,0>:d    {Compacted,A@1}
+(W)     mov (32|M0)              rN.0<1>:ud   0x0:ud                             
+(W)     shl (1|M0)               rN.2<1>:q     rN.1<0;1,0>:d     1:w               {I@2}
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      accN.0<1;0>:f     rN.0<1>:f        {Compacted,I@2}
+(W)     mov (2|M0)               rN.16<1>:w    0x40:uv                             
+(W)     add (1|M0)               rN.0<1>:q    rN.2<0;1,0>:q     rN.3<0;1,0>:q    {Compacted,I@2}
+(W)     add (16|M0)              rN.0<1>:f     rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,F@1}
+(W)     add (1|M0)               rN.0<1>:uq   rN.0<0;1,0>:uq   rN.16<0;1,0>:w   {I@1}
+(W)     add (1|M0)               rN.1<1>:uq   rN.0<0;1,0>:uq   rN.17<0;1,0>:w  
+(W)     mov (8|M0)               rN.0<1>:ud   rN.8<1;1,0>:ud                   {Compacted,F@1}
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+(W)     add (8|M0)               rN.0<1>:f    rN.0<1;1,0>:f     rN.0<1;1,0>:f   {Compacted,I@1}
+(W)     send.ugm (2|M0)          rN       rN  null:0  0x0            0x04100580           {F@1,$4} // wr:2+0, rd:1; load.ugm.d32.a64
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+        mul (32|M0)              accN.0<1>:f   accN.0<1;1,0>:f   rN.0<1;1,0>:f   {Compacted}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     accN.0<1;0>:f     rN.0<1>:f       {Compacted}
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,F@3}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+        mul (32|M0)              accN.0<1>:f   accN.0<1;1,0>:f   rN.0<1;1,0>:f   {Compacted}
+(W)     mov (32|M0)              rN.0<1>:ud   0x0:ud                             
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+        mad (32|M0)              rN.0<1>:f    accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f        {Compacted,A@1}
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+(W)     mov (4|M0)               rN.0<1>:ud   rN.4<1;1,0>:ud                  {Compacted,$4.src}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,F@3}
+(W)     add (4|M0)               rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,I@1}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     accN.0<1;0>:f     rN.0<1>:f       {Compacted}
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+(W)     add (1|M0)               rN.8<1>:f     rN.0<0;1,0>:f    rN.2<0;1,0>:f   {F@4}
+(W)     add (1|M0)               rN.9<1>:f     rN.1<0;1,0>:f    rN.3<0;1,0>:f  
+(W)     add (16|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted}
+(W)     mov (32|M0)              rN.0<1>:ud   0x0:ud                              {F@1}
+        mad (32|M0)              rN.0<1>:f    accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f        {Compacted,I@1}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+        mul (32|M0)              accN.0<1>:f   accN.0<1;1,0>:f   rN.0<1;1,0>:f   {Compacted}
+(W)     mov (8|M0)               rN.0<1>:ud   rN.8<1;1,0>:ud                  {Compacted}
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+(W)     add (8|M0)               rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,I@1}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,F@4}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.10<0;1,0>:f   {Compacted}
+(W)     add (16|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted}
+(W)     mov (4|M0)               rN.0<1>:ud   rN.4<1;1,0>:ud                  {Compacted,F@4}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     accN.0<1;0>:f     rN.0<1>:f       {Compacted}
+(W)     mov (32|M0)              rN.0<1>:ud   0x0:ud                              {F@2}
+(W)     mov (8|M0)               rN.0<1>:ud   rN.8<1;1,0>:ud                  {Compacted}
+(W)     add (4|M0)               rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,I@3}
+        mad (32|M0)              rN.0<1>:f    accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f        {Compacted,I@2}
+(W)     add (1|M0)               rN.1<1>:f     rN.8<0;1,0>:f     rN.9<0;1,0>:f   
+(W)     add (1|M0)               rN.8<1>:f     rN.0<0;1,0>:f    rN.2<0;1,0>:f   {F@3}
+(W)     add (1|M0)               rN.9<1>:f     rN.1<0;1,0>:f    rN.3<0;1,0>:f  
+(W)     add (8|M0)               rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,I@1}
+(W)     add (16|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,F@5}
+(W)     mov (4|M0)               rN.0<1>:ud   rN.4<1;1,0>:ud                  {Compacted,F@2}
+(W)     mov (8|M0)               rN.0<1>:ud   rN.8<1;1,0>:ud                  {Compacted,F@1}
+(W)     add (4|M0)               rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,I@2}
+(W)     add (8|M0)               rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,I@1}
+(W)     add (1|M0)               rN.6<1>:f     rN.8<0;1,0>:f     rN.9<0;1,0>:f   
+(W)     add (1|M0)               rN.8<1>:f     rN.0<0;1,0>:f    rN.2<0;1,0>:f   {F@3}
+(W)     add (1|M0)               rN.9<1>:f     rN.1<0;1,0>:f    rN.3<0;1,0>:f  
+(W)     mov (4|M0)               rN.0<1>:ud   rN.4<1;1,0>:ud                  {Compacted,F@1}
+(W)     add (1|M0)               rN.8<1>:f     rN.8<0;1,0>:f     rN.9<0;1,0>:f   
+(W)     add (4|M0)               rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,I@1}
+        sync.nop                             null                             {Compacted,F@2}
+(W)     shl (1|M0)               rN.9<1>:ud    rN.0<0;1,0>:uw    0x10:uw              {$4.dst}
+(W)     add (1|M0)               rN.11<1>:f    rN.0<0;1,0>:f    rN.2<0;1,0>:f   {F@1}
+(W)     add (1|M0)               rN.12<1>:f    rN.1<0;1,0>:f    rN.3<0;1,0>:f  
+        sync.nop                             null                             {Compacted,$10.src}
+(W)     shr (1|M0)               a0.0<1>:ud    rN.5<0;1,0>:ud   0x4:uw              {$2.src}
+(W)     add (1|M0)               rN.2<1>:f     rN.11<0;1,0>:f    rN.12<0;1,0>:f   {F@1}
+(W)     shl (1|M0)               rN.12<1>:ud   rN.1<0;1,0>:uw    0x10:uw              {F@1}
+(W)     add (1|M0)               rN.11<1>:f    rN.9<0;1,0>:f     -rN.1<0;1,0>:f   {I@3}
+(W)     add (1|M0)               rN.1<1>:f     rN.12<0;1,0>:f    -rN.6<0;1,0>:f   {I@1}
+(W)     mul (1|M0)               rN.6<1>:f     rN.11<0;1,0>:f    rN.6<0;1,0>:f    {F@2}
+        shl (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d   2:w               {Compacted}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.6<0;1,0>:f    {Compacted,F@1}
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {A@1,$2} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.6<0;1,0>:f    {Compacted}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.6<0;1,0>:f    {Compacted}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f     rN.6<0;1,0>:f    {Compacted}
+(W)     mul (1|M0)               rN.1<1>:f     rN.1<0;1,0>:f     rN.6<0;1,0>:f   
+(W)     shl (1|M0)               rN.15<1>:ud   rN.2<0;1,0>:uw    0x10:uw             
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.1<0;1,0>:f    {Compacted,F@1}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.1<0;1,0>:f    {Compacted}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.1<0;1,0>:f    {Compacted}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f     rN.1<0;1,0>:f    {Compacted}
+(W)     add (1|M0)               rN.9<1>:f     rN.15<0;1,0>:f    -rN.8<0;1,0>:f   {I@1}
+(W)     shl (1|M0)               rN.13<1>:ud   rN.3<0;1,0>:uw    0x10:uw             
+(W)     mul (1|M0)               rN.11<1>:f    rN.9<0;1,0>:f     rN.6<0;1,0>:f    {F@1}
+(W)     add (1|M0)               rN.8<1>:f     rN.13<0;1,0>:f    -rN.2<0;1,0>:f   {I@1}
+(W)     mul (1|M0)               rN.14<1>:f    rN.8<0;1,0>:f     rN.6<0;1,0>:f    {F@1}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {$5} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$6} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.11<0;1,0>:f   {Compacted,$6.src}
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$5.dst}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {F@1,$7} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$8} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f     rN.11<0;1,0>:f   {Compacted,$8.src}
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$7.dst}
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,F@1}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {$3} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$4} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.14<0;1,0>:f   {Compacted,$4.src}
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$3.dst}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,F@1}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {$1} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$0} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.11<0;1,0>:f   {Compacted,$0.src}
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$1.dst}
+(W)     mov (32|M0)              rN.0<1>:ud   0x0:ud                              {F@2}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {F@1,$15} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$14} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f     rN.14<0;1,0>:f   {Compacted,$14.src}
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$15.dst}
+(W)     mov (32|M0)              rN.0<1>:ud    0x0:ud                              {F@2}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {F@1,$2} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$13} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.14<0;1,0>:f   {Compacted,$13.src}
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$2.dst}
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,F@1}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted}
+(W)     mov (32|M0)              rN.0<1>:ud   0x0:ud                             
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {$6} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$9} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$6.dst}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,F@1}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {$5} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$5.dst}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.11<0;1,0>:f   {Compacted}
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {F@1,$8} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mad (32|M0)              rN.0<1>:f    accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,I@1}
+(W)     add (16|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,F@1}
+(W)     mov (8|M0)               rN.0<1>:ud   rN.8<1;1,0>:ud                  {Compacted,F@1}
+        mul (32|M0)              rN.0<1>:f    rN.0<1;1,0>:f    rN.14<0;1,0>:f   {Compacted,$8.src}
+(W)     add (8|M0)               rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,I@1}
+(W)     mov (32|M0)              rN.0<1>:ud   0x0:ud                              {F@2}
+(W)     mov (4|M0)               rN.0<1>:ud   rN.4<1;1,0>:ud                  {Compacted,F@1}
+        mad (32|M0)              rN.0<1>:f    accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,I@2}
+(W)     add (4|M0)               rN.0<1>:f    rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,I@1}
+(W)     add (16|M0)              rN.0<1>:f     rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,F@2}
+(W)     add (1|M0)               rN.8<1>:f     rN.0<0;1,0>:f    rN.2<0;1,0>:f   {F@2}
+(W)     add (1|M0)               rN.9<1>:f     rN.1<0;1,0>:f    rN.3<0;1,0>:f  
+(W)     mov (8|M0)               rN.0<1>:ud   rN.8<1;1,0>:ud                   {Compacted,F@3}
+(W)     add (1|M0)               rN.6<1>:f     rN.8<0;1,0>:f     rN.9<0;1,0>:f    {F@1}
+(W)     add (8|M0)               rN.0<1>:f     rN.0<1;1,0>:f     rN.0<1;1,0>:f   {Compacted,I@1}
+(W)     mov (4|M0)               rN.0<1>:ud   rN.4<1;1,0>:ud                   {Compacted,F@1}
+(W)     add (4|M0)               rN.0<1>:f     rN.0<1;1,0>:f     rN.0<1;1,0>:f   {Compacted,I@1}
+(W)     add (1|M0)               rN.11<1>:f    rN.0<0;1,0>:f     rN.2<0;1,0>:f    {F@1}
+(W)     add (1|M0)               rN.12<1>:f    rN.1<0;1,0>:f     rN.3<0;1,0>:f   
+(W)     add (1|M0)               rN.10<1>:f    rN.11<0;1,0>:f    rN.12<0;1,0>:f   {F@1}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {$7} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$10} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$7.dst}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {F@1,$4} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$11} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$4.dst}
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,F@1}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {$5} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$12} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$5.dst}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,F@1}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {$6} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$13} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$6.dst}
+        mad (32|M0)              rN.0<1>:f    accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,F@1}
+(W)     add (16|M0)              rN.0<1>:f     rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,F@1}
+(W)     mov (8|M0)               rN.0<1>:ud   rN.8<1;1,0>:ud                   {Compacted,F@1}
+(W)     add (8|M0)               rN.0<1>:f     rN.0<1;1,0>:f     rN.0<1;1,0>:f   {Compacted,I@1}
+(W)     mov (4|M0)               rN.0<1>:ud   rN.4<1;1,0>:ud                   {Compacted,F@1}
+(W)     add (4|M0)               rN.0<1>:f     rN.0<1;1,0>:f     rN.0<1;1,0>:f   {Compacted,I@1}
+(W)     add (1|M0)               rN.8<1>:f     rN.0<0;1,0>:f     rN.2<0;1,0>:f    {F@1}
+(W)     add (1|M0)               rN.9<1>:f     rN.1<0;1,0>:f     rN.3<0;1,0>:f   
+(W)     add (1|M0)               rN.1<1>:f     rN.8<0;1,0>:f     rN.9<0;1,0>:f    {F@1}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {$3} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$14} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$3.dst}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {F@1,$1} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$15} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$1.dst}
+        mul (32|M0)              accN.0<1>:f   rN.0<1;1,0>:f    rN.0<1;1,0>:f   {Compacted,F@1}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted}
+        send.ugm (32|M0)         rN      rN  null:0  a0.0        0x44280500           {$8} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        send.ugm (32|M0)         null     rN  rN:2  a0.0        0x440E0504           {$0} // wr:2+2, rd:0; store.ugm.d32.a32.wb.wb.ss[a0.0]
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f      rN.0<1;0>:f      rN.10<0>:f       {Compacted,$8.dst}
+        mad (32|M0)              accN.0<1>:f   accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,F@1}
+        send.ugm (32|M0)         rN       rN  null:0  a0.0        0x44280500           {$3} // wr:2+0, rd:2; load.ugm.d32.a32.ca.ca.ss[a0.0]
+        mad (32|M0)              rN.0<1>:f    rN.0<1;0>:f       rN.0<1;0>:f      rN.10<0>:f       {Compacted,$3.dst}
+        mad (32|M0)              rN.0<1>:f     accN.0<1;0>:f     rN.0<1;0>:f      rN.0<1>:f       {Compacted,F@1}
+(W)     add (16|M0)              rN.0<1>:f     rN.0<1;1,0>:f     rN.0<1;1,0>:f    {Compacted,F@1}
+(W)     mov (8|M0)               rN.0<1>:ud    rN.8<1;1,0>:ud                   {Compacted,F@1}
+(W)     add (8|M0)               rN.0<1>:f     rN.0<1;1,0>:f     rN.0<1;1,0>:f    {Compacted,I@1}
+(W)     mov (4|M0)               rN.0<1>:ud    rN.4<1;1,0>:ud                   {Compacted,F@1}
+(W)     add (4|M0)               rN.0<1>:f     rN.0<1;1,0>:f     rN.0<1;1,0>:f    {Compacted,I@1}
+(W)     add (1|M0)               rN.8<1>:f     rN.0<0;1,0>:f     rN.2<0;1,0>:f    {F@1}
+(W)     add (1|M0)               rN.9<1>:f     rN.1<0;1,0>:f     rN.3<0;1,0>:f   
+(W)     add (1|M0)               rN.6<1>:f     rN.8<0;1,0>:f     rN.9<0;1,0>:f    {F@1}
+(~f3.0) goto (32|M0)                         LN                  LN                
+LN:
+(W)     add (1|M0)               rN.0<1>:q    rN.2<0;1,0>:q     rN.0<0;1,0>:q    {Compacted}
+(W)     mov (2|M0)               rN.16<1>:w    0x40:uv                              {F@1}
+(W)     mov (1|M0)               rN.0<1>:bf    rN.10<0;1,0>:f                  
+(W)     mov (1|M0)               rN.1<1>:bf    rN.6<0;1,0>:f                   
+(W)     mov (1|M0)               rN.2<1>:bf    rN.1<0;1,0>:f                   
+(W)     mov (1|M0)               rN.3<1>:bf    rN.6<0;1,0>:f                   
+(W)     add (1|M0)               rN.0<1>:uq    rN.0<0;1,0>:uq   rN.16<0;1,0>:w   {I@1}
+(W)     add (1|M0)               rN.1<1>:uq    rN.0<0;1,0>:uq   rN.17<0;1,0>:w  
+(W)     send.ugm (2|M0)          null     rN  rN:1  0x0            0x04000584           {A@1,$4} // wr:2+1, rd:0; store.ugm.d32.a64
+LN:
+        join (32|M0)                         LN                                
+LN:
+(W)     add3 (1|M0)              rN.1<1>:d     rN.14<0;0>:d      rN.15<0;0>:d      -rN.0<0>:d     
+(W)     shl (1|M0)               rN.4<1>:q     rN.1<0;1,0>:d     2:w               {I@1}
+(W)     add (1|M0)               rN.0<1>:q     rN.4<0;1,0>:q     rN.6<0;1,0>:q    {@1,$4.src}
+(W)     send.ugm (1|M0)          rN       rN  null:0  0x0            0x02108580           {I@1,$5} // wr:1+0, rd:1; load.ugm.d32x1t.a64
+(W)     cmp (32|M0)   (gt)f0.0   null<1>:d     rN.0<0;1,0>:d     0:w               {$5.dst}
+(W&~f0.0) jmpi                               LN                                
+LN:
+(W)     mul (1|M0)               accN.0<1>:ud  rN.12<0;1,0>:ud   rN.0<0;1,0>:uw  
+(W)     macl (1|M0)              rN.0<1>:ud    rN.12<0;1,0>:ud   rN.0<0;1,0>:ud   {Compacted}
+(W)     mul (1|M0)               accN.0<1>:ud  rN.12<0;1,0>:ud   rN.0<0;1,0>:uw  
+(W)     mach (1|M0)              rN.0<1>:d     rN.12<0;1,0>:ud   rN.0<0;1,0>:ud  
+(W)     mul (1|M0)               accN.0<1>:d   rN.0<0;1,0>:ud    rN.26<0;1,0>:uw 
+(W)     macl (1|M0)              rN.0<1>:d     rN.0<0;1,0>:ud    rN.13<0;1,0>:d  
+(W)     mul (1|M0)               accN.0<1>:d   rN.6<0;1,0>:d     rN.4<0;1,0>:uw  
+(W)     add (1|M0)               rN.1<1>:d     rN.0<0;1,0>:d     rN.0<0;1,0>:d    {Compacted,I@2}
+(W)     macl (1|M0)              rN.0<1>:d     rN.6<0;1,0>:d     rN.2<0;1,0>:d    {Compacted}
+(W)     shl (1|M0)               rN.4<1>:q     rN.0<0;1,0>:q     1:w               {I@2}
+(W)     add (1|M0)               rN.4<1>:d     rN.7<0;1,0>:d     rN.0<0;1,0>:d    {I@2}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,I@1}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+(W)     add (1|M0)               rN.5<1>:q     rN.4<0;1,0>:q     rN.4<0;1,0>:q   
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@3}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@3}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$6} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$6.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$7} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$7.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$8} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$8.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+(W)     or (1|M0)                rN.1<1>:d     rN.6<0;1,0>:d     1:w              
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@3}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@3}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$3} // wr:4+2, rd:0; store.ugm.d16u32.a64
+(W)     mul (1|M0)               accN.0<1>:d   rN.1<0;1,0>:d     rN.4<0;1,0>:uw  
+(W)     macl (1|M0)              rN.0<1>:d     rN.1<0;1,0>:d     rN.2<0;1,0>:d    {Compacted,$3.src}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+(W)     add (1|M0)               rN.4<1>:d     rN.7<0;1,0>:d     rN.0<0;1,0>:d    {I@1}
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,I@1}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$4} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$4.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$5} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$5.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$6} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$6.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+(W)     or (1|M0)                rN.1<1>:d     rN.6<0;1,0>:d     2:w              
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@3}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@3}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$7} // wr:4+2, rd:0; store.ugm.d16u32.a64
+(W)     mul (1|M0)               accN.0<1>:d   rN.1<0;1,0>:d     rN.4<0;1,0>:uw  
+(W)     macl (1|M0)              rN.0<1>:d     rN.1<0;1,0>:d     rN.2<0;1,0>:d    {Compacted,$7.src}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+(W)     add (1|M0)               rN.4<1>:d     rN.7<0;1,0>:d     rN.0<0;1,0>:d    {I@1}
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,I@1}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$8} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$8.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$3} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$3.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$4} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$4.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+(W)     or (1|M0)                rN.1<1>:d     rN.6<0;1,0>:d     3:w              
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@3}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@3}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$5} // wr:4+2, rd:0; store.ugm.d16u32.a64
+(W)     mul (1|M0)               accN.0<1>:d   rN.1<0;1,0>:d     rN.4<0;1,0>:uw  
+(W)     macl (1|M0)              rN.0<1>:d     rN.1<0;1,0>:d     rN.2<0;1,0>:d    {Compacted,$5.src}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+(W)     add (1|M0)               rN.4<1>:d     rN.7<0;1,0>:d     rN.0<0;1,0>:d    {I@1}
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,I@1}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$6} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$6.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$7} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$7.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$8} // wr:4+2, rd:0; store.ugm.d16u32.a64
+        add (32|M0)              rN.0<1>:d     rN.0<1;1,0>:d    rN.4<0;1,0>:d    {Compacted,$8.src}
+        mov (16|M0)              rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted,I@1}
+        mov (16|M16)             rN.0<2>:ud   rN.0<1;1,0>:ud                   {Compacted}
+        mov (16|M0)              rN.0<1>:bf   rN.0<1;1,0>:f                  
+        mov (16|M16)             rN.16<1>:bf  rN.0<1;1,0>:f                  
+        shl (16|M0)              rN.0<1>:q     rN.0<2;1,0>:d    1:w               {I@2}
+        shl (16|M16)             rN.0<1>:q    rN.0<2;1,0>:d    1:w               {I@2}
+        add (16|M0)              rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q    {Compacted,I@2}
+        add (16|M16)             rN.0<1>:q     rN.5<0;1,0>:q     rN.0<1;1,0>:q   {Compacted,I@2}
+        mov (32|M0)              rN.0<1>:ud   rN.0<1;1,0>:uw                  {F@1}
+        send.ugm (32|M0)         null     rN  rN:2  0x0            0x08000B84           {I@1,$1} // wr:4+2, rd:0; store.ugm.d16u32.a64
+LN:
+(W)     add (1|M0)               rN.1<1>:d     rN.15<0;1,0>:d    1:w              
+(W)     cmp (32|M0)   (lt)f2.0   null<1>:d     rN.1<0;1,0>:d     rN.1<0;1,0>:d   {I@1}
+(W&~f2.0) jmpi                               LN                                
+LN:
+(W)     mov (1|M0)               rN.15<1>:d    rN.1<0;1,0>:d                   
+(W)     jmpi                                 LN                                
+LN:
+(W)     mov (16|M0)              rN.0<1>:f   rN.0<1;1,0>:f                   {Compacted}
+(W)     send.gtwy (1|M0)         null     rN  null:0  0x0            0x02000010           {EOT,F@1,$3} // wr:1+0, rd:0; end of thread
+LN:
+(W)     mov (16|M0)              null<1>:ud    0x82421A2:ud                             
+(W)     mov (16|M0)              null<1>:ud    0xA1EF9BA8:ud                             
+(W)     mov (16|M0)              null<1>:ud    0x0:ud                             
+(W)     mov (16|M0)              null<1>:ud    0x1:ud                             
+        illegal                
+        illegal                
+        illegal                
+        illegal                
+        illegal                
+        illegal                
+        illegal                
+        illegal                
