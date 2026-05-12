@@ -151,8 +151,10 @@ def _xpu_available() -> bool:
 
 
 _XPU_OK = _xpu_available()
-_HAS_OP = _XPU_OK and hasattr(torch.ops, "_xpu_C") and hasattr(
-    torch.ops._xpu_C, "gdn_attention"
+_HAS_OP = (
+    _XPU_OK
+    and hasattr(torch.ops, "_xpu_C")
+    and hasattr(torch.ops._xpu_C, "gdn_attention")
 )
 
 
@@ -372,9 +374,7 @@ def _call_sycl(payload, conv_pool, ssm_pool, remap, device):
         dtype=payload["core_attn_out"].dtype,
         device=device,
     )
-    z = torch.empty(
-        payload["z"].shape, dtype=payload["z"].dtype, device=device
-    )
+    z = torch.empty(payload["z"].shape, dtype=payload["z"].dtype, device=device)
 
     conv_w = payload["conv_weight"].to(device)
     if conv_w.dim() == 3:
@@ -402,18 +402,16 @@ def _call_sycl(payload, conv_pool, ssm_pool, remap, device):
     if is_spec_capture:
         spec_qsl = payload["spec_query_start_loc"]
         if spec_qsl is None:
-            pytest.skip(
-                "spec capture missing spec_query_start_loc — re-capture"
-            )
+            pytest.skip("spec capture missing spec_query_start_loc — re-capture")
         spec_qsl = spec_qsl.to(device).contiguous()
-        spec_idx_dense = _remap_index_tensor(
-            payload["spec_state_indices_tensor"], remap
-        ).to(torch.int32).contiguous()
+        spec_idx_dense = (
+            _remap_index_tensor(payload["spec_state_indices_tensor"], remap)
+            .to(torch.int32)
+            .contiguous()
+        )
         num_acc = payload["num_accepted_tokens"]
         if num_acc is None:
-            pytest.skip(
-                "spec capture missing num_accepted_tokens — re-capture"
-            )
+            pytest.skip("spec capture missing num_accepted_tokens — re-capture")
         num_acc = num_acc.to(device).to(torch.int32).contiguous()
         num_spec_decodes = int(payload["num_spec_decodes"])
         # Sentinel non_spec slot lookup: passed for argument validation only;
@@ -515,9 +513,9 @@ def _compute_fla_spec_oracle(payload, device):
     # for the call, then transpose back so the post-state diffs against SYCL's
     # in-place update slot-by-slot.
     dim_first = bool(payload.get("is_conv_state_dim_first") or False)
-    conv_pool_for_fla = conv_pool if dim_first else conv_pool.transpose(
-        -1, -2
-    ).contiguous()
+    conv_pool_for_fla = (
+        conv_pool if dim_first else conv_pool.transpose(-1, -2).contiguous()
+    )
 
     mixed_qkv = payload["mixed_qkv"][:n_actual].to(device).clone()
     conv_w = payload["conv_weight"].to(device)
@@ -527,9 +525,11 @@ def _compute_fla_spec_oracle(payload, device):
     if conv_b is not None:
         conv_b = conv_b.to(device)
 
-    spec_idx_dense = _remap_index_tensor(
-        payload["spec_state_indices_tensor"], remap
-    ).to(torch.int32).contiguous()
+    spec_idx_dense = (
+        _remap_index_tensor(payload["spec_state_indices_tensor"], remap)
+        .to(torch.int32)
+        .contiguous()
+    )
     num_acc = payload["num_accepted_tokens"].to(device).to(torch.int32).contiguous()
     spec_qsl = payload["spec_query_start_loc"].to(device).to(torch.int32).contiguous()
     num_spec_decodes = int(payload["num_spec_decodes"])
@@ -829,9 +829,7 @@ def test_sycl_mixed_batch_matches_per_subset(mixed_pair):
     ).contiguous()
 
     non_spec_token_indx = torch.arange(0, n_ns, device=device, dtype=torch.long)
-    spec_token_indx = torch.arange(
-        n_ns, n_total, device=device, dtype=torch.long
-    )
+    spec_token_indx = torch.arange(n_ns, n_total, device=device, dtype=torch.long)
 
     # has_initial_state: only the non_spec subset uses it.
     has_initial_state = ns.get("has_initial_state")
@@ -912,13 +910,9 @@ def test_sycl_mixed_batch_matches_per_subset(mixed_pair):
     sp_qkvz = qkvz_total.index_select(0, spec_token_indx).contiguous()
     sp_ba = ba_total.index_select(0, spec_token_indx).contiguous()
 
-    ns_core = torch.empty(
-        (n_ns,) + out_per_token, dtype=dtype_core, device=device
-    )
+    ns_core = torch.empty((n_ns,) + out_per_token, dtype=dtype_core, device=device)
     ns_z = torch.empty_like(ns_core)
-    sp_core = torch.empty(
-        (n_sp,) + out_per_token, dtype=dtype_core, device=device
-    )
+    sp_core = torch.empty((n_sp,) + out_per_token, dtype=dtype_core, device=device)
     sp_z = torch.empty_like(sp_core)
 
     # Non-spec subset call.
@@ -982,9 +976,7 @@ def test_sycl_mixed_batch_matches_per_subset(mixed_pair):
         rtol,
         label="mixed.non_spec.core_attn_out",
     )
-    _diff(
-        z_out[:n_ns], ns["z"][:n_ns], atol, rtol, label="mixed.non_spec.z"
-    )
+    _diff(z_out[:n_ns], ns["z"][:n_ns], atol, rtol, label="mixed.non_spec.z")
 
     # Spec subset: drive the inline FLA oracle on the spec capture in
     # isolation (separate scratch pool) — same approach as test_sycl_matches_fla.

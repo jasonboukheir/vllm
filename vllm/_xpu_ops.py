@@ -306,9 +306,7 @@ def _spec_gdn_dump_call(
     if attn_md_raw is None:
         # V1 profile run — _forward_core warms up prefill kernels; nothing to
         # capture because there is no real attn_metadata.
-        layer._forward_core(
-            mixed_qkv=mixed_qkv, b=b, a=a, core_attn_out=core_attn_out
-        )
+        layer._forward_core(mixed_qkv=mixed_qkv, b=b, a=a, core_attn_out=core_attn_out)
         return
 
     assert isinstance(attn_md_raw, dict)
@@ -408,9 +406,7 @@ def _spec_gdn_dump_call(
         "num_accepted_tokens": _opt_to_cpu(
             getattr(attn_md, "num_accepted_tokens", None)
         ),
-        "has_initial_state": _opt_to_cpu(
-            getattr(attn_md, "has_initial_state", None)
-        ),
+        "has_initial_state": _opt_to_cpu(getattr(attn_md, "has_initial_state", None)),
         "num_actual_tokens": int(getattr(attn_md, "num_actual_tokens", 0) or 0),
         "num_prefills": int(getattr(attn_md, "num_prefills", 0) or 0),
         "num_decodes": int(getattr(attn_md, "num_decodes", 0) or 0),
@@ -592,8 +588,7 @@ def _gdn_xpu_spec_sycl_path(
             non_spec_query_start_loc=spec_query_start_loc[
                 : num_spec_decodes + 1
             ].contiguous(),
-            non_spec_state_indices_tensor=spec_state_indices_tensor[:, 0]
-            .contiguous(),
+            non_spec_state_indices_tensor=spec_state_indices_tensor[:, 0].contiguous(),
             num_actual_tokens=num_actual_tokens,
             spec_state_indices_tensor=spec_state_indices_tensor,
             num_accepted_tokens=num_accepted_tokens,
@@ -667,8 +662,7 @@ def _gdn_xpu_spec_sycl_path(
         non_spec_query_start_loc=spec_query_start_loc[
             : num_spec_decodes + 1
         ].contiguous(),
-        non_spec_state_indices_tensor=spec_state_indices_tensor[:, 0]
-        .contiguous(),
+        non_spec_state_indices_tensor=spec_state_indices_tensor[:, 0].contiguous(),
         num_actual_tokens=n_spec,
         spec_state_indices_tensor=spec_state_indices_tensor,
         num_accepted_tokens=num_accepted_tokens,
