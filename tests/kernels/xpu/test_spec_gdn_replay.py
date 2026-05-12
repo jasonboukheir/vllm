@@ -212,7 +212,14 @@ def _build_dense_pool(payload, device):
 def _remap_index_tensor(t, remap):
     if t is None:
         return None
-    return remap[t.to(torch.long).to(remap.device)]
+    # The kernel treats slot ids <= 0 as NULL_BLOCK_ID; map them to the
+    # dense pool's slot-0 sentinel instead of letting negative indices
+    # wrap to the end of `remap`.
+    t_long = t.to(torch.long).to(remap.device)
+    out = torch.zeros_like(t_long)
+    mask = t_long > 0
+    out[mask] = remap[t_long[mask]]
+    return out
 
 
 def _build_unified_pool(non_spec_payload, spec_payload, device):
