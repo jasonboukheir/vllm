@@ -602,6 +602,11 @@ def _gdn_xpu_spec_sycl_path(
         return
 
     # Mixed batch: split, run twice, scatter.
+    # The metadata builder stores these as int32 (see GDNAttentionMetadataBuilder
+    # in vllm/v1/attention/backends/gdn_attn.py); index_copy_ requires int64.
+    spec_token_indx = spec_token_indx.to(torch.long)
+    non_spec_token_indx = non_spec_token_indx.to(torch.long)
+
     spec_qkvz = qkvz.index_select(0, spec_token_indx).contiguous()
     spec_ba = ba.index_select(0, spec_token_indx).contiguous()
     non_spec_qkvz = qkvz.index_select(0, non_spec_token_indx).contiguous()
