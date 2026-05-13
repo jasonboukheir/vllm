@@ -100,17 +100,50 @@ class WorkspaceManager:
         Returns:
             List of tensor views into the workspace buffer, one per shape/dtype pair.
         """
+        return self._slice_workspace(
+            self._ensure_workspace_size(self._total_bytes(shapes_and_dtypes)),
+            shapes_and_dtypes,
+        )
+
+    def try_get_simultaneous(
+        self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+    ) -> list[torch.Tensor] | None:
+        """Like get_simultaneous, but return None when growth would be needed
+        on a locked workspace instead of raising.
+
+        Callers use this when they have a correct (slower) fallback path and
+        want to opportunistically use pre-allocated workspace whenever it
+        already fits. A locked workspace that is already large enough is
+        still returned normally — only the locked-and-undersized case yields
+        None.
+        """
+        total_bytes = self._total_bytes(shapes_and_dtypes)
+        if self._locked:
+            ubatch_id = dbo_current_ubatch_id()
+            current = self._current_workspaces[ubatch_id]
+            if self._workspace_size_bytes(current) < total_bytes:
+                return None
+            return self._slice_workspace(current, shapes_and_dtypes)
+        return self._slice_workspace(
+            self._ensure_workspace_size(total_bytes), shapes_and_dtypes
+        )
+
+    @staticmethod
+    def _total_bytes(
+        shapes_and_dtypes: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+    ) -> int:
+        return sum(round_up(_compute_bytes(s, d), 256) for s, d in shapes_and_dtypes)
+
+    @staticmethod
+    def _slice_workspace(
+        workspace: torch.Tensor,
+        shapes_and_dtypes: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+    ) -> list[torch.Tensor]:
         actual_bytes = [_compute_bytes(s, d) for s, d in shapes_and_dtypes]
         aligned_bytes = [round_up(actual, 256) for actual in actual_bytes]
-        total_bytes = sum(aligned_bytes)
-
-        # Calculate cumulative offsets using itertools.accumulate
         offsets = list(accumulate([0] + aligned_bytes[:-1]))
-
-        current_workspace = self._ensure_workspace_size(total_bytes)
-
         return [
-            current_workspace[offsets[i] : offsets[i] + actual_bytes[i]]
+            workspace[offsets[i] : offsets[i] + actual_bytes[i]]
             .view(shapes_and_dtypes[i][1])
             .reshape(shapes_and_dtypes[i][0])
             for i in range(len(shapes_and_dtypes))
