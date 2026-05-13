@@ -10,6 +10,20 @@ from torch.nn.parameter import Parameter
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEQuantConfig,
+    int4_w4a16_moe_quant_config,
+)
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+    FusedMoEMethodBase,
+)
+from vllm.model_executor.layers.fused_moe.layer import FusedMoeWeightScaleSupported
+from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+    convert_to_wna16_moe_kernel_format,
+    make_wna16_moe_kernel,
+    select_wna16_moe_backend,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -19,12 +33,18 @@ from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     QuantizationMethods,
 )
+from vllm.model_executor.layers.quantization.utils import replace_parameter
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    QuantKey,
+    kInt4StaticGroupScale,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     PackedvLLMParameter,
     RowvLLMParameter,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
@@ -122,6 +142,45 @@ class INCConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "INCConfig":
+        # GPTQModel checkpoints carry per-module overrides under `dynamic`
+        # rather than `extra_config`. Translate `-:<regex>` (skip) and
+        # `+:<regex>` / bare (override) entries into INC's extra_config
+        # format so get_layer_config() handles them via its existing regex
+        # path. For "skip", we set bits=16 (= unquantized in check_quantized).
+        #
+        # GPTQModel matches its `dynamic` keys with `re.match` (anchored at
+        # start), but INC's get_layer_config uses `re.search` and only treats
+        # a key as a regex when it contains regex special characters. We
+        # therefore anchor every translated key with `^` and append `.*` for
+        # bare prefixes so they reach the regex matcher. Override values can
+        # be a dict (config), True/None (= use defaults), or False (= skip).
+        skip_cfg = {"bits": 16, "group_size": -1, "sym": True}
+        extra_config = cls.get_from_keys_or(config, ["extra_config"], None)
+        dynamic = cls.get_from_keys_or(config, ["dynamic"], None)
+        if dynamic:
+            extra_config = dict(extra_config) if extra_config else {}
+            for raw_pattern, override in dynamic.items():
+                if raw_pattern.startswith("-:"):
+                    pattern = raw_pattern.removeprefix("-:")
+                    cfg: dict[str, Any] = dict(skip_cfg)
+                else:
+                    pattern = raw_pattern.removeprefix("+:")
+                    if override is False:
+                        cfg = dict(skip_cfg)
+                    elif override is None or override is True:
+                        cfg = {}
+                    elif isinstance(override, dict):
+                        cfg = override
+                    else:
+                        raise ValueError(
+                            f"INC `dynamic` override for {raw_pattern!r} must "
+                            f"be a dict, bool, or None; got {type(override).__name__}."
+                        )
+                anchored = pattern if pattern.startswith("^") else f"^{pattern}"
+                if not any(c in r"*+?^$()[]{}|\\" for c in anchored.removeprefix("^")):
+                    anchored = f"{anchored}.*"
+                extra_config[anchored] = cfg
+
         return cls(
             weight_bits=cls.get_from_keys(config, ["bits"]),
             group_size=cls.get_from_keys(config, ["group_size"]),
@@ -132,7 +191,7 @@ class INCConfig(QuantizationConfig):
             block_name_to_quantize=cls.get_from_keys_or(
                 config, ["block_name_to_quantize", "to_quant_block_names"], None
             ),
-            extra_config=cls.get_from_keys_or(config, ["extra_config"], None),
+            extra_config=extra_config,
             data_type=cls.get_from_keys_or(config, ["data_type"], "int"),
             backend=cls.get_from_keys_or(config, ["backend", "vllm_backend"], "auto"),
         )
@@ -412,6 +471,8 @@ class INCConfig(QuantizationConfig):
         return None
 
     def apply_xpu_w4a16_quant_layer(self, layer, prefix: str):
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
 
         if not self.check_quantized(weight_bits):
@@ -435,6 +496,13 @@ class INCConfig(QuantizationConfig):
                 group_size=group_size,
                 sym=sym,
             )
+        if isinstance(layer, FusedMoE):
+            return INCXPUMoEMethod(
+                weight_bits=weight_bits,
+                group_size=group_size,
+                sym=sym,
+                moe=layer.moe_config,
+            )
         return None
 
     def apply_cpu_w4a16_quant_layer(self, layer, prefix: str):
@@ -456,6 +524,8 @@ class INCConfig(QuantizationConfig):
             )
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             return self.apply_gptq_quant_layer(layer, prefix)
+        # FusedMoE on CPU is not yet supported by INC; XPU has its own
+        # INCXPUMoEMethod path above.
         return None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -486,10 +556,34 @@ class INCConfig(QuantizationConfig):
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> "QuantizationMethods | None":
-        """Override the `auto-round` method to `inc`."""
-        is_auto_round_format = hf_quant_cfg.get("quant_method", None) == "auto-round"
-        if is_auto_round_format:
+        """Override the `auto-round` method to `inc`.
+
+        On XPU, also claim vanilla GPTQ sym int4 desc_act=false checkpoints:
+        gptq_marlin / awq_marlin gate on CUDA/CPU, and the moe_wna16 fallback
+        runs Triton kernels that don't execute on Intel GPUs. INC routes the
+        linear path through INCXPULinearMethod (oneDNN int4_gemm_w4a16) and
+        the MoE path through INCXPUMoEMethod (vllm-xpu-kernels
+        xpu_fused_moe(is_int4=True)) — the only working W4A16 path on XPU.
+        """
+        quant_method = hf_quant_cfg.get("quant_method", None)
+        if quant_method == "auto-round":
             return cls.get_name()
+        # On XPU, also claim vanilla GPTQ sym int4 desc_act=false. Honor an
+        # explicit user `--quantization` flag: only take over when the user
+        # didn't ask for a specific method or asked for `inc` directly, so
+        # `--quantization gptq_marlin` still routes through the marlin path
+        # for users who want it (it would then no-op on XPU; that's the
+        # user's call, not ours).
+        if (
+            current_platform.is_xpu()
+            and quant_method == "gptq"
+            and user_quant in (None, "inc")
+        ):
+            bits = hf_quant_cfg.get("bits")
+            sym = hf_quant_cfg.get("sym", True)
+            desc_act = hf_quant_cfg.get("desc_act", False)
+            if bits == 4 and sym is True and not desc_act:
+                return cls.get_name()
         return None
 
 
@@ -624,3 +718,264 @@ class INCXPULinearMethod(LinearMethodBase):
             None,  # g_idx not needed: desc_act is always False for INC models
         )
         return out.reshape(out_shape)
+
+
+class INCXPUMoEMethod(FusedMoEMethodBase):
+    """W4A16 INT4-symmetric MoE on Intel XPU via vllm-xpu-kernels.
+
+    Companion to ``INCXPULinearMethod``. Routes through the WNA16 MoE
+    oracle, which on XPU returns ``XPUExpertsWNA16`` — a thin wrapper over
+    ``vllm_xpu_kernels.fused_moe_interface.xpu_fused_moe(is_int4=True)``.
+
+    Weights are loaded in standard GPTQ MoE format
+    ([E, K // pack_factor, 2*N] int32 etc.) so existing GPTQv2 sym int4
+    checkpoints (e.g. ``palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4``) load
+    without a custom adapter. ``process_weights_after_loading`` then
+    repacks into the [E, 2*N, K] uint8 layout the XPU kernel expects.
+    """
+
+    def __init__(
+        self,
+        weight_bits: int,
+        group_size: int,
+        sym: bool,
+        moe: FusedMoEConfig,
+    ) -> None:
+        super().__init__(moe)
+        if weight_bits != 4:
+            raise NotImplementedError(
+                f"INC XPU MoE only supports 4-bit quantization, "
+                f"got weight_bits={weight_bits}."
+            )
+        if not sym:
+            raise NotImplementedError(
+                "INC XPU MoE only supports symmetric quantization for now."
+            )
+        self.weight_bits = weight_bits
+        self.group_size = group_size
+        self.sym = sym
+        self.pack_factor = 32 // weight_bits
+        self.input_dtype: torch.dtype | None = None
+
+        weight_key = QuantKey(
+            scalar_types.uint4b8, kInt4StaticGroupScale, symmetric=True
+        )
+        self.wna16_moe_backend, self.experts_cls = select_wna16_moe_backend(
+            moe, weight_key, weight_bits
+        )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        layer.input_dtype = self.input_dtype
+        # Drop intermediate_size_full (used by Marlin act-order); not relevant
+        # here since INC checkpoints have desc_act=false.
+        extra_weight_attrs.pop("intermediate_size_full", None)
+
+        if hidden_size % self.group_size != 0:
+            raise ValueError(
+                f"INC XPU MoE requires hidden_size ({hidden_size}) to be "
+                f"divisible by group_size ({self.group_size})."
+            )
+        if intermediate_size_per_partition % self.group_size != 0:
+            raise ValueError(
+                f"INC XPU MoE requires intermediate_size_per_partition "
+                f"({intermediate_size_per_partition}) to be divisible by "
+                f"group_size ({self.group_size}); check tensor-parallel size."
+            )
+
+        scales_size13 = hidden_size // self.group_size
+        scales_size2 = intermediate_size_per_partition // self.group_size
+        layer.num_groups_w13 = scales_size13
+        layer.num_groups_w2 = scales_size2
+
+        strategy = FusedMoeWeightScaleSupported.GROUP.value
+        extra_weight_attrs.update({"quant_method": strategy, "is_transposed": True})
+
+        # GPTQ-format storage: [E, K // pack_factor, 2*N] int32 along packed
+        # input dim. Same as GPTQMarlinMoEMethod so existing checkpoints load.
+        w13_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size // self.pack_factor,
+                2 * intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qweight", w13_qweight)
+        set_weight_attrs(w13_qweight, extra_weight_attrs)
+
+        w2_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition // self.pack_factor,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qweight", w2_qweight)
+        set_weight_attrs(w2_qweight, extra_weight_attrs)
+
+        w13_scales = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                scales_size13,
+                2 * intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_scales", w13_scales)
+        set_weight_attrs(w13_scales, extra_weight_attrs)
+
+        w2_scales = torch.nn.Parameter(
+            torch.empty(num_experts, scales_size2, hidden_size, dtype=params_dtype),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_scales", w2_scales)
+        set_weight_attrs(w2_scales, extra_weight_attrs)
+
+        # GPTQ checkpoints carry qzeros / g_idx tensors. Register placeholders
+        # so the loader doesn't error; they're discarded in
+        # process_weights_after_loading because the XPU kernel handles
+        # symmetric int4 zero points internally.
+        for name, shape in (
+            (
+                "w13_qzeros",
+                (
+                    num_experts,
+                    scales_size13,
+                    2 * intermediate_size_per_partition // self.pack_factor,
+                ),
+            ),
+            (
+                "w2_qzeros",
+                (
+                    num_experts,
+                    scales_size2,
+                    hidden_size // self.pack_factor,
+                ),
+            ),
+            ("w13_g_idx", (num_experts, hidden_size)),
+            ("w2_g_idx", (num_experts, intermediate_size_per_partition)),
+        ):
+            param = torch.nn.Parameter(
+                torch.empty(shape, dtype=torch.int32), requires_grad=False
+            )
+            layer.register_parameter(name, param)
+            set_weight_attrs(param, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        (
+            w13,
+            w2,
+            w13_scale,
+            w2_scale,
+            _w13_g_idx,
+            _w2_g_idx,
+            _w13_g_idx_sort,
+            _w2_g_idx_sort,
+            _w13_global_scale,
+            _w2_global_scale,
+            _w13_bias,
+            _w2_bias,
+        ) = convert_to_wna16_moe_kernel_format(
+            backend=self.wna16_moe_backend,
+            layer=layer,
+            quant_config=self,  # _process_weights_xpu ignores quant_config
+            input_dtype=self.input_dtype,
+            w13=layer.w13_qweight,
+            w2=layer.w2_qweight,
+            w13_scale=layer.w13_scales,
+            w2_scale=layer.w2_scales,
+            w13_g_idx=layer.w13_g_idx,
+            w2_g_idx=layer.w2_g_idx,
+        )
+
+        replace_parameter(layer, "w13_qweight", w13)
+        replace_parameter(layer, "w2_qweight", w2)
+        replace_parameter(layer, "w13_scales", w13_scale)
+        replace_parameter(layer, "w2_scales", w2_scale)
+
+        self._assert_no_g_idx_reordering(layer)
+
+        empty = torch.empty((0,), dtype=torch.int32, device=w13.device)
+        for name in ("w13_qzeros", "w2_qzeros", "w13_g_idx", "w2_g_idx"):
+            if hasattr(layer, name):
+                replace_parameter(layer, name, empty)
+
+        self._setup_kernel(layer)
+
+    @staticmethod
+    def _assert_no_g_idx_reordering(layer: torch.nn.Module) -> None:
+        """xpu_fused_moe(is_int4=True) does not implement desc_act / g_idx
+        activation reordering. Verify any loaded g_idx is monotonically
+        non-decreasing (the desc_act=false pattern) so that the hardcoded
+        is_k_full=True passed into make_wna16_moe_kernel below is safe."""
+        for name in ("w13_g_idx", "w2_g_idx"):
+            if not hasattr(layer, name):
+                continue
+            g_idx = getattr(layer, name)
+            if g_idx.numel() == 0:
+                continue
+            if (g_idx[..., 1:] < g_idx[..., :-1]).any():
+                raise NotImplementedError(
+                    f"INC XPU MoE requires desc_act=false GPTQ checkpoints; "
+                    f"got non-monotonic {name} indicating activation reordering, "
+                    f"which xpu_fused_moe does not support."
+                )
+
+    def _setup_kernel(self, layer: torch.nn.Module) -> None:
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        self.moe_kernel = make_wna16_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            experts_cls=self.experts_cls,
+            layer=layer,
+            is_k_full=True,  # validated above via _assert_no_g_idx_reordering
+            w13_g_idx=None,
+            w2_g_idx=None,
+            w13_g_idx_sort_indices=None,
+            w2_g_idx_sort_indices=None,
+            routing_tables=layer._maybe_init_expert_routing_tables(),
+            shared_experts=layer.shared_experts,
+        )
+
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
+        return int4_w4a16_moe_quant_config(
+            w1_scale=layer.w13_scales,
+            w2_scale=layer.w2_scales,
+            w1_zp=None,
+            w2_zp=None,
+            block_shape=[0, self.group_size],
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert self.moe_kernel is not None
+        return self.moe_kernel.apply(
+            hidden_states=x,
+            w1=layer.w13_qweight,
+            w2=layer.w2_qweight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            expert_map=layer.expert_map,
+            shared_experts_input=shared_experts_input,
+        )
