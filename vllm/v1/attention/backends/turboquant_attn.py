@@ -319,7 +319,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         )
         max_batch_tokens = scheduler_config.max_num_seqs * (1 + extra_spec_tokens)
         query_dtype = vllm_config.model_config.dtype
-        manager.get_simultaneous(
+        # Reserve across every ubatch slot so DBO setups don't get caught
+        # with sibling ubatches locked at 0 bytes.
+        manager.reserve(
             (
                 (
                     max_batch_tokens,

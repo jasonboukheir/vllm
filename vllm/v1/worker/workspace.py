@@ -100,10 +100,9 @@ class WorkspaceManager:
         Returns:
             List of tensor views into the workspace buffer, one per shape/dtype pair.
         """
-        return self._slice_workspace(
-            self._ensure_workspace_size(self._total_bytes(shapes_and_dtypes)),
-            shapes_and_dtypes,
-        )
+        actual_bytes, offsets, total_bytes = self._compute_layout(shapes_and_dtypes)
+        workspace = self._ensure_workspace_size(total_bytes)
+        return self._slice(workspace, shapes_and_dtypes, actual_bytes, offsets)
 
     def try_get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
@@ -117,31 +116,51 @@ class WorkspaceManager:
         still returned normally — only the locked-and-undersized case yields
         None.
         """
-        total_bytes = self._total_bytes(shapes_and_dtypes)
+        actual_bytes, offsets, total_bytes = self._compute_layout(shapes_and_dtypes)
         if self._locked:
             ubatch_id = dbo_current_ubatch_id()
             current = self._current_workspaces[ubatch_id]
             if self._workspace_size_bytes(current) < total_bytes:
                 return None
-            return self._slice_workspace(current, shapes_and_dtypes)
-        return self._slice_workspace(
-            self._ensure_workspace_size(total_bytes), shapes_and_dtypes
-        )
+            return self._slice(current, shapes_and_dtypes, actual_bytes, offsets)
+        workspace = self._ensure_workspace_size(total_bytes)
+        return self._slice(workspace, shapes_and_dtypes, actual_bytes, offsets)
+
+    def reserve(self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]) -> None:
+        """Pre-allocate workspace large enough for these shapes on every
+        ubatch slot.
+
+        Use this at init time (before `lock_workspace()`) so the lock
+        snapshots a workspace large enough for steady-state use on every
+        ubatch — not just the one whose forward happens to be active
+        during reservation. Safe to call repeatedly; idempotent.
+
+        Distinct from `get_simultaneous` which only grows the current
+        ubatch (to avoid orphaning sibling ubatches' outstanding views
+        mid-run).
+        """
+        total_bytes = self._compute_layout(shapes_and_dtypes)[2]
+        for ubatch_id in range(self._num_ubatches):
+            self._ensure_workspace_size(total_bytes, ubatch_id=ubatch_id)
 
     @staticmethod
-    def _total_bytes(
+    def _compute_layout(
         shapes_and_dtypes: tuple[tuple[tuple[int, ...], torch.dtype], ...],
-    ) -> int:
-        return sum(round_up(_compute_bytes(s, d), 256) for s, d in shapes_and_dtypes)
-
-    @staticmethod
-    def _slice_workspace(
-        workspace: torch.Tensor,
-        shapes_and_dtypes: tuple[tuple[tuple[int, ...], torch.dtype], ...],
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[int], list[int], int]:
+        """Compute byte sizes, aligned offsets, and total bytes in one pass."""
         actual_bytes = [_compute_bytes(s, d) for s, d in shapes_and_dtypes]
         aligned_bytes = [round_up(actual, 256) for actual in actual_bytes]
         offsets = list(accumulate([0] + aligned_bytes[:-1]))
+        total_bytes = sum(aligned_bytes)
+        return actual_bytes, offsets, total_bytes
+
+    @staticmethod
+    def _slice(
+        workspace: torch.Tensor,
+        shapes_and_dtypes: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+        actual_bytes: list[int],
+        offsets: list[int],
+    ) -> list[torch.Tensor]:
         return [
             workspace[offsets[i] : offsets[i] + actual_bytes[i]]
             .view(shapes_and_dtypes[i][1])
@@ -149,16 +168,22 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
-    def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
-        """Ensure workspace is allocated and large enough, return current workspace.
+    def _ensure_workspace_size(
+        self, required_bytes: int, ubatch_id: int | None = None
+    ) -> torch.Tensor:
+        """Ensure workspace is allocated and large enough, return that workspace.
 
         Args:
             required_bytes: The number of bytes required.
+            ubatch_id: Which ubatch slot to size. Defaults to the current
+                ubatch (`dbo_current_ubatch_id()`); pass an explicit id
+                from `reserve` to size sibling slots.
 
         Returns:
-            The current workspace tensor.
+            The workspace tensor for the selected ubatch.
         """
-        ubatch_id = dbo_current_ubatch_id()
+        if ubatch_id is None:
+            ubatch_id = dbo_current_ubatch_id()
         current_workspace = self._current_workspaces[ubatch_id]
         current_size = self._workspace_size_bytes(current_workspace)
 
