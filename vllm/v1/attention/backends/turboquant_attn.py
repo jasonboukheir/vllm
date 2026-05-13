@@ -295,6 +295,44 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
 
+        # Pre-reserve decode scratch buffers so `lock_workspace()` (called
+        # at end of warmup) snapshots a workspace large enough for the
+        # steady-state decode shape. Without this, models whose warmup
+        # path never lands a decode forward through the TQ backend (e.g.
+        # dense + hybrid attention) leave the workspace locked at 0 MB
+        # and the first decode request would fall back to torch.empty
+        # for every layer/forward.
+        self._reserve_decode_workspace(vllm_config)
+
+    def _reserve_decode_workspace(self, vllm_config) -> None:
+        if not is_workspace_manager_initialized():
+            return
+        manager = current_workspace_manager()
+        if manager.is_locked():
+            return
+        scheduler_config = vllm_config.scheduler_config
+        speculative_config = vllm_config.speculative_config
+        extra_spec_tokens = (
+            speculative_config.num_speculative_tokens
+            if speculative_config is not None
+            else 0
+        )
+        max_batch_tokens = scheduler_config.max_num_seqs * (1 + extra_spec_tokens)
+        query_dtype = vllm_config.model_config.dtype
+        manager.get_simultaneous(
+            (
+                (
+                    max_batch_tokens,
+                    self.num_heads,
+                    self.max_num_kv_splits,
+                    self.head_size + 1,
+                ),
+                torch.float32,
+            ),
+            ((max_batch_tokens, self.num_heads, self.head_size), query_dtype),
+            ((max_batch_tokens, self.num_heads), torch.float32),
+        )
+
     def _flash_attn_varlen(
         self,
         q: torch.Tensor,
@@ -888,9 +926,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             mid_o_buf = torch.empty(
                 (B, Hq, S, D + 1), dtype=torch.float32, device=query.device
             )
-            output_buf = torch.empty(
-                (B, Hq, D), dtype=query.dtype, device=query.device
-            )
+            output_buf = torch.empty((B, Hq, D), dtype=query.dtype, device=query.device)
             lse_buf = torch.empty((B, Hq), dtype=torch.float32, device=query.device)
 
         result = triton_turboquant_decode_attention(
