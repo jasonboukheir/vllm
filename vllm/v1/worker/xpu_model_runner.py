@@ -38,12 +38,22 @@ class XPUModelRunnerV2(GPUModelRunnerV2):
             super().__init__(vllm_config, device)
 
 
+def _xpu_current_stream(*args, **kwargs):
+    return torch.xpu.current_stream(*args, **kwargs)
+
+
 @contextmanager
 def _torch_cuda_wrapper():
     # replace cuda APIs with xpu APIs, this should work by default
     torch.cuda.Stream = torch.xpu.Stream
     torch.cuda.default_stream = torch.xpu.current_stream
-    torch.cuda.current_stream = torch.xpu.current_stream
+    # Must be a *distinct* object from torch.xpu.current_stream, not an alias.
+    # torch._dynamo.variables.torch._get_handlers() registers one handler for
+    # {accelerator,cuda,xpu}.current_stream in a single @register() group and
+    # raises "Handler already registered" on duplicate function objects, so
+    # aliasing the two aborts the first torch.compile during profile_run. The
+    # wrapper keeps the CUDA-shim semantics while staying a separate object.
+    torch.cuda.current_stream = _xpu_current_stream
     torch.cuda.stream = torch.xpu.stream
     torch.cuda.mem_get_info = torch.xpu.mem_get_info
     torch.cuda.Event = torch.Event
