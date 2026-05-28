@@ -1517,6 +1517,20 @@ def _run() -> None:
     with open(output_file, "wb") as f:
         f.write(pickle.dumps(result))
 
+    # The inspection result is now fully written, which is this subprocess's
+    # only job. Hard-exit to skip interpreter teardown: on XPU, once the
+    # SYCL/Level-Zero driver has touched the torch op registry, torch's
+    # library finalizer (torch.library._del_library) re-resolves ops after
+    # they've been reset, reading freed memory (garbage op overload names ->
+    # SIGSEGV). That teardown crash makes _run_in_subprocess treat a
+    # successful inspection as a failed one and aborts engine startup.
+    from vllm.platforms import current_platform
+
+    if current_platform.is_xpu():
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
 
 if __name__ == "__main__":
     _run()
