@@ -216,6 +216,13 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         parallel_config = self.vllm_config.parallel_config
 
         max_num_reqs = scheduler_config.max_num_seqs
+        speculative_config = self.vllm_config.speculative_config
+        max_query_tokens = 1
+        if speculative_config is not None:
+            max_query_tokens += (
+                2 if speculative_config.parallel_drafting else 1
+            ) * speculative_config.num_speculative_tokens
+        max_num_query_tokens = max_num_reqs * max_query_tokens
         num_heads = model_config.get_num_attention_heads(parallel_config)
         num_kv_heads = self.kv_cache_spec.num_kv_heads
         head_size = self.kv_cache_spec.head_size
@@ -223,10 +230,14 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             self.vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
 
-        current_workspace_manager().get_simultaneous(
-            ((max_num_reqs, num_heads, max_num_splits, head_size + 1), torch.float32),
-            ((max_num_reqs, num_heads, head_size), model_config.dtype),
-            ((max_num_reqs, num_heads), torch.float32),
+        workspace_manager = current_workspace_manager()
+        workspace_manager.reserve(
+            (
+                (max_num_query_tokens, num_heads, max_num_splits, head_size + 1),
+                torch.float32,
+            ),
+            ((max_num_query_tokens, num_heads, head_size), model_config.dtype),
+            ((max_num_query_tokens, num_heads), torch.float32),
         )
 
         reserve_continuation_prefill = (
@@ -239,7 +250,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         max_cached_len = max(0, model_config.max_model_len - 1)
         alloc_len = round_up(max_cached_len, self.kv_cache_spec.block_size)
         cache_buf_shape = (1, num_kv_heads, alloc_len, head_size)
-        current_workspace_manager().get_simultaneous(
+        workspace_manager.reserve(
             (cache_buf_shape, torch.float16),
             (cache_buf_shape, torch.float16),
         )
@@ -914,21 +925,29 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
     ) -> torch.Tensor:
         # Acquire shared decode scratch buffers from WorkspaceManager.
         # Layers execute sequentially so one set of buffers is sufficient.
-        # Falls back to kernel-internal allocation if workspace unavailable.
+        # output_buf in query dtype — matches the in-kernel fp16 cast in stage2.
         B = query.shape[0]
         D = self.head_size
         S = self.max_num_kv_splits
         Hq = self.num_heads
         mid_o_buf = output_buf = lse_buf = None
         if is_workspace_manager_initialized():
-            # output_buf in query dtype — matches the in-kernel fp16 cast in stage2.
-            mid_o_buf, output_buf, lse_buf = (
-                current_workspace_manager().get_simultaneous(
-                    ((B, Hq, S, D + 1), torch.float32),
-                    ((B, Hq, D), query.dtype),
-                    ((B, Hq), torch.float32),
-                )
+            bufs = current_workspace_manager().try_get_simultaneous(
+                ((B, Hq, S, D + 1), torch.float32),
+                ((B, Hq, D), query.dtype),
+                ((B, Hq), torch.float32),
             )
+            if bufs is not None:
+                mid_o_buf, output_buf, lse_buf = bufs
+            # else: workspace is locked at a size that cannot fit this decode
+            # shape (e.g. warmup never landed a decode pass on a TQ layer).
+            # Fall through to kernel-internal allocation via torch.empty.
+        if mid_o_buf is None:
+            mid_o_buf = torch.empty(
+                (B, Hq, S, D + 1), dtype=torch.float32, device=query.device
+            )
+            output_buf = torch.empty((B, Hq, D), dtype=query.dtype, device=query.device)
+            lse_buf = torch.empty((B, Hq), dtype=torch.float32, device=query.device)
 
         result = triton_turboquant_decode_attention(
             query=query,
