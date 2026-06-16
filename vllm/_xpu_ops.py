@@ -168,6 +168,28 @@ def _gdn_attention_core_xpu_impl(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
     )
 
+    # vLLM's shared GDN attention backend pads everything handed to a captured
+    # CUDAGraph out to the captured batch size, while num_actual_tokens stays at
+    # the real (unpadded) count (see vllm/v1/attention/backends/gdn_attn.py).
+    # The SYCL kernel already narrows the padded data tensors (core_attn_out / z
+    # / projected_states_{qkvz,ba}) internally, so leave those alone. The index /
+    # metadata tensors are different: the kernel still enforces exact sizes on
+    # them, so strip the cudagraph padding here in the adapter. The active
+    # lengths differ per tensor (token counts vs. request counts) and must stay
+    # distinct. Slicing dim 0 of a contiguous tensor yields a contiguous view
+    # sharing storage, so the padded tail is left untouched.
+    num_non_spec = num_prefills + num_decodes
+    if non_spec_query_start_loc is not None:
+        non_spec_query_start_loc = non_spec_query_start_loc[: num_non_spec + 1]
+    if non_spec_state_indices_tensor is not None:
+        non_spec_state_indices_tensor = non_spec_state_indices_tensor[:num_non_spec]
+    if spec_query_start_loc is not None:
+        spec_query_start_loc = spec_query_start_loc[: num_spec_decodes + 1]
+    if spec_state_indices_tensor is not None:
+        spec_state_indices_tensor = spec_state_indices_tensor[:num_spec_decodes]
+    if num_accepted_tokens is not None:
+        num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
+
     torch.ops._xpu_C.gdn_attention(
         core_attn_out,
         z,
