@@ -524,6 +524,24 @@ class Worker(WorkerBase):
         ) as profile_result:
             self.model_runner.profile_run()
 
+            # Materialize KVarN's lazy tail pools and scratch inside the measured
+            # profile window. Otherwise first use can be mischarged as graph
+            # memory and the same allocation is effectively counted twice.
+            cache_dtype = self.cache_config.cache_dtype
+            if (
+                isinstance(cache_dtype, str)
+                and cache_dtype.startswith("kvarn_")
+                and not cache_dtype.startswith("kvarn_mla")
+                and not getattr(self.vllm_config.model_config, "use_mla", False)
+            ):
+                from vllm.v1.attention.backends.kvarn_attn import (
+                    KVarNAttentionImpl,
+                )
+
+                for impl in KVarNAttentionImpl._all_impls:
+                    impl._ensure_pool(self.device)
+                torch.accelerator.synchronize(self.device)
+
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
         # torch.accelerator.get_memory_info (reliable on ROCm, as used by
@@ -567,6 +585,12 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+
+        # KVarN's fp16 tail pools (and the rest of its lazy state) are now
+        # materialized INSIDE the profiling window above, so their memory is
+        # measured for real and already part of non_kv_cache_memory — no
+        # arithmetic reservation needed here (the old explicit pool_bytes
+        # subtraction would double-count it).
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
