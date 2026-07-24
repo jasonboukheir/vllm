@@ -228,6 +228,9 @@ def _gdn_attention_core_xpu_impl(
         ).contiguous()
         spec_qkvz = projected_states_qkvz.index_select(0, spec_token_indx).contiguous()
         spec_ba = projected_states_ba.index_select(0, spec_token_indx).contiguous()
+        local_spec_token_indx = torch.arange(
+            spec_qkvz.shape[0], dtype=torch.int32, device=spec_qkvz.device
+        )
 
         non_spec_core = core_attn_out.new_empty((non_spec_qkvz.shape[0], *output_shape))
         non_spec_z = z.new_empty((non_spec_qkvz.shape[0], *output_shape))
@@ -274,7 +277,7 @@ def _gdn_attention_core_xpu_impl(
             non_spec_token_indx=None,
             non_spec_state_indices_tensor=None,
             spec_query_start_loc=spec_query_start_loc,
-            spec_token_indx=None,
+            spec_token_indx=local_spec_token_indx,
             spec_state_indices_tensor=spec_state_indices_tensor,
             num_accepted_tokens=num_accepted_tokens,
             num_actual_tokens=spec_qkvz.shape[0],
