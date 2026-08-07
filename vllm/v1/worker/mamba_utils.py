@@ -58,7 +58,9 @@ def _copy_mamba_state_block(
     The caller owns the decision logic (which columns, whether to copy); this
     device function only performs the byte copy for the given metadata slot.
     """
-    state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
+    state_base_addr = tl.load(state_base_addrs_ptr + state_idx).to(
+        tl.pointer_type(tl.uint8)
+    )
     state_block_stride = tl.load(state_block_strides_ptr + state_idx)
     state_elem_size = tl.load(state_elem_sizes_ptr + state_idx)
     state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
