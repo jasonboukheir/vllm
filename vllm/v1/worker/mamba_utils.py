@@ -607,7 +607,7 @@ class MambaSpecDecodeGPUContext:
 
     # Per-state metadata tensors (shape: [num_layers * num_state_types])
     # These are populated from forward_context during the first forward pass
-    state_base_addrs: torch.Tensor  # int64: base address of each state tensor
+    state_base_addrs: torch.Tensor  # uint64: base address of each state tensor
     state_block_strides: torch.Tensor  # int64: bytes per block
     state_elem_sizes: torch.Tensor  # int32: element size in bytes
     state_inner_sizes: torch.Tensor  # int64: elements in inner dimensions
@@ -627,7 +627,7 @@ class MambaSpecDecodeGPUContext:
     # Output buffer for num_accepted_tokens updates
     num_accepted_tokens_out: torch.Tensor
 
-    # Per-group block-table base addresses: int64[num_groups]. Populated in
+    # Per-group block-table base addresses: uint64[num_groups]. Populated in
     # initialize_from_forward_context from the persistent per-group block
     # table tensors (whose data_ptr is stable across steps).
     block_table_ptrs: torch.Tensor
@@ -668,7 +668,7 @@ class MambaSpecDecodeGPUContext:
 
         return cls(
             state_base_addrs=torch.zeros(
-                total_states, dtype=torch.int64, device=device
+                total_states, dtype=torch.uint64, device=device
             ),
             state_block_strides=torch.zeros(
                 total_states, dtype=torch.int64, device=device
@@ -700,7 +700,7 @@ class MambaSpecDecodeGPUContext:
                 max_num_reqs, dtype=torch.int32, device=device
             ),
             block_table_ptrs=torch.zeros(
-                len(mamba_group_ids), dtype=torch.int64, device=device
+                len(mamba_group_ids), dtype=torch.uint64, device=device
             ),
             mamba_state_idx_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_scheduled_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
