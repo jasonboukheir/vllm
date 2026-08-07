@@ -758,6 +758,7 @@ class MambaSpecDecodeGPUContext:
             return
 
         idx = 0
+        state_base_addrs = []
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
             for layer_name in layer_names:
@@ -766,7 +767,7 @@ class MambaSpecDecodeGPUContext:
 
                 for state_type_idx, state in enumerate(kv_caches):
                     # Base address
-                    self.state_base_addrs[idx] = state.data_ptr()
+                    state_base_addrs.append(state.data_ptr())
 
                     # Block stride (bytes between consecutive blocks)
                     # state shape: [num_blocks, ...], stride(0) = elements per block
@@ -841,6 +842,14 @@ class MambaSpecDecodeGPUContext:
                     self.state_group_indices[idx] = group_local_idx
                     idx += 1
 
+        self.state_base_addrs.copy_(
+            torch.tensor(
+                state_base_addrs,
+                dtype=torch.uint64,
+                device=self.state_base_addrs.device,
+            )
+        )
+
         # Cache per-group block-table base addresses and per-request stride.
         # `block_tables[i]` is the persistent 2D int32 block-table tensor for
         # `mamba_group_ids[i]`; `data_ptr()` / `stride(0)` are stable for the
@@ -853,8 +862,13 @@ class MambaSpecDecodeGPUContext:
             f"all mamba block tables must share stride(0), got {strides}"
         )
         self.block_table_stride_req = int(next(iter(strides)))
-        for i, bt in enumerate(block_tables):
-            self.block_table_ptrs[i] = bt.data_ptr()
+        self.block_table_ptrs.copy_(
+            torch.tensor(
+                [bt.data_ptr() for bt in block_tables],
+                dtype=torch.uint64,
+                device=self.block_table_ptrs.device,
+            )
+        )
 
         self.is_initialized = True
 
