@@ -157,7 +157,9 @@ def _copy_mamba_state_block(
     small; only ``tile_idx == 0`` copies them. ``TEMPORAL_TILES == 1`` and
     ``tile_idx == 0`` reproduces the untiled behavior.
     """
-    state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
+    state_base_addr = tl.load(state_base_addrs_ptr + state_idx).to(
+        tl.pointer_type(tl.uint8)
+    )
     state_block_stride = tl.load(state_block_strides_ptr + state_idx)
     state_elem_size = tl.load(state_elem_sizes_ptr + state_idx)
     state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
