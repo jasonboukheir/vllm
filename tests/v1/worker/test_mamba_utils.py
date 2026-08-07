@@ -372,6 +372,21 @@ def _make_gpu_ctx(
     )
 
 
+def test_gpu_context_pointer_metadata_supports_unsigned_addresses():
+    cfg = _TestConfig()
+    kv_cache_config = _make_kv_cache_config(cfg, ["layer_0"])
+    ctx = _make_gpu_ctx(cfg, kv_cache_config, torch.device("cpu"))
+    high_address = 2**63
+
+    ctx.state_base_addrs[0] = high_address
+    ctx.block_table_ptrs[0] = high_address
+
+    assert ctx.state_base_addrs.dtype == torch.uint64
+    assert ctx.block_table_ptrs.dtype == torch.uint64
+    assert ctx.state_base_addrs[0].item() == high_address
+    assert ctx.block_table_ptrs[0].item() == high_address
+
+
 # -----------------------------------------------------------------------------
 # stage_postprocess_inputs_to_gpu: single-pass staging into pinned views
 # -----------------------------------------------------------------------------
