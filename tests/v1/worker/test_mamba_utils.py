@@ -375,7 +375,23 @@ def _make_gpu_ctx(
 def test_gpu_context_pointer_metadata_supports_unsigned_addresses():
     cfg = _TestConfig()
     kv_cache_config = _make_kv_cache_config(cfg, ["layer_0"])
-    ctx = _make_gpu_ctx(cfg, kv_cache_config, torch.device("cpu"))
+    device = torch.device("cpu")
+    ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
+    _, _, conv_state, temporal_state, _, forward_context = _make_dual_states(
+        cfg, ["layer_0"], device
+    )
+    block_table = torch.zeros((cfg.max_num_reqs, 2), dtype=torch.int32)
+
+    ctx.initialize_from_forward_context(
+        kv_cache_config, forward_context, _COPY_FUNCS, [block_table]
+    )
+
+    assert ctx.state_base_addrs.tolist() == [
+        conv_state[0].data_ptr(),
+        temporal_state[0].data_ptr(),
+    ]
+    assert ctx.block_table_ptrs[0].item() == block_table.data_ptr()
+
     high_address = 2**63
 
     ctx.state_base_addrs[0] = high_address
