@@ -245,6 +245,80 @@ def test_independent_pool_kv_events_remain_fail_closed():
         )
 
 
+def test_prefix_cache_reconciles_mamba16_with_attention128_pools():
+    """A completed mixed-geometry prompt reuses the shared 128-token prefix."""
+    hash_block_size = 16
+    groups = [
+        KVCacheGroupSpec(
+            [f"mamba.{group_id}"],
+            MambaSpec(
+                block_size=16,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+                num_speculative_blocks=0,
+            ),
+        )
+        for group_id in range(3)
+    ]
+    groups.append(
+        KVCacheGroupSpec(
+            ["attention"],
+            FullAttentionSpec(
+                block_size=128,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        )
+    )
+    config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=32, group_ids=[group_id])
+            for group_id in range(3)
+        ]
+        + [KVCachePoolSpec(num_blocks=8, group_ids=[3])],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=256,
+        scheduler_block_size=128,
+        hash_block_size=hash_block_size,
+        enable_caching=True,
+    )
+
+    token_ids = list(range(200))
+    first = make_request("first", token_ids, hash_block_size, sha256)
+    # Align mode must expose the recurrent state at the common 128-token
+    # boundary before processing the prompt tail.
+    assert manager.allocate_slots(first, num_new_tokens=128) is not None
+    first.num_computed_tokens = 128
+    assert manager.allocate_slots(first, num_new_tokens=72) is not None
+    first.num_computed_tokens = 200
+    # Finishing the request includes decode steps that recycle old align-mode
+    # running states. The cached 128-token boundary must survive that churn.
+    for _ in range(3):
+        manager.new_step_starts()
+        assert manager.allocate_slots(first, num_new_tokens=1) is not None
+        first.num_computed_tokens += 1
+    manager.free(first)
+
+    second = make_request("second", token_ids, hash_block_size, sha256)
+    blocks, num_computed_tokens, _ = manager.get_computed_blocks(second)
+
+    assert num_computed_tokens >= 128
+    assert all(group for group in blocks.blocks)
+    assert all(
+        block.pool_id == group_id
+        for group_id, group in enumerate(blocks.blocks)
+        for block in group
+        if not block.is_null
+    )
+
+
 def _make_hybrid_spec_manager(num_spec_tokens: int = 2) -> KVCacheManager:
     """Independent attention/recurrent pools with configurable MTP gamma."""
     config = KVCacheConfig(
