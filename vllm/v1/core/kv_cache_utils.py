@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
     HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCachePoolSpec,
     KVCacheSpec,
     KVCacheTensor,
     MambaSpec,
@@ -120,6 +121,8 @@ class KVCacheBlock:
 
     # Block ID, ranging from 0 to num_gpu_blocks - 1.
     block_id: int
+    # Physical block-pool namespace. Block IDs are only unique within a pool.
+    pool_id: int = 0
     # Reference count.
     ref_cnt: int = 0
     # The hash key (block hash + group id) of the block, only available
@@ -928,14 +931,20 @@ def get_max_concurrency_for_kv_cache_config(
     a representative per-layer spec (scheduler config), so both capacity
     call sites agree.
     """
-    num_blocks_per_request = sum(
+    blocks_per_request = [
         cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
             group.kv_cache_spec.page_size_bytes,
         )
         for group in kv_cache_config.kv_cache_groups
-    )
-    max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
+    ]
+    if kv_cache_config.has_independent_kv_cache_pools:
+        max_concurrency = min(
+            kv_cache_config.num_blocks_for_group(group_id) / request_blocks
+            for group_id, request_blocks in enumerate(blocks_per_request)
+        )
+    else:
+        max_concurrency = kv_cache_config.num_blocks / sum(blocks_per_request)
     return max_concurrency
 
 
@@ -958,6 +967,28 @@ def _pool_bytes_per_block(
     `available_memory` into `num_blocks`. Used to compute the effective KV cache
     capacity once `num_gpu_blocks_override` is applied.
     """
+    independent_kvarn_pools = (
+        isinstance(vllm_config.cache_config.cache_dtype, str)
+        and vllm_config.cache_config.cache_dtype.startswith("kvarn_")
+        and not vllm_config.cache_config.cache_dtype.startswith("kvarn_mla")
+        and len(kv_cache_groups) > 1
+        and any(isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups)
+    )
+    if independent_kvarn_pools:
+        scheduler_quantum = math.lcm(
+            *(group.kv_cache_spec.block_size for group in kv_cache_groups)
+        )
+        bytes_per_quantum = sum(
+            len(group.layer_names)
+            * group.kv_cache_spec.page_size_bytes
+            * (scheduler_quantum // group.kv_cache_spec.block_size)
+            for group in kv_cache_groups
+        )
+        min_blocks_per_quantum = min(
+            scheduler_quantum // group.kv_cache_spec.block_size
+            for group in kv_cache_groups
+        )
+        return bytes_per_quantum // min_blocks_per_quantum
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
@@ -1349,8 +1380,51 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    # KVarN hybrid models can have a much smaller attention page than their
+    # recurrent-state page. Keep one physical block namespace per cache group
+    # instead of inflating every KVarN page to the recurrent page size.
+    independent_kvarn_pools = (
+        isinstance(vllm_config.cache_config.cache_dtype, str)
+        and vllm_config.cache_config.cache_dtype.startswith("kvarn_")
+        and not vllm_config.cache_config.cache_dtype.startswith("kvarn_mla")
+        and len(kv_cache_groups) > 1
+        and any(isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups)
+    )
+
     # Determine how model runners should initialize the KV cache tensors.
-    if len(kv_cache_groups) == 1 and isinstance(
+    if independent_kvarn_pools:
+        scheduler_quantum = math.lcm(
+            *(group.kv_cache_spec.block_size for group in kv_cache_groups)
+        )
+        bytes_per_quantum = sum(
+            len(group.layer_names)
+            * group.kv_cache_spec.page_size_bytes
+            * (scheduler_quantum // group.kv_cache_spec.block_size)
+            for group in kv_cache_groups
+        )
+        num_quanta = available_memory // bytes_per_quantum
+        num_quanta = may_override_num_blocks(vllm_config, num_quanta)
+
+        kv_cache_tensors = []
+        kv_cache_pools = []
+        pool_block_counts = []
+        for group_id, group in enumerate(kv_cache_groups):
+            num_group_blocks = num_quanta * (
+                scheduler_quantum // group.kv_cache_spec.block_size
+            )
+            pool_block_counts.append(num_group_blocks)
+            kv_cache_pools.append(
+                KVCachePoolSpec(num_blocks=num_group_blocks, group_ids=[group_id])
+            )
+            for layer_name in group.layer_names:
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=group.kv_cache_spec.page_size_bytes * num_group_blocks,
+                        shared_by=[layer_name],
+                    )
+                )
+        num_blocks = min(pool_block_counts)
+    elif len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         # Special case: all layers have the same type of KV cache but with
@@ -1406,6 +1480,7 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        kv_cache_pools=kv_cache_pools if independent_kvarn_pools else None,
     )
 
 
@@ -1802,15 +1877,24 @@ def get_kv_cache_groups(
         if not isinstance(v, HiddenStateCacheSpec)
     }
 
-    # Prefer preserving each layer's cache semantics. If physical pages cannot
-    # be unified, try a supported allocation-only fallback before failing.
-    try:
-        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
-    except NotImplementedError:
-        fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
-        if fallback_groups is None:
-            raise
-        return fallback_groups
+    # KVarN hybrid models use independent physical pools, so their attention
+    # pages do not need to be enlarged to the recurrent-state page size.
+    independent_kvarn_pools = (
+        isinstance(vllm_config.cache_config.cache_dtype, str)
+        and vllm_config.cache_config.cache_dtype.startswith("kvarn_")
+        and not vllm_config.cache_config.cache_dtype.startswith("kvarn_mla")
+        and any(isinstance(spec, MambaSpec) for spec in filtered_spec.values())
+    )
+    if not independent_kvarn_pools:
+        # Prefer preserving each layer's cache semantics. If physical pages
+        # cannot be unified, try a supported allocation-only fallback.
+        try:
+            filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+        except NotImplementedError:
+            fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
+            if fallback_groups is None:
+                raise
+            return fallback_groups
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
@@ -2217,6 +2301,14 @@ def get_kv_cache_configs(
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
+
+        if kv_cache_config.has_independent_kv_cache_pools:
+            assert kv_cache_config.kv_cache_pools is not None
+            for pool in kv_cache_config.kv_cache_pools:
+                assert pool.num_blocks % num_blocks_old == 0
+                pool.num_blocks = (
+                    pool.num_blocks // num_blocks_old * min_num_blocks
+                )
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
