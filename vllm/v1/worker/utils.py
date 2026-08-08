@@ -399,6 +399,23 @@ def prepare_kernel_block_sizes(
             # This is an attention backend that supports virtual block splitting.
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
             group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
+            if kv_cache_config.has_independent_kv_cache_pools:
+                # Independent pools preserve each layer's physical page geometry.
+                # The engine-side group spec can still carry the hybrid
+                # scheduler's logical alignment (for example 16 from a Mamba
+                # group), which must not be passed to a backend whose physical
+                # tile is 128 tokens. AttentionGroup is constructed from the
+                # worker's per-layer spec and is therefore authoritative here.
+                physical_block_sizes = {
+                    group.kv_cache_spec.block_size
+                    for group in attn_groups[kv_cache_gid]
+                }
+                assert len(physical_block_sizes) == 1, (
+                    "Independent KV cache groups must have one physical attention "
+                    f"block size, got {physical_block_sizes} for group "
+                    f"{kv_cache_gid}."
+                )
+                kv_manager_block_size = physical_block_sizes.pop()
             selected_kernel_size = select_common_block_size(
                 kv_manager_block_size, group_backends
             )

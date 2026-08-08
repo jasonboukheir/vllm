@@ -41,7 +41,9 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCachePoolSpec,
     KVCacheTensor,
+    MambaSpec,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -56,7 +58,11 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.utils import select_common_block_size
+from vllm.v1.worker.utils import (
+    AttentionGroup,
+    prepare_kernel_block_sizes,
+    select_common_block_size,
+)
 
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
@@ -260,6 +266,43 @@ def test_select_common_block_size_uses_largest_shared_int():
 
     selected_size = select_common_block_size(256, [backend_a, backend_b])
     assert selected_size == 64
+
+
+def test_independent_pool_uses_attention_physical_block_size():
+    """A logical hybrid alignment must not resize a KVarN kernel tile."""
+    backend = _make_mock_backend_for_kernel_block_size([128])
+    physical_attn_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=256,
+        dtype=torch.uint8,
+    )
+    # The engine-side group may retain the hybrid scheduler's logical block
+    # size. The worker AttentionGroup carries the physical per-layer geometry.
+    logical_attn_spec = physical_attn_spec.copy_with_new_block_size(16)
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+    )
+    config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn"], logical_attn_spec),
+            KVCacheGroupSpec(["mamba"], mamba_spec),
+        ],
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=8, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=8, group_ids=[1]),
+        ],
+    )
+    attn_groups = [
+        [AttentionGroup(backend, ["attn"], physical_attn_spec, 0)],
+        [],
+    ]
+
+    assert prepare_kernel_block_sizes(config, attn_groups) == [128, 16]
 
 
 def test_reasoning_config_without_custom_logitsprocs_does_not_need_output_token_ids(
