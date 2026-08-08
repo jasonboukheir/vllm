@@ -939,9 +939,11 @@ def get_max_concurrency_for_kv_cache_config(
         for group in kv_cache_config.kv_cache_groups
     ]
     if kv_cache_config.has_independent_kv_cache_pools:
+        assert kv_cache_config.kv_cache_pools is not None
         max_concurrency = min(
-            kv_cache_config.num_blocks_for_group(group_id) / request_blocks
-            for group_id, request_blocks in enumerate(blocks_per_request)
+            pool.num_blocks
+            / sum(blocks_per_request[group_id] for group_id in pool.group_ids)
+            for pool in kv_cache_config.kv_cache_pools
         )
     else:
         max_concurrency = kv_cache_config.num_blocks / sum(blocks_per_request)
@@ -1970,6 +1972,45 @@ def update_kv_cache_capacity(
         f"{max_model_len:,}",
         max_concurrency,
     )
+    if kv_cache_config.has_independent_kv_cache_pools:
+        assert kv_cache_config.kv_cache_pools is not None
+        for pool_id, pool in enumerate(kv_cache_config.kv_cache_pools):
+            groups = [kv_cache_config.kv_cache_groups[i] for i in pool.group_ids]
+            request_blocks = sum(
+                cdiv(
+                    group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                    group.kv_cache_spec.page_size_bytes,
+                )
+                for group in groups
+            )
+            allocated_bytes = sum(
+                tensor.size
+                for tensor in kv_cache_config.kv_cache_tensors
+                if any(
+                    layer_name in tensor.shared_by
+                    for group in groups
+                    for layer_name in group.layer_names
+                )
+            )
+            group_kinds = [type(group.kv_cache_spec).__name__ for group in groups]
+            logger.info_once(
+                "KV cache pool %d: groups=%s, types=%s, layers=%d, "
+                "physical_blocks=%s, block_sizes=%s, page_sizes=%s bytes, "
+                "allocated=%s bytes, max_request_blocks=%s, concurrency=%.2fx%s",
+                pool_id,
+                pool.group_ids,
+                group_kinds,
+                sum(len(group.layer_names) for group in groups),
+                f"{pool.num_blocks:,}",
+                [group.kv_cache_spec.block_size for group in groups],
+                [group.kv_cache_spec.page_size_bytes for group in groups],
+                f"{allocated_bytes:,}",
+                f"{request_blocks:,}",
+                pool.num_blocks / request_blocks,
+                " (limiting)"
+                if pool.num_blocks / request_blocks == max_concurrency
+                else "",
+            )
 
 
 def _max_memory_usage_bytes_from_groups(

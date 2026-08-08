@@ -1679,6 +1679,28 @@ def test_get_max_concurrency_for_kv_cache_config():
         vllm_config, kv_cache_config_uniform_group
     )
 
+    # A physical pool may own more than one logical group. Its per-request
+    # demand is the sum of those groups, not the largest individual demand.
+    kv_cache_config_multi_group_pool = KVCacheConfig(
+        num_blocks=1153 * 3,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer_0"], full_attention_spec),
+            KVCacheGroupSpec(["layer_1"], sliding_window_spec),
+            KVCacheGroupSpec(["layer_2"], full_attention_spec),
+        ],
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=1153 * 3, group_ids=[0, 1]),
+            KVCachePoolSpec(num_blocks=1024 * 4, group_ids=[2]),
+        ],
+    )
+    assert (
+        get_max_concurrency_for_kv_cache_config(
+            vllm_config, kv_cache_config_multi_group_pool
+        )
+        == 3
+    )
+
 
 def test_get_max_concurrency_packed_kv_cache_config():
     from vllm.v1.core.kv_cache_utils import (

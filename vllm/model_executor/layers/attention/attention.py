@@ -711,6 +711,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size=self.head_size,
                 head_size_v=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=quant_mode,
                 tq_slot_size=slot_bytes,
             )
         else:
