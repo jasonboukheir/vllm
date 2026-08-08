@@ -277,9 +277,6 @@ def test_independent_pool_uses_attention_physical_block_size():
         head_size=256,
         dtype=torch.uint8,
     )
-    # The engine-side group may retain the hybrid scheduler's logical block
-    # size. The worker AttentionGroup carries the physical per-layer geometry.
-    logical_attn_spec = physical_attn_spec.copy_with_new_block_size(16)
     mamba_spec = MambaSpec(
         block_size=16,
         shapes=((1,),),
@@ -289,7 +286,10 @@ def test_independent_pool_uses_attention_physical_block_size():
         num_blocks=8,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(["attn"], logical_attn_spec),
+            # Reproduce the engine-side hybrid wrapper seen on hardware: this
+            # position dispatches as logical Mamba/16 even though the worker's
+            # actual layer and backend are physical attention/KVarN/128.
+            KVCacheGroupSpec(["attn"], mamba_spec),
             KVCacheGroupSpec(["mamba"], mamba_spec),
         ],
         kv_cache_pools=[
