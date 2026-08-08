@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool, MultiBlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -25,6 +26,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -626,6 +629,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for g in kv_cache_config.kv_cache_groups
         )
         self.verify_and_split_kv_cache_groups()
+        logger.debug(
+            "Hybrid KV prefix geometry: scheduler_block_size=%d, "
+            "hash_block_size=%d, groups=%s, pools=%s",
+            self.scheduler_block_size,
+            self.hash_block_size,
+            [manager.block_size for manager in self.single_type_managers],
+            [
+                self.kv_cache_config.pool_id_for_group(group_id)
+                for group_id in range(len(self.single_type_managers))
+            ],
+        )
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
@@ -735,6 +749,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
             )
+            blocks = manager.req_to_blocks.get(request.request_id, ())
+            logger.debug(
+                "Hybrid KV prefix insert: request=%s group=%d pool=%d "
+                "requested_tokens=%d resident_blocks=%d hashed_blocks=%d",
+                request.request_id,
+                manager.kv_cache_group_id,
+                manager.block_pool.pool_id,
+                num_tokens_to_cache,
+                sum(not block.is_null for block in blocks),
+                sum(block.block_hash is not None for block in blocks),
+            )
 
     def find_longest_cache_hit(
         self,
@@ -830,6 +855,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         if isinstance(spec, FullAttentionSpec)
                         else 1
                     ),
+                )
+                logger.debug(
+                    "Hybrid KV prefix lookup: groups=%s pool=%d "
+                    "candidate_tokens=%d hit_tokens=%d blocks=%s",
+                    group_ids,
+                    self.kv_cache_config.pool_id_for_group(first_group_id),
+                    _max_length,
+                    _new_hit_length,
+                    [len(blocks) for blocks in hit_blocks],
                 )
                 if drop_eagle_block:
                     eagle_verified.add(idx)

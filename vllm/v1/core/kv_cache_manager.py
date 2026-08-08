@@ -257,6 +257,14 @@ class KVCacheManager:
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
         if not self.prefix_cache_lookup_enabled(request):
+            logger.debug(
+                "Skipping prefix lookup: request=%s enabled=%s skip_read=%s "
+                "cache_salt_set=%s",
+                request.request_id,
+                self.enable_caching,
+                request.skip_reading_prefix_cache,
+                request.cache_salt is not None,
+            )
             return self.empty_kv_cache_blocks, 0, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
