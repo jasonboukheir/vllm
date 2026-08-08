@@ -841,20 +841,18 @@ class Platform:
         elif cache_config.cache_dtype.startswith("kvarn_") and not (
             cache_config.cache_dtype.startswith("kvarn_mla")
         ):
-            from vllm.v1.attention.backends.kvarn_attn import (
-                KVarNAttentionBackend,
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
             )
 
-            kvarn_spec = FullAttentionSpec(
-                block_size=1,
-                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
-                head_size=model_config.get_head_size(),
-                dtype=kv_cache_dtype,
-                kv_quant_mode=kv_quant_mode,
+            kvarn_config = KVarNConfig.from_cache_dtype(
+                cache_config.cache_dtype, model_config.get_head_size()
             )
-            kvarn_page = KVarNAttentionBackend.customize_spec(
-                kvarn_spec
-            ).page_size_bytes
+            kvarn_page = (
+                model_config.get_num_kv_heads(parallel_config)
+                * kvarn_config.tile_bytes_aligned
+                // kvarn_config.group
+            )
             if cache_config.kv_cache_dtype_skip_layers:
                 skip_page = FullAttentionSpec(
                     block_size=1,
