@@ -44,6 +44,7 @@ class KVQuantMode(IntEnum):
     INT4_PER_TOKEN_HEAD = 4  # packed 2×int4/byte, RHT + asymmetric zp
     NVFP4 = 5  # packed fp4 data + fp8 block scales
     TURBOQUANT = 6  # Hadamard-rotated Lloyd-Max quant, packed K+V per slot
+    KVARN = 7  # tile-shared K/V quantization with a packed cache record
 
     @property
     def is_per_token_head(self) -> bool:
@@ -77,6 +78,12 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
         return KVQuantMode.TURBOQUANT
+    if (
+        isinstance(kv_cache_dtype, str)
+        and kv_cache_dtype.startswith("kvarn_")
+        and not kv_cache_dtype.startswith("kvarn_mla")
+    ):
+        return KVQuantMode.KVARN
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
