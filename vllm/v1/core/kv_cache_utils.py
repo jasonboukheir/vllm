@@ -960,6 +960,20 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     return num_blocks
 
 
+def _physical_blocks_per_request(
+    vllm_config: VllmConfig, group: KVCacheGroupSpec
+) -> int:
+    """Peak resident pages for one request in one physical cache pool.
+
+    This intentionally uses the memory contract rather than block-table width.
+    In Mamba ``align`` mode the table is position-indexed across the sequence,
+    while old entries are null and only ``2 + num_speculative_blocks`` states
+    remain resident.
+    """
+    spec = group.kv_cache_spec
+    return cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+
+
 def _pool_bytes_per_block(
     vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
 ) -> int:
@@ -977,20 +991,12 @@ def _pool_bytes_per_block(
         and any(isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups)
     )
     if independent_kvarn_pools:
-        scheduler_quantum = math.lcm(
-            *(group.kv_cache_spec.block_size for group in kv_cache_groups)
-        )
-        bytes_per_quantum = sum(
+        return sum(
             len(group.layer_names)
             * group.kv_cache_spec.page_size_bytes
-            * (scheduler_quantum // group.kv_cache_spec.block_size)
+            * _physical_blocks_per_request(vllm_config, group)
             for group in kv_cache_groups
         )
-        min_blocks_per_quantum = min(
-            scheduler_quantum // group.kv_cache_spec.block_size
-            for group in kv_cache_groups
-        )
-        return bytes_per_quantum // min_blocks_per_quantum
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
@@ -1395,25 +1401,26 @@ def get_kv_cache_config_from_groups(
 
     # Determine how model runners should initialize the KV cache tensors.
     if independent_kvarn_pools:
-        scheduler_quantum = math.lcm(
-            *(group.kv_cache_spec.block_size for group in kv_cache_groups)
-        )
-        bytes_per_quantum = sum(
+        blocks_per_request = [
+            _physical_blocks_per_request(vllm_config, group)
+            for group in kv_cache_groups
+        ]
+        bytes_per_request = sum(
             len(group.layer_names)
             * group.kv_cache_spec.page_size_bytes
-            * (scheduler_quantum // group.kv_cache_spec.block_size)
-            for group in kv_cache_groups
+            * num_blocks
+            for group, num_blocks in zip(kv_cache_groups, blocks_per_request)
         )
-        num_quanta = available_memory // bytes_per_quantum
-        num_quanta = may_override_num_blocks(vllm_config, num_quanta)
+        num_requests = available_memory // bytes_per_request
+        num_requests = may_override_num_blocks(vllm_config, num_requests)
 
         kv_cache_tensors = []
         kv_cache_pools = []
         pool_block_counts = []
-        for group_id, group in enumerate(kv_cache_groups):
-            num_group_blocks = num_quanta * (
-                scheduler_quantum // group.kv_cache_spec.block_size
-            )
+        for group_id, (group, request_blocks) in enumerate(
+            zip(kv_cache_groups, blocks_per_request)
+        ):
+            num_group_blocks = num_requests * request_blocks
             pool_block_counts.append(num_group_blocks)
             kv_cache_pools.append(
                 KVCachePoolSpec(num_blocks=num_group_blocks, group_ids=[group_id])
@@ -2356,19 +2363,21 @@ def get_kv_cache_configs(
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
+        if num_blocks_old == min_num_blocks:
+            continue
 
         if kv_cache_config.has_independent_kv_cache_pools:
             assert kv_cache_config.kv_cache_pools is not None
             for pool in kv_cache_config.kv_cache_pools:
-                assert pool.num_blocks % num_blocks_old == 0
+                assert pool.num_blocks * min_num_blocks % num_blocks_old == 0
                 pool.num_blocks = (
-                    pool.num_blocks // num_blocks_old * min_num_blocks
+                    pool.num_blocks * min_num_blocks // num_blocks_old
                 )
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            assert tensor.size * min_num_blocks % num_blocks_old == 0
+            tensor.size = tensor.size * min_num_blocks // num_blocks_old
 
     return kv_cache_configs
 
