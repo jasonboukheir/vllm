@@ -164,16 +164,18 @@ class BlockPool:
         num_gpu_blocks: int,
         enable_caching: bool,
         hash_block_size: int,
+        pool_id: int = 0,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
+        self.pool_id = pool_id
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
-            KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+            KVCacheBlock(idx, pool_id=pool_id) for idx in range(num_gpu_blocks)
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
@@ -829,3 +831,52 @@ class BlockPool:
         events = self.kv_event_queue
         self.kv_event_queue = []
         return events
+
+
+class MultiBlockPool:
+    """Compatibility facade for independent physical block pools.
+
+    Block-bearing operations are routed by ``KVCacheBlock.pool_id``. Operations
+    whose input is only an unqualified block ID intentionally remain unsupported
+    for multiple pools because local IDs may collide.
+    """
+
+    def __init__(self, pools: Sequence[BlockPool]):
+        assert pools
+        self.pools = tuple(pools)
+
+    def _group_blocks(
+        self, blocks: Iterable[KVCacheBlock]
+    ) -> list[list[KVCacheBlock]]:
+        grouped = [[] for _ in self.pools]
+        for block in blocks:
+            grouped[block.pool_id].append(block)
+        return grouped
+
+    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        for pool, blocks in zip(self.pools, self._group_blocks(ordered_blocks)):
+            if blocks:
+                pool.free_blocks(blocks)
+
+    def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
+        for pool, pool_blocks in zip(self.pools, self._group_blocks(blocks)):
+            if pool_blocks:
+                pool.touch(pool_blocks)
+
+    def get_num_free_blocks(self) -> int:
+        return min(pool.get_num_free_blocks() for pool in self.pools)
+
+    def get_usage(self) -> float:
+        return max(pool.get_usage() for pool in self.pools)
+
+    def reset_prefix_cache(self) -> bool:
+        # Check refcounts first so reset remains all-or-nothing.
+        if any(any(block.ref_cnt for block in pool.blocks) for pool in self.pools):
+            return False
+        return all(pool.reset_prefix_cache() for pool in self.pools)
+
+    def take_events(self) -> list[KVCacheEvent]:
+        return [event for pool in self.pools for event in pool.take_events()]
+
+    def evict_blocks(self, block_ids: set[int]) -> None:
+        raise ValueError("Block IDs must be pool-qualified with multiple KV pools")

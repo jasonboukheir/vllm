@@ -19,6 +19,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.platforms.interface import Platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
 from vllm.utils.mem_constants import GiB_bytes
@@ -49,6 +50,7 @@ from vllm.v1.kv_cache_interface import (
     HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCachePoolSpec,
     KVCacheSpec,
     KVCacheSpecKind,
     KVCacheTensor,
@@ -1399,6 +1401,7 @@ def test_is_kv_cache_spec_uniform():
     }
     assert is_kv_cache_spec_uniform(kv_cache_spec)
 
+
     kv_cache_spec = {
         "layer_1": new_kv_cache_spec(num_kv_heads=32),
         "layer_2": new_sliding_window_spec(num_kv_heads=32, sliding_window=1),
@@ -1416,6 +1419,115 @@ def test_is_kv_cache_spec_uniform():
         "layer_2": new_sliding_window_spec(num_kv_heads=32, sliding_window=2),
     }
     assert not is_kv_cache_spec_uniform(kv_cache_spec)
+
+
+def test_kv_cache_config_supports_independent_group_capacities():
+    """Physical cache pools may have different block counts."""
+    groups = [
+        KVCacheGroupSpec(["full"], new_kv_cache_spec(block_size=128)),
+        KVCacheGroupSpec(["mamba"], new_mamba_spec(block_size=1664)),
+    ]
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=130, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=10, group_ids=[1]),
+        ],
+    )
+
+    assert config.num_blocks_for_group(0) == 130
+    assert config.num_blocks_for_group(1) == 10
+    assert config.pool_id_for_group(0) == 0
+    assert config.pool_id_for_group(1) == 1
+    assert config.num_blocks == 10
+    assert config.max_num_blocks == 130
+    assert config.has_independent_kv_cache_pools
+
+
+def test_kv_cache_config_defaults_each_group_to_shared_capacity():
+    """Existing uniform-pool configurations retain their old behavior."""
+    groups = [
+        KVCacheGroupSpec(["full"], new_kv_cache_spec()),
+        KVCacheGroupSpec(["mamba"], new_mamba_spec()),
+    ]
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+    )
+
+    assert config.num_blocks_for_group(0) == 10
+    assert config.num_blocks_for_group(1) == 10
+    assert config.pool_id_for_group(0) == 0
+    assert config.pool_id_for_group(1) == 0
+    assert not config.has_independent_kv_cache_pools
+
+
+def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
+    """KVarN tiles and Mamba states retain their natural page geometry."""
+    groups = [
+        KVCacheGroupSpec(["full.0", "full.1"], new_kv_cache_spec(block_size=128)),
+        KVCacheGroupSpec(["mamba.0"], new_mamba_spec(block_size=512)),
+    ]
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=512))
+    vllm_config.cache_config.cache_dtype = "kvarn_k4v4_g128"
+    vllm_config.cache_config.kv_cache_layout = "LBHNC"
+
+    blocks_per_request = [
+        group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+        // group.kv_cache_spec.page_size_bytes
+        for group in groups
+    ]
+    bytes_per_request = sum(
+        len(group.layer_names)
+        * group.kv_cache_spec.page_size_bytes
+        * blocks
+        for group, blocks in zip(groups, blocks_per_request)
+    )
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=bytes_per_request * 3,
+    )
+
+    expected_pool_blocks = [blocks * 3 for blocks in blocks_per_request]
+    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == (
+        expected_pool_blocks
+    )
+    assert config.num_blocks == min(expected_pool_blocks)
+    assert [tensor.pool_id for tensor in config.kv_cache_tensors] == [0, 1]
+    assert [tensor.size for tensor in config.kv_cache_tensors] == [
+        len(groups[0].layer_names)
+        * groups[0].kv_cache_spec.page_size_bytes
+        * expected_pool_blocks[0],
+        len(groups[1].layer_names)
+        * groups[1].kv_cache_spec.page_size_bytes
+        * expected_pool_blocks[1],
+    ]
+    assert sum(tensor.size for tensor in config.kv_cache_tensors) == (
+        bytes_per_request * 3
+    )
+
+
+def test_kvarn_hybrid_alignment_preserves_natural_block_sizes():
+    cache_config = SimpleNamespace(
+        cache_dtype="kvarn_k4v4_g128",
+        block_size=128,
+        mamba_block_size=8192,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(),
+    )
+
+    Platform._align_hybrid_block_size(vllm_config, SimpleNamespace())
+
+    assert cache_config.block_size == 128
+    assert cache_config.mamba_block_size == 8192
 
 
 @pytest.mark.parametrize(

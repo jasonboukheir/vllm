@@ -1144,6 +1144,7 @@ class KVCacheTensor:
     layer_stride: int
     block_stride: int
     offset: int = 0  # byte offset of layers[0]'s block 0
+    pool_id: int = 0  # physical backing allocation for this placement
 
 
 @dataclass
@@ -1159,6 +1160,14 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+
+
+@dataclass
+class KVCachePoolSpec:
+    """A physical block-ID namespace shared by one or more cache groups."""
+
+    num_blocks: int
+    group_ids: list[int]
 
 
 @dataclass
@@ -1183,6 +1192,59 @@ class KVCacheConfig:
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
+    kv_cache_pools: list[KVCachePoolSpec] | None = None
+    """Physical cache pools, or one shared legacy pool when omitted."""
+
+    def __post_init__(self) -> None:
+        if self.kv_cache_pools is None:
+            self.kv_cache_pools = [
+                KVCachePoolSpec(
+                    num_blocks=self.num_blocks,
+                    group_ids=list(range(len(self.kv_cache_groups))),
+                )
+            ]
+
+        group_pool_ids: list[int | None] = [None] * len(self.kv_cache_groups)
+        for pool_id, pool in enumerate(self.kv_cache_pools):
+            if pool.num_blocks <= 0:
+                raise ValueError("KV cache pools must contain at least one block")
+            for group_id in pool.group_ids:
+                if not 0 <= group_id < len(self.kv_cache_groups):
+                    raise ValueError(f"Invalid KV cache group id: {group_id}")
+                if group_pool_ids[group_id] is not None:
+                    raise ValueError(
+                        f"KV cache group {group_id} belongs to multiple pools"
+                    )
+                group_pool_ids[group_id] = pool_id
+        if any(pool_id is None for pool_id in group_pool_ids):
+            raise ValueError("Every KV cache group must belong to one pool")
+        self._group_pool_ids = tuple(group_pool_ids)
+        if self.kv_cache_pools:
+            self.num_blocks = min(pool.num_blocks for pool in self.kv_cache_pools)
+
+    def pool_id_for_group(self, group_id: int) -> int:
+        pool_id = self._group_pool_ids[group_id]
+        assert pool_id is not None
+        return pool_id
+
+    def num_blocks_for_group(self, group_id: int) -> int:
+        pool_id = self.pool_id_for_group(group_id)
+        assert self.kv_cache_pools is not None
+        return self.kv_cache_pools[pool_id].num_blocks
+
+    def num_blocks_for_pool(self, pool_id: int) -> int:
+        assert self.kv_cache_pools is not None
+        return self.kv_cache_pools[pool_id].num_blocks
+
+    @property
+    def has_independent_kv_cache_pools(self) -> bool:
+        assert self.kv_cache_pools is not None
+        return len(self.kv_cache_pools) > 1
+
+    @property
+    def max_num_blocks(self) -> int:
+        assert self.kv_cache_pools is not None
+        return max((pool.num_blocks for pool in self.kv_cache_pools), default=0)
 
     @property
     def has_mamba_layers(self) -> bool:

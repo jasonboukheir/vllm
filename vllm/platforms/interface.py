@@ -791,6 +791,15 @@ class Platform:
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
+        if cache_config.cache_dtype.startswith("kvarn_") and not (
+            cache_config.cache_dtype.startswith("kvarn_mla")
+        ):
+            logger.info(
+                "Keeping natural KVarN and Mamba block sizes for independent "
+                "KV cache pools."
+            )
+            return
+
         if cache_config.cache_dtype == "auto":
             kv_cache_dtype = model_config.dtype
         else:

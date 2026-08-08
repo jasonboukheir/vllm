@@ -142,6 +142,13 @@ class KVCacheManager:
 
         self.enable_caching = enable_caching
         self.enable_kv_cache_events = enable_kv_cache_events
+        if kv_cache_config.has_independent_kv_cache_pools and (
+            enable_caching or enable_kv_cache_events
+        ):
+            raise NotImplementedError(
+                "Independent KV cache pools currently require prefix caching "
+                "and KV cache events to be disabled"
+            )
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
@@ -166,12 +173,16 @@ class KVCacheManager:
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        self.block_pools = self.coordinator.block_pools
         self.kv_cache_config = kv_cache_config
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        self.watermark_blocks_by_pool = tuple(
+            int(watermark * pool.num_gpu_blocks) for pool in self.block_pools
+        )
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -463,31 +474,39 @@ class KVCacheManager:
             self.max_model_len,
         )
 
-        watermark_blocks = 0
+        watermark_blocks_by_pool = (0,) * len(self.block_pools)
         # The watermark is applied to waiting/preempted requests only, and only
         # when there's at least one request already scheduled.
         if has_scheduled_reqs and request.status in (
             RequestStatus.WAITING,
             RequestStatus.PREEMPTED,
         ):
-            watermark_blocks = self.watermark_blocks
+            watermark_blocks_by_pool = self.watermark_blocks_by_pool
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=full_num_tokens,
-                new_computed_blocks=new_computed_block_list,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=total_computed_tokens,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_tokens_main_model=full_num_tokens,
-                apply_admission_cap=True,
+            num_blocks_to_allocate = (
+                self.coordinator.get_num_blocks_to_allocate_by_pool(
+                    request_id=request.request_id,
+                    num_tokens=full_num_tokens,
+                    new_computed_blocks=new_computed_block_list,
+                    num_encoder_tokens=num_encoder_tokens,
+                    total_computed_tokens=total_computed_tokens,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_tokens_main_model=full_num_tokens,
+                    apply_admission_cap=True,
+                )
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            if any(
+                required + watermark > pool.get_num_free_blocks()
+                for required, watermark, pool in zip(
+                    num_blocks_to_allocate,
+                    watermark_blocks_by_pool,
+                    self.block_pools,
+                )
+            ):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -510,7 +529,7 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate_by_pool(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -523,9 +542,14 @@ class KVCacheManager:
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
+        if any(
+            required + watermark > pool.get_num_free_blocks() - reserved_blocks
+            for required, watermark, pool in zip(
+                num_blocks_to_allocate,
+                watermark_blocks_by_pool,
+                self.block_pools,
+            )
+        ):
             # Cannot allocate new blocks
             return None
 
