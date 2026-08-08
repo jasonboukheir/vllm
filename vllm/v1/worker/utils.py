@@ -389,6 +389,22 @@ def prepare_kernel_block_sizes(
     kernel_block_sizes = []
     for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
         kv_cache_spec = kv_cache_group.kv_cache_spec
+        if (
+            kv_cache_config.has_independent_kv_cache_pools
+            and attn_groups[kv_cache_gid]
+        ):
+            # Hybrid scheduling may expose a logical wrapper spec from another
+            # pool (for example Mamba/16) at this group position. The worker's
+            # AttentionGroups were built from the actual layers and therefore
+            # own both the authoritative physical spec kind and block size.
+            physical_specs = {
+                group.kv_cache_spec for group in attn_groups[kv_cache_gid]
+            }
+            assert len(physical_specs) == 1, (
+                "Independent KV cache groups must have one physical attention "
+                f"spec, got {physical_specs} for group {kv_cache_gid}."
+            )
+            kv_cache_spec = physical_specs.pop()
         if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
             # pick an arbitrary one to dispatch.
@@ -400,22 +416,7 @@ def prepare_kernel_block_sizes(
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
             group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
             if kv_cache_config.has_independent_kv_cache_pools:
-                # Independent pools preserve each layer's physical page geometry.
-                # The engine-side group spec can still carry the hybrid
-                # scheduler's logical alignment (for example 16 from a Mamba
-                # group), which must not be passed to a backend whose physical
-                # tile is 128 tokens. AttentionGroup is constructed from the
-                # worker's per-layer spec and is therefore authoritative here.
-                physical_block_sizes = {
-                    group.kv_cache_spec.block_size
-                    for group in attn_groups[kv_cache_gid]
-                }
-                assert len(physical_block_sizes) == 1, (
-                    "Independent KV cache groups must have one physical attention "
-                    f"block size, got {physical_block_sizes} for group "
-                    f"{kv_cache_gid}."
-                )
-                kv_manager_block_size = physical_block_sizes.pop()
+                kv_manager_block_size = kv_cache_spec.block_size
             selected_kernel_size = select_common_block_size(
                 kv_manager_block_size, group_backends
             )
