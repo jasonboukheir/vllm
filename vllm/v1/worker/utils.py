@@ -417,6 +417,17 @@ def prepare_kernel_block_sizes(
             group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
             if kv_cache_config.has_independent_kv_cache_pools:
                 kv_manager_block_size = kv_cache_spec.block_size
+                # Logical hybrid alignment can rewrite both the engine and
+                # worker specs (e.g. to Mamba's 16) even though an independent
+                # backend owns a physically larger tile. Unlike a shared pool,
+                # the kernel block need not divide that logical wrapper size.
+                # Ask the backend for the active cache dtype's physical choice.
+                preferred_sizes = {
+                    backend.get_preferred_block_size(kv_manager_block_size)
+                    for backend in group_backends
+                }
+                if len(preferred_sizes) == 1:
+                    kv_manager_block_size = preferred_sizes.pop()
             selected_kernel_size = select_common_block_size(
                 kv_manager_block_size, group_backends
             )
