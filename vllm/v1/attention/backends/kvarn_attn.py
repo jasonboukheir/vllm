@@ -412,7 +412,11 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             self._group = KVarNConfig.from_cache_dtype(_cd, _hd).group
         except Exception:
             self._group = 128
-        cache_block_size = vllm_config.cache_config.block_size
+        # The global cache block size is a scheduler-level value and can be
+        # rewritten to another hybrid pool's alignment (e.g. Mamba/16).
+        # This builder is bound to one normalized physical attention spec;
+        # its block size is the only valid source for KVarN tile geometry.
+        cache_block_size = kv_cache_spec.block_size
         if cache_block_size % self._group != 0:
             raise ValueError(
                 f"KVarN cache block size {cache_block_size} must be a multiple "

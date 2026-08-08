@@ -13,6 +13,7 @@ from vllm.model_executor.layers.quantization.kvarn.config import (
 from vllm.platforms.xpu import XPUPlatform
 from vllm.v1.attention.backends.kvarn_attn import (
     KVarNAttentionBackend,
+    KVarNMetadataBuilder,
     expand_kvarn_block_table,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -203,3 +204,32 @@ def test_macro_cache_shape_exposes_one_record_per_tile():
         cache_dtype_str="kvarn_k4v4_g128",
     )
     assert shape == (65, 4, 65536)
+
+
+def test_metadata_builder_uses_physical_spec_not_global_logical_block_size():
+    spec = TQFullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=256,
+        head_size_v=256,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.KVARN,
+        tq_slot_size=512,
+    )
+    config = SimpleNamespace(
+        speculative_config=None,
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        cache_config=SimpleNamespace(
+            block_size=16,
+            cache_dtype="kvarn_k4v4_g128",
+        ),
+        model_config=SimpleNamespace(
+            max_model_len=8192,
+            get_head_size=lambda: 256,
+        ),
+    )
+
+    builder = KVarNMetadataBuilder(spec, ["attn"], config, torch.device("cpu"))
+
+    assert builder._group == 128
+    assert builder._tiles_per_block == 1
