@@ -5788,7 +5788,10 @@ def test_independent_hybrid_prefix_chunks_at_common_physical_boundary(
         ),
         model_config=model_config,
         cache_config=CacheConfig(
-            block_size=physical_block_size,
+            # The global cache block size can retain Mamba's 16-token logical
+            # granularity even though the resolved cross-pool scheduler
+            # quantum (passed to Scheduler below) is 128.
+            block_size=hash_block_size,
             enable_prefix_caching=True,
             mamba_cache_mode="align",
         ),
