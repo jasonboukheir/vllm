@@ -1446,7 +1446,10 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
         cache_config=SimpleNamespace(
             cache_dtype="kvarn_k4v4_g128",
             num_gpu_blocks_override=None,
-        )
+            mamba_cache_mode="none",
+        ),
+        model_config=SimpleNamespace(max_model_len=8192),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
     )
 
     config = kv_cache_utils.get_kv_cache_config_from_groups(
@@ -1464,6 +1467,13 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
     ]
     assert sum(tensor.size for tensor in config.kv_cache_tensors) == (
         bytes_per_quantum * 3
+    )
+    assert kv_cache_utils._max_memory_usage_bytes_from_groups(
+        vllm_config, groups
+    ) == sum(
+        len(group.layer_names)
+        * group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+        for group in groups
     )
 
 

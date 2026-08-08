@@ -1986,6 +1986,20 @@ def _max_memory_usage_bytes_from_groups(
     if not kv_cache_groups:
         return 0
 
+    independent_kvarn_pools = (
+        isinstance(vllm_config.cache_config.cache_dtype, str)
+        and vllm_config.cache_config.cache_dtype.startswith("kvarn_")
+        and not vllm_config.cache_config.cache_dtype.startswith("kvarn_mla")
+        and len(kv_cache_groups) > 1
+        and any(isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_groups)
+    )
+    if independent_kvarn_pools:
+        return sum(
+            len(group.layer_names)
+            * group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+            for group in kv_cache_groups
+        )
+
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
