@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
 from concurrent.futures import Future
 from unittest.mock import Mock
 
@@ -10,6 +11,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
@@ -36,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCachePoolSpec,
     MambaSpec,
 )
 from vllm.v1.outputs import (
@@ -5735,6 +5738,142 @@ def test_hybrid_per_group_hit_divergence_fa_deeper_no_external():
     num_scheduled = output.num_scheduled_tokens[replay.request_id]
     # Must resume at the convergent boundary (block 0), not the deep FA hit.
     assert replay.num_tokens - num_scheduled == block_size
+
+
+def test_independent_hybrid_prefix_chunks_at_common_physical_boundary(
+    tmp_path, monkeypatch
+):
+    """Sequential 200-token prompts reuse KVarN/128 plus Mamba/16 state."""
+    hash_block_size = 16
+    physical_block_size = 128
+    model_dir = tmp_path / "opt"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["OPTForCausalLM"],
+                "do_layer_norm_before": True,
+                "ffn_dim": 256,
+                "hidden_size": 64,
+                "max_position_embeddings": 256,
+                "model_type": "opt",
+                "num_attention_heads": 4,
+                "num_hidden_layers": 2,
+                "vocab_size": 1000,
+                "word_embed_proj_dim": 64,
+            }
+        )
+    )
+    # Keep model inspection in-process so the hermetic test does not depend on
+    # the parent interpreter's site-packages being reproduced in a subprocess.
+    from vllm.model_executor.models import registry
+
+    monkeypatch.setattr(registry, "_run_in_subprocess", lambda fn: fn())
+    model_config = ModelConfig(
+        model=str(model_dir),
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+        max_model_len=256,
+    )
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=256,
+            max_model_len=256,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+            watermark=0.0,
+        ),
+        model_config=model_config,
+        cache_config=CacheConfig(
+            block_size=physical_block_size,
+            enable_prefix_caching=True,
+            mamba_cache_mode="align",
+        ),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    groups = [
+        KVCacheGroupSpec(
+            [f"mamba.{group_id}"],
+            MambaSpec(
+                block_size=hash_block_size,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        )
+        for group_id in range(3)
+    ]
+    groups.append(
+        KVCacheGroupSpec(
+            ["attention"],
+            FullAttentionSpec(
+                block_size=physical_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        )
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=32, group_ids=[group_id])
+            for group_id in range(3)
+        ]
+        + [KVCachePoolSpec(num_blocks=8, group_ids=[3])],
+    )
+    vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+    register_all_kvcache_specs(vllm_config)
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=physical_block_size,
+        hash_block_size=hash_block_size,
+        log_stats=True,
+    )
+    [first, second] = create_requests(
+        num_requests=2,
+        num_tokens=200,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=hash_block_size,
+        req_ids=["first", "second"],
+    )
+
+    scheduler.add_request(first)
+    chunks = []
+    while first.request_id in scheduler.requests:
+        output = scheduler.schedule()
+        chunks.append(output.num_scheduled_tokens[first.request_id])
+        prompt_done = sum(chunks) >= first.num_prompt_tokens
+        model_output = ModelRunnerOutput(
+            req_ids=[first.request_id],
+            req_id_to_index={first.request_id: 0},
+            sampled_token_ids=[[1000] if prompt_done else []],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+        scheduler.update_from_output(output, model_output)
+
+    assert chunks[:3] == [128, 64, 8]
+
+    scheduler.add_request(second)
+    output = scheduler.schedule()
+    # The shared prefix starts this request at 128. Align mode then stops the
+    # first replay chunk at the prompt's 192-token hash boundary, leaving the
+    # final eight tokens for the following step.
+    assert output.num_scheduled_tokens[second.request_id] == 64
+    assert (
+        second.num_computed_tokens - output.num_scheduled_tokens[second.request_id]
+        == 128
+    )
 
 
 def _make_encoder_instance_request(scheduler, text_prefix=8, image_tokens=16):
