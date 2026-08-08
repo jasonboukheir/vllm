@@ -11,6 +11,10 @@ from vllm.model_executor.layers.quantization.kvarn.config import (
     KVarNConfig,
 )
 from vllm.platforms.xpu import XPUPlatform
+from vllm.v1.attention.backends.kvarn_attn import (
+    KVarNAttentionBackend,
+    expand_kvarn_block_table,
+)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
@@ -127,7 +131,7 @@ def test_xpu_routes_every_kvarn_preset_to_kvarn_backend(cache_dtype):
     )
 
 
-def test_kvarn_page_unification_does_not_change_quantization_group():
+def test_kvarn_page_unification_scales_by_whole_quantization_tiles():
     kvarn = KVarNFullAttentionSpec(
         block_size=128,
         num_kv_heads=1,
@@ -144,7 +148,7 @@ def test_kvarn_page_unification_does_not_change_quantization_group():
         dtype=torch.bfloat16,
     )
     unified = unify_kv_cache_spec_page_size({"kvarn": kvarn, "native": native})
-    assert unified["kvarn"].block_size == 128
+    assert unified["kvarn"].block_size == 256
     assert unified["kvarn"].page_size_bytes == unified["native"].page_size_bytes
 
 
@@ -169,3 +173,23 @@ def test_turboquant_page_unification_retains_scaling_behavior():
     )
     assert unified["turboquant"].block_size == 256
     assert unified["turboquant"].page_size_bytes == unified["native"].page_size_bytes
+
+
+def test_macro_block_table_expands_to_stable_tile_ids():
+    macro = torch.tensor([[4, 7, -1], [2, -1, -1]], dtype=torch.int32)
+    expanded = expand_kvarn_block_table(macro, tiles_per_block=3)
+    assert expanded.tolist() == [
+        [12, 13, 14, 21, 22, 23, -1, -1, -1],
+        [6, 7, 8, -1, -1, -1, -1, -1, -1],
+    ]
+
+
+def test_macro_cache_shape_exposes_one_record_per_tile():
+    shape = KVarNAttentionBackend.get_kv_cache_shape(
+        num_blocks=5,
+        block_size=1664,
+        num_kv_heads=4,
+        head_size=256,
+        cache_dtype_str="kvarn_k4v4_g128",
+    )
+    assert shape == (65, 4, 65536)
