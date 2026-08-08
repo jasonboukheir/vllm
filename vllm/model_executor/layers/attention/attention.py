@@ -623,13 +623,13 @@ class Attention(nn.Module, AttentionLayerBase):
                 from vllm.model_executor.layers.quantization.kvarn.config import (
                     KVarNConfig,
                 )
-                from vllm.v1.kv_cache_interface import TQSlidingWindowSpec
+                from vllm.v1.kv_cache_interface import KVarNSlidingWindowSpec
 
                 kvarn_cfg = KVarNConfig.from_cache_dtype(
                     self.kv_cache_dtype, self.head_size
                 )
                 slot_bytes = kvarn_cfg.tile_bytes_aligned // kvarn_cfg.group
-                return TQSlidingWindowSpec(
+                return KVarNSlidingWindowSpec(
                     block_size=block_size,
                     num_kv_heads=self.num_kv_heads,
                     head_size=self.head_size,
@@ -694,7 +694,7 @@ class Attention(nn.Module, AttentionLayerBase):
             from vllm.model_executor.layers.quantization.kvarn.config import (
                 KVarNConfig,
             )
-            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
+            from vllm.v1.kv_cache_interface import KVarNFullAttentionSpec
 
             kvarn_cfg = KVarNConfig.from_cache_dtype(
                 self.kv_cache_dtype, self.head_size
@@ -705,7 +705,7 @@ class Attention(nn.Module, AttentionLayerBase):
             # slot semantics differ. This gives the packed per-block page size
             # so vLLM allocates blocks at the compressed size.
             slot_bytes = kvarn_cfg.tile_bytes_aligned // kvarn_cfg.group
-            return TQFullAttentionSpec(
+            return KVarNFullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
