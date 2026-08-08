@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     KVCachePoolSpec,
     KVCacheTensor,
     MambaSpec,
+    TQFullAttentionSpec,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -268,14 +269,22 @@ def test_select_common_block_size_uses_largest_shared_int():
     assert selected_size == 64
 
 
-def test_independent_pool_uses_attention_physical_block_size():
+def test_independent_pool_uses_attention_backend_preferred_block_size(monkeypatch):
     """A logical hybrid alignment must not resize a KVarN kernel tile."""
-    backend = _make_mock_backend_for_kernel_block_size([128])
-    physical_attn_spec = FullAttentionSpec(
-        block_size=128,
+    from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionBackend
+
+    monkeypatch.setattr(
+        KVarNAttentionBackend,
+        "get_preferred_block_size",
+        classmethod(lambda cls, default: 128),
+    )
+    logical_attn_spec = TQFullAttentionSpec(
+        block_size=16,
         num_kv_heads=1,
         head_size=256,
+        head_size_v=256,
         dtype=torch.uint8,
+        tq_slot_size=140,
     )
     mamba_spec = MambaSpec(
         block_size=16,
@@ -298,7 +307,7 @@ def test_independent_pool_uses_attention_physical_block_size():
         ],
     )
     attn_groups = [
-        [AttentionGroup(backend, ["attn"], physical_attn_spec, 0)],
+        [AttentionGroup(KVarNAttentionBackend, ["attn"], logical_attn_spec, 0)],
         [],
     ]
 
