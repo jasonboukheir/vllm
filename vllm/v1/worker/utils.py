@@ -383,16 +383,26 @@ def allocate_kv_cache(
 ) -> dict[str, torch.Tensor]:
     """Allocate the KV cache and view it as ``[B, H, N, C]`` per layer.
 
-    Every KVCacheTensor places its layers in the same backing allocation: layer ``l`` of
-    block ``b`` starts at ``offset + l * layer_stride + b * block_stride``. Cache
-    groups overlay each other, so tensors may address the same bytes.
+    Every KVCacheTensor places its layers in its pool's backing allocation:
+    layer ``l`` of block ``b`` starts at
+    ``offset + l * layer_stride + b * block_stride``. Cache groups in a shared
+    pool overlay each other, while independent KVarN/Mamba groups use distinct
+    buffers and local block-ID namespaces.
     """
     if not kv_cache_config.kv_cache_tensors:
         return {}
 
-    sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
-    assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
-    buf = torch.zeros(sizes.pop(), dtype=torch.int8, device=device)
+    tensors_by_pool: defaultdict[int, list] = defaultdict(list)
+    for tensor in kv_cache_config.kv_cache_tensors:
+        tensors_by_pool[tensor.pool_id].append(tensor)
+
+    buffers: dict[int, torch.Tensor] = {}
+    for pool_id, tensors in tensors_by_pool.items():
+        sizes = {tensor.size for tensor in tensors}
+        assert len(sizes) == 1, (
+            f"KV cache tensors in pool {pool_id} must share one backing allocation."
+        )
+        buffers[pool_id] = torch.zeros(sizes.pop(), dtype=torch.int8, device=device)
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
@@ -406,13 +416,13 @@ def allocate_kv_cache(
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.kv_cache_specs[layer_name]
 
-        num_blocks = kv_cache_config.num_blocks
+        num_blocks = kv_cache_config.num_blocks_for_group(group_id)
         kernel_block_size = None
         if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[group_id]
 
         views = create_kv_cache_views(
-            buf,
+            buffers[tensor.pool_id],
             spec,
             num_blocks,
             layout,

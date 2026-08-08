@@ -6,7 +6,7 @@ from typing import NamedTuple
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BlockPool, MultiBlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -95,12 +95,22 @@ class KVCacheCoordinator(ABC):
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
-        self.block_pool = BlockPool(
-            num_gpu_blocks=kv_cache_config.num_blocks,
-            enable_caching=enable_caching,
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
+        assert kv_cache_config.kv_cache_pools is not None
+        self.block_pools = tuple(
+            BlockPool(
+                num_gpu_blocks=pool.num_blocks,
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                pool_id=pool_id,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+            )
+            for pool_id, pool in enumerate(kv_cache_config.kv_cache_pools)
+        )
+        self.block_pool = (
+            self.block_pools[0]
+            if len(self.block_pools) == 1
+            else MultiBlockPool(self.block_pools)
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -138,7 +148,9 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=self.block_pools[
+                    kv_cache_config.pool_id_for_group(i)
+                ],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
@@ -193,12 +205,37 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        return sum(
+            self.get_num_blocks_to_allocate_by_pool(
+                request_id,
+                num_tokens,
+                new_computed_blocks,
+                num_encoder_tokens,
+                total_computed_tokens,
+                num_local_computed_tokens,
+                num_tokens_main_model,
+                apply_admission_cap,
+            )
+        )
+
+    def get_num_blocks_to_allocate_by_pool(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> tuple[int, ...]:
+        """Return allocation requirements in physical-pool namespaces."""
+        num_blocks_to_allocate = [0] * len(self.block_pools)
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                required = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -208,7 +245,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                required = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -217,7 +254,9 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
-        return num_blocks_to_allocate
+            pool_id = self.kv_cache_config.pool_id_for_group(i)
+            num_blocks_to_allocate[pool_id] += required
+        return tuple(num_blocks_to_allocate)
 
     def allocate_new_computed_blocks(
         self,
