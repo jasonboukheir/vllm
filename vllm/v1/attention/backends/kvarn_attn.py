@@ -42,6 +42,8 @@ import torch
 import torch.nn.functional as F
 
 from vllm.config.cache import CacheDType
+from vllm.platforms import current_platform
+from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -1074,7 +1076,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         All allocation happens BEFORE the captured forward, so
         do_kv_cache_update can be pure tensor ops.
         """
-        if torch.cuda.is_current_stream_capturing():
+        if current_platform.is_xpu():
+            is_capturing = torch.xpu.is_current_stream_capturing()
+        else:
+            is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing:
             return
         cfg = self.kvarn_config
         cls = type(self)
@@ -1284,11 +1290,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # driver still falls back to single-stage if N ever exceeds these rows
         # (defensive), and split-K is never disabled for a batch it would take
         # (B*Hk<=sm_count => N=B*Hq <= (sm_count//Hk)*Hq).
-        _sm = (
-            getattr(self, "_sm_count", 0)
-            or torch.cuda.get_device_properties(device).multi_processor_count
-        )
-        mid_rows = max((_sm // max(Hk, 1)) * Hq, Hq, 1)
+        compute_units = num_compute_units(device.index or 0)
+        mid_rows = max((compute_units // max(Hk, 1)) * Hq, Hq, 1)
         _ex_mid = cls._shared_mid_o_buf.get(bkey)
         if (
             _ex_mid is None

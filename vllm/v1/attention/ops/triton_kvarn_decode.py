@@ -21,7 +21,9 @@ import os
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.platform_utils import num_compute_units
 
 # Number of KV-sequence splits for the split-K flash-decoding kernel. More
 # splits = better load-balancing of ragged burst seqlens across SMs, at the cost
@@ -43,10 +45,14 @@ _DECODE_AUTOTUNE_CONFIGS = [
     for bn in (16, 32, 64)
     for nw in (2, 4)
     for ns in (1, 2)
-] + [
-    triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2, maxnreg=mr)
-    for mr in (64, 96)
-]
+] + (
+    []
+    if current_platform.is_xpu()
+    else [
+        triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2, maxnreg=mr)
+        for mr in (64, 96)
+    ]
+)
 
 
 def adaptive_num_kv_splits(max_blocks_per_req: int) -> int:
@@ -911,10 +917,7 @@ def kvarn_decode_attention(
     if _sk_env is not None:
         split_k = use_fused and _sk_env == "1" and _mid_fits
     else:
-        sm_count = (
-            getattr(impl, "_sm_count", 0)
-            or torch.cuda.get_device_properties(device).multi_processor_count
-        )
+        compute_units = num_compute_units(device.index or 0)
         # long context (>= ~16 blocks of group tokens) AND single-stage grid does
         # not already fill the SMs.
         # Sliding-window layers read only ~window/GROUP blocks (single-stage is
@@ -924,7 +927,7 @@ def kvarn_decode_attention(
             use_fused
             and (_sw <= 0)
             and (max_blocks_per_req >= 16)
-            and (B * Hk <= sm_count)
+            and (B * Hk <= compute_units)
             and _mid_fits
         )
     if use_fused and not split_k:
@@ -1145,12 +1148,7 @@ def kvarn_verify_attention(
         B = NQ // qlen
         SPLITS = (
             adaptive_num_kv_splits(max_ctx_blocks)
-            if max_ctx_blocks >= 16
-            and B * Hk
-            <= (
-                getattr(impl, "_sm_count", 0)
-                or torch.cuda.get_device_properties(device).multi_processor_count
-            )
+            if max_ctx_blocks >= 16 and B * Hk <= num_compute_units(device.index or 0)
             else 1
         )
         mid_o = torch.empty(Nrows, SPLITS, D, dtype=torch.float32, device=device)
@@ -1203,16 +1201,13 @@ def kvarn_verify_attention(
     # Split-K mirrors the decode driver's heuristic: long context with too few
     # programs to fill the SMs. Verify batches are tiny (NQ <= maxq * B), so
     # long-context verify nearly always wants the split.
-    sm_count = (
-        getattr(impl, "_sm_count", 0)
-        or torch.cuda.get_device_properties(device).multi_processor_count
-    )
+    compute_units = num_compute_units(device.index or 0)
     _sw = int(getattr(impl, "sliding_window", 0) or 0)
     _sk_env = os.environ.get("KVARN_SPLIT_K")
     if _sk_env is not None:
         split_k = _sk_env == "1"
     else:
-        split_k = (_sw <= 0) and (max_ctx_blocks >= 16) and (NQ * Hk <= sm_count)
+        split_k = (_sw <= 0) and (max_ctx_blocks >= 16) and (NQ * Hk <= compute_units)
 
     if not split_k:
         _kvarn_fused_decode_kernel[(NQ, Hk)](

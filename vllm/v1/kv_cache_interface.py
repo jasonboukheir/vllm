@@ -386,6 +386,11 @@ class TQFullAttentionSpec(FullAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class KVarNFullAttentionSpec(TQFullAttentionSpec):
+    """KVarN page whose block size is fixed to its quantization tile."""
+
+
+@dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
@@ -654,6 +659,11 @@ class TQSlidingWindowSpec(SlidingWindowSpec):
             "the same tq_slot_size."
         )
         return replace(merged, tq_slot_size=specs[0].tq_slot_size)
+
+
+@dataclass(frozen=True, kw_only=True)
+class KVarNSlidingWindowSpec(TQSlidingWindowSpec):
+    """Sliding-window KVarN page with a fixed quantization tile size."""
 
 
 @dataclass(frozen=True, kw_only=True)

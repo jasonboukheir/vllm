@@ -1077,11 +1077,18 @@ def unify_kv_cache_spec_page_size(
         else:
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size == 0:
-                # KVarN/TQ specs are group-locked: block_size must equal the
+                # KVarN specs are group-locked: block_size must equal the
                 # variance-normalization tile size, so block_size cannot be
                 # scaled to grow the page. Pad the page instead (strided view,
                 # like MLA), keeping block_size fixed.
-                if getattr(layer_spec, "tq_slot_size", 0) > 0:
+                from vllm.v1.kv_cache_interface import (
+                    KVarNFullAttentionSpec,
+                    KVarNSlidingWindowSpec,
+                )
+
+                if isinstance(
+                    layer_spec, (KVarNFullAttentionSpec, KVarNSlidingWindowSpec)
+                ):
                     new_spec = replace(  # type: ignore[call-arg]
                         layer_spec, page_size_padded=max_page_size
                     )
