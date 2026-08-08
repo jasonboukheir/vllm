@@ -1477,6 +1477,24 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
     )
 
 
+@pytest.mark.parametrize("max_model_len", [128, 8192, 114688])
+def test_mamba_none_pool_cost_is_constant_with_context_length(max_model_len):
+    """A recurrent state costs one page per request, not one page per token."""
+    spec = MambaSpec(
+        block_size=max_model_len,
+        shapes=((1_603_584,),),
+        dtypes=(torch.bfloat16,),
+        mamba_cache_mode="none",
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+    )
+
+    assert spec.max_memory_usage_bytes(vllm_config) == spec.page_size_bytes
+    assert spec.max_num_blocks_per_req(vllm_config, max_model_len) == 1
+
+
 def test_kvarn_hybrid_alignment_preserves_natural_block_sizes():
     cache_config = SimpleNamespace(
         cache_dtype="kvarn_k4v4_g128",
