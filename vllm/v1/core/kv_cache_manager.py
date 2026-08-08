@@ -140,12 +140,10 @@ class KVCacheManager:
 
         self.enable_caching = enable_caching
         self.enable_kv_cache_events = enable_kv_cache_events
-        if kv_cache_config.has_independent_kv_cache_pools and (
-            enable_caching or enable_kv_cache_events
-        ):
+        if kv_cache_config.has_independent_kv_cache_pools and enable_kv_cache_events:
             raise NotImplementedError(
-                "Independent KV cache pools currently require prefix caching "
-                "and KV cache events to be disabled"
+                "Independent KV cache pools currently require KV cache events "
+                "to be disabled"
             )
         self.use_eagle = use_eagle
         self.log_stats = log_stats

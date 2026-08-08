@@ -32,6 +32,8 @@ def _initialize_block_hash_seed():
 
 def _make_manager(
     pool_capacities: tuple[int, int] = (5, 2),
+    *,
+    enable_caching: bool = False,
 ) -> KVCacheManager:
     groups = [
         KVCacheGroupSpec(
@@ -60,7 +62,7 @@ def _make_manager(
         max_model_len=64,
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
-        enable_caching=False,
+        enable_caching=enable_caching,
     )
 
 
@@ -195,6 +197,54 @@ def test_usage_reports_pressure_of_limiting_pool():
     assert manager.usage == pytest.approx(1.0)
 
 
+def test_prefix_cache_hits_are_resolved_in_each_independent_pool():
+    """Identical local block IDs must resolve through their owning pool."""
+    manager = _make_manager(pool_capacities=(5, 5), enable_caching=True)
+    first = _request("first", num_tokens=8)
+
+    assert manager.allocate_slots(first, num_new_tokens=8) is not None
+    manager.free(first)
+
+    second = _request("second", num_tokens=8)
+    blocks, num_computed_tokens, _ = manager.get_computed_blocks(second)
+
+    # vLLM recomputes the final token, so an eight-token prompt reuses the
+    # first complete four-token block. Both physical pools legitimately use
+    # the same local ID, distinguished by KVCacheBlock.pool_id.
+    assert num_computed_tokens == BLOCK_SIZE
+    assert [_ids(group) for group in blocks.blocks] == [
+        [(0, 1)],
+        [(1, 1)],
+    ]
+
+    allocated = manager.allocate_slots(
+        second,
+        num_new_tokens=4,
+        num_new_computed_tokens=num_computed_tokens,
+        new_computed_blocks=blocks,
+    )
+    assert allocated is not None
+    assert all(block.ref_cnt == 1 for group in blocks.blocks for block in group)
+    assert all(
+        block.pool_id == group_id
+        for group_id, group in enumerate(allocated.blocks)
+        for block in group
+    )
+
+
+def test_independent_pool_kv_events_remain_fail_closed():
+    config = _make_manager().kv_cache_config
+    with pytest.raises(NotImplementedError, match="KV cache events"):
+        KVCacheManager(
+            kv_cache_config=config,
+            max_model_len=64,
+            scheduler_block_size=BLOCK_SIZE,
+            hash_block_size=BLOCK_SIZE,
+            enable_caching=True,
+            enable_kv_cache_events=True,
+        )
+
+
 def _make_hybrid_spec_manager(num_spec_tokens: int = 2) -> KVCacheManager:
     """Independent attention/recurrent pools with configurable MTP gamma."""
     config = KVCacheConfig(
@@ -239,7 +289,7 @@ def _make_hybrid_spec_manager(num_spec_tokens: int = 2) -> KVCacheManager:
 
 
 @pytest.mark.parametrize("num_spec_tokens", [0, 1, 2])
-@pytest.mark.parametrize("context_len", [1, 31, 63])
+@pytest.mark.parametrize("context_len", [1, 31, 63, 64])
 def test_mamba_none_memory_is_context_invariant(
     num_spec_tokens: int, context_len: int
 ):
@@ -247,6 +297,8 @@ def test_mamba_none_memory_is_context_invariant(
 
     Unlike full attention, recurrent cache residency must not scale with the
     context length. ``block_size=max_model_len`` is scheduling metadata here.
+    The exact max-length case also guards against lookahead spilling into an
+    accidental fourth recurrent-state block.
     """
     manager = _make_hybrid_spec_manager(num_spec_tokens)
     request = _request("context", num_tokens=context_len)

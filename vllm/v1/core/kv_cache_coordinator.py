@@ -647,10 +647,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
             use_eagle = i in self.eagle_group_ids
+            pool_id = self.kv_cache_config.pool_id_for_group(i)
 
             # Try to find an existing group with the same spec
             for idx, group in enumerate(self.attention_groups):
-                if group.spec == spec:
+                first_group_pool_id = self.kv_cache_config.pool_id_for_group(
+                    group.group_ids[0]
+                )
+                if group.spec == spec and first_group_pool_id == pool_id:
                     assert manager_cls is group.manager_cls, (
                         "Expected same manager class for identical KV cache specs."
                     )
@@ -687,6 +691,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if group.use_eagle:
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
+
+    def _block_pool_for_group_ids(self, group_ids: list[int]) -> BlockPool:
+        """Return the physical pool shared by a cache-lookup group."""
+        pool_ids = {
+            self.kv_cache_config.pool_id_for_group(group_id)
+            for group_id in group_ids
+        }
+        assert len(pool_ids) == 1, (
+            "Prefix-cache lookup groups cannot span independent physical pools"
+        )
+        return self.block_pools[pool_ids.pop()]
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         if self.enable_partial_hash_hits:
@@ -806,7 +821,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     block_hashes=block_hashes,
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
+                    block_pool=self._block_pool_for_group_ids(group_ids),
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self._cache_hit_alignment_tokens,
@@ -875,7 +890,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 block_hashes=block_hashes,
                 max_length=max_cache_hit_length,
                 kv_cache_group_ids=group_ids,
-                block_pool=self.block_pool,
+                block_pool=self._block_pool_for_group_ids(group_ids),
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self._cache_hit_alignment_tokens,
