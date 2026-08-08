@@ -22,6 +22,7 @@ from vllm.multimodal.inputs import (
 from vllm.platforms.interface import Platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
@@ -1429,19 +1430,12 @@ def test_kv_cache_config_defaults_each_group_to_shared_capacity():
     assert not config.has_independent_kv_cache_pools
 
 
-def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
-    """KVarN tiles and Mamba states retain their natural page geometry."""
+def test_kvarn_hybrid_config_sizes_independent_pools_by_request_capacity():
+    """Every pool is provisioned for the same number of complete requests."""
     groups = [
         KVCacheGroupSpec(["full.0", "full.1"], new_kv_cache_spec(block_size=128)),
         KVCacheGroupSpec(["mamba.0"], new_mamba_spec(block_size=512)),
     ]
-    scheduler_quantum = 512
-    bytes_per_quantum = sum(
-        len(group.layer_names)
-        * group.kv_cache_spec.page_size_bytes
-        * (scheduler_quantum // group.kv_cache_spec.block_size)
-        for group in groups
-    )
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(
             cache_dtype="kvarn_k4v4_g128",
@@ -1451,23 +1445,40 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
         model_config=SimpleNamespace(max_model_len=8192),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
     )
+    blocks_per_request = [
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            group.kv_cache_spec.page_size_bytes,
+        )
+        for group in groups
+    ]
+    bytes_per_request = sum(
+        len(group.layer_names)
+        * group.kv_cache_spec.page_size_bytes
+        * num_blocks
+        for group, num_blocks in zip(groups, blocks_per_request)
+    )
 
     config = kv_cache_utils.get_kv_cache_config_from_groups(
         vllm_config,
         groups,
-        available_memory=bytes_per_quantum * 3,
+        available_memory=bytes_per_request * 3,
     )
 
-    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [12, 3]
-    assert config.num_blocks == 3
+    assert blocks_per_request == [64, 3]
+    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [192, 9]
+    assert config.num_blocks == 9
     assert [tensor.size for tensor in config.kv_cache_tensors] == [
-        groups[0].kv_cache_spec.page_size_bytes * 12,
-        groups[0].kv_cache_spec.page_size_bytes * 12,
-        groups[1].kv_cache_spec.page_size_bytes * 3,
+        groups[0].kv_cache_spec.page_size_bytes * 192,
+        groups[0].kv_cache_spec.page_size_bytes * 192,
+        groups[1].kv_cache_spec.page_size_bytes * 9,
     ]
     assert sum(tensor.size for tensor in config.kv_cache_tensors) == (
-        bytes_per_quantum * 3
+        bytes_per_request * 3
     )
+    assert kv_cache_utils.get_max_concurrency_for_kv_cache_config(
+        vllm_config, config
+    ) == 3
     assert kv_cache_utils._max_memory_usage_bytes_from_groups(
         vllm_config, groups
     ) == sum(
@@ -1475,6 +1486,48 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
         * group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
         for group in groups
     )
+
+
+def test_kvarn_prefix_aligned_pool_uses_only_resident_mamba_states():
+    """Align-mode block-table width must not inflate physical state storage."""
+    groups = [
+        KVCacheGroupSpec(["full.0"], new_kv_cache_spec(block_size=128)),
+        KVCacheGroupSpec(
+            ["mamba.0"],
+            new_mamba_spec(
+                block_size=128,
+                mamba_cache_mode="align",
+                num_speculative_blocks=2,
+            ),
+        ),
+    ]
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v4_g128",
+            num_gpu_blocks_override=None,
+            mamba_cache_mode="align",
+        ),
+        model_config=SimpleNamespace(max_model_len=8192),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+    )
+    # Full attention retains 64 token pages. Align-mode Mamba exposes 66
+    # position-indexed block-table columns, but only two running states plus
+    # two speculative rollback states are physically resident.
+    assert groups[1].kv_cache_spec.max_num_blocks_per_req(vllm_config, 8192) == 66
+    resident_blocks = [64, 4]
+    bytes_per_request = sum(
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes * blocks
+        for group, blocks in zip(groups, resident_blocks)
+    )
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, available_memory=bytes_per_request * 2
+    )
+
+    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [128, 8]
+    assert kv_cache_utils.get_max_concurrency_for_kv_cache_config(
+        vllm_config, config
+    ) == 2
 
 
 @pytest.mark.parametrize("max_model_len", [128, 8192, 114688])
