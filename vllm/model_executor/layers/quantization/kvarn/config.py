@@ -281,7 +281,7 @@ class KVarNConfig:
         count is unavailable."""
         try:
             n = model_config.get_num_layers_by_block_type(parallel_config, "attention")
-            if n and n > 0:
+            if n is not None and n >= 0:
                 return n
         except Exception:
             pass

@@ -42,6 +42,8 @@ import torch
 import torch.nn.functional as F
 
 from vllm.config.cache import CacheDType
+from vllm.platforms import current_platform
+from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -163,7 +165,8 @@ class KVarNAttentionBackend(AttentionBackend):
         )
         return replace(
             spec,
-            state_content_bytes=cfg.tile_bytes_aligned // cfg.group,
+            state_content_bytes=cfg.tile_bytes_aligned,
+            tokens_per_state=cfg.group,
         )
 
     @staticmethod
@@ -182,6 +185,14 @@ class KVarNAttentionBackend(AttentionBackend):
             KVARN_PRESETS,
         )
 
+        from vllm.config.vllm import get_current_vllm_config
+
+        try:
+            cache_dtype = get_current_vllm_config().cache_config.cache_dtype
+        except Exception:
+            cache_dtype = None
+        if isinstance(cache_dtype, str) and cache_dtype in KVARN_PRESETS:
+            return [KVARN_PRESETS[cache_dtype]["group"]]
         return sorted({p["group"] for p in KVARN_PRESETS.values()})
 
     @classmethod
@@ -1066,7 +1077,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         All allocation happens BEFORE the captured forward, so
         do_kv_cache_update can be pure tensor ops.
         """
-        if torch.cuda.is_current_stream_capturing():
+        if current_platform.is_xpu():
+            is_capturing = torch.xpu.is_current_stream_capturing()
+        else:
+            is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing:
             return
         cfg = self.kvarn_config
         cls = type(self)
@@ -1276,11 +1291,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # driver still falls back to single-stage if N ever exceeds these rows
         # (defensive), and split-K is never disabled for a batch it would take
         # (B*Hk<=sm_count => N=B*Hq <= (sm_count//Hk)*Hq).
-        _sm = (
-            getattr(self, "_sm_count", 0)
-            or torch.cuda.get_device_properties(device).multi_processor_count
-        )
-        mid_rows = max((_sm // max(Hk, 1)) * Hq, Hq, 1)
+        compute_units = num_compute_units(device.index or 0)
+        mid_rows = max((compute_units // max(Hk, 1)) * Hq, Hq, 1)
         _ex_mid = cls._shared_mid_o_buf.get(bkey)
         if (
             _ex_mid is None
@@ -1625,6 +1637,23 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         back to the cache tensor.
         """
         return kv_cache[block_id, head]
+
+    @staticmethod
+    def _record_cache_view(kv_cache: torch.Tensor) -> torch.Tensor:
+        """Normalize vLLM's logical ``[B,H,1,C]`` view to packed records."""
+        if kv_cache.ndim == 4:
+            if kv_cache.shape[2] != 1:
+                raise ValueError(
+                    "KVarN expects one packed state per kernel block, got "
+                    f"shape {tuple(kv_cache.shape)}"
+                )
+            return kv_cache.squeeze(2)
+        if kv_cache.ndim != 3:
+            raise ValueError(
+                "KVarN expects a [block,head,record] cache, got "
+                f"shape {tuple(kv_cache.shape)}"
+            )
+        return kv_cache
 
     def _write_packed(
         self,
@@ -1990,6 +2019,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         therefore deferred to ``_flush_eligible_tails``, invoked at the top
         of ``forward()``.
         """
+        kv_cache = self._record_cache_view(kv_cache)
         # Stage α-2: fully tensorised store. rotate(k, v) by H_fp16 → scatter
         # into pool at slot=block_id directly. No Python loop, no allocator,
         # no dict mutation. Safe inside a captured CUDA graph.
@@ -2064,6 +2094,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        kv_cache = self._record_cache_view(kv_cache)
         num_tokens = query.shape[0]
         device = query.device
 

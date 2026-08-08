@@ -150,6 +150,13 @@ class XPUPlatform(Platform):
         if kv_cache_dtype is not None and kv_cache_dtype.startswith("turboquant_"):
             logger.info_once("Using TurboQuant attention backend.")
             return AttentionBackendEnum.TURBOQUANT.get_path()
+        if (
+            kv_cache_dtype is not None
+            and kv_cache_dtype.startswith("kvarn_")
+            and not attn_selector_config.use_mla
+        ):
+            logger.info_once("Using KVarN attention backend on XPU.")
+            return AttentionBackendEnum.KVARN.get_path()
 
         dtype = attn_selector_config.dtype
         if attn_selector_config.use_sparse:
@@ -382,6 +389,61 @@ class XPUPlatform(Platform):
                 "XPU platform: set server shutdown_timeout=%d.",
                 vllm_config.shutdown_timeout,
             )
+
+        cache_config = vllm_config.cache_config
+        model_config = vllm_config.model_config
+        scheduler_config = vllm_config.scheduler_config
+        cache_dtype = getattr(cache_config, "cache_dtype", None)
+        if (
+            model_config is not None
+            and isinstance(cache_dtype, str)
+            and cache_dtype.startswith("kvarn_")
+            and not cache_dtype.startswith("kvarn_mla")
+            and not getattr(model_config, "use_mla", False)
+        ):
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+
+            head_size = model_config.get_head_size()
+            if head_size not in (128, 256, 512):
+                raise ValueError(
+                    f"{cache_dtype} requires head_dim in (128, 256, 512), but "
+                    f"this model has head_dim={head_size}; use a different "
+                    "--kv-cache-dtype for this model."
+                )
+
+            skip_layers = cache_config.kv_cache_dtype_skip_layers
+            if os.environ.get("KVARN_QUANT_SLIDING") == "1":
+                while "sliding_window" in skip_layers:
+                    skip_layers.remove("sliding_window")
+            elif "sliding_window" not in skip_layers:
+                skip_layers.append("sliding_window")
+
+            kvarn_config = KVarNConfig.from_cache_dtype(cache_dtype, head_size)
+            weight_bytes = kvarn_config.estimate_weight_bytes(
+                model_config.model,
+                tensor_parallel_size=vllm_config.parallel_config.tensor_parallel_size,
+            )
+            supported = kvarn_config.max_supported_seqs(
+                total_gpu_bytes=cls.get_device_total_memory(),
+                num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+                num_layers=KVarNConfig.num_kvarn_layers(
+                    model_config, vllm_config.parallel_config
+                ),
+                max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
+                gpu_memory_utilization=cache_config.gpu_memory_utilization,
+                weight_bytes=weight_bytes,
+            )
+            if scheduler_config.max_num_seqs > supported:
+                logger.warning(
+                    "KVarN (%s): capping max_num_seqs %d -> %d so the XPU "
+                    "fp16 tail pool fits its memory budget.",
+                    cache_dtype,
+                    scheduler_config.max_num_seqs,
+                    supported,
+                )
+                scheduler_config.max_num_seqs = supported
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
