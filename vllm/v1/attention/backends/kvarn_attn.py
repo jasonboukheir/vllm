@@ -76,6 +76,20 @@ if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
 
+def expand_kvarn_block_table(
+    block_table: torch.Tensor, tiles_per_block: int
+) -> torch.Tensor:
+    """Expand allocator macro-block IDs into consecutive KVarN tile IDs."""
+    if tiles_per_block == 1:
+        return block_table
+    offsets = torch.arange(
+        tiles_per_block, dtype=block_table.dtype, device=block_table.device
+    )
+    expanded = block_table.unsqueeze(-1) * tiles_per_block + offsets
+    expanded = torch.where(block_table.unsqueeze(-1) >= 0, expanded, -1)
+    return expanded.flatten(1)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Hadamard cache (one D×D matrix per (head_dim, device))
 # ──────────────────────────────────────────────────────────────────────────────
@@ -235,10 +249,16 @@ class KVarNAttentionBackend(AttentionBackend):
         )
 
         cfg = KVarNConfig.from_cache_dtype(cache_dtype_str, head_size)
-        assert block_size == cfg.group, (
-            f"KVarN requires block_size ({block_size}) == group ({cfg.group})."
+        assert block_size % cfg.group == 0, (
+            f"KVarN requires block_size ({block_size}) to be a multiple of "
+            f"group ({cfg.group})."
         )
-        return (num_blocks, num_kv_heads, cfg.tile_bytes_aligned)
+        tiles_per_block = block_size // cfg.group
+        return (
+            num_blocks * tiles_per_block,
+            num_kv_heads,
+            cfg.tile_bytes_aligned,
+        )
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
@@ -392,6 +412,13 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             self._group = KVarNConfig.from_cache_dtype(_cd, _hd).group
         except Exception:
             self._group = 128
+        cache_block_size = vllm_config.cache_config.block_size
+        if cache_block_size % self._group != 0:
+            raise ValueError(
+                f"KVarN cache block size {cache_block_size} must be a multiple "
+                f"of quantization group {self._group}."
+            )
+        self._tiles_per_block = cache_block_size // self._group
 
         # Persistent cu_seqlens buffers (allocated lazily in build()).
         self._cu_seqlens_q_buf: torch.Tensor = None  # type: ignore[assignment]
@@ -437,7 +464,10 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # at B=256 and dominated build() once the flush was vectorized.
         # We only touch column 0 (sinks) + a few per-request entries, so numpy's
         # O(1) indexing avoids materializing ~8k Python ints every step.
-        block_table_np = cam.block_table_tensor.cpu().numpy()
+        block_table = expand_kvarn_block_table(
+            cam.block_table_tensor, self._tiles_per_block
+        )
+        block_table_np = block_table.cpu().numpy()
         slot_mapping_cpu = cam.slot_mapping.tolist()
         bt_rows = block_table_np.shape[0]
         bt_cols = block_table_np.shape[1] if block_table_np.ndim == 2 else 0
@@ -824,7 +854,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         return KVarNMetadata(
             seq_lens=cam.seq_lens,
             slot_mapping=cam.slot_mapping,
-            block_table=cam.block_table_tensor,
+            block_table=block_table,
             query_start_loc=cam.query_start_loc,
             num_actual_tokens=cam.num_actual_tokens,
             max_query_len=cam.max_query_len,
