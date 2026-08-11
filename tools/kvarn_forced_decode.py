@@ -15,11 +15,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+
+if kernel_library := os.environ.get("VLLM_XPU_KERNELS_LIBRARY"):
+    # Accuracy iteration commonly validates a locally built kernel before its
+    # package input is updated.  Load that exact ABI in both the driver and the
+    # spawned engine process instead of silently exercising an older closure.
+    torch.ops.load_library(kernel_library)
 
 from vllm import LLM, SamplingParams, TokensPrompt
 from vllm.exceptions import VLLMValidationError
@@ -35,6 +42,20 @@ class _ForceTokenSequence:
         self.token_ids = token_ids
 
     def __call__(self, output_ids: list[int], logits: torch.Tensor) -> torch.Tensor:
+        if os.environ.get("KVARN_FORCED_VALIDATE_FINITE", "0") == "1":
+            nan_count = int(torch.isnan(logits).sum().item())
+            posinf_count = int(torch.isposinf(logits).sum().item())
+            # Some model vocabularies intentionally mask invalid/reserved
+            # entries with -inf.  Those are valid sampling logits; NaN and
+            # +inf are not.
+            if nan_count or posinf_count:
+                neginf_count = int(torch.isneginf(logits).sum().item())
+                raise RuntimeError(
+                    "forced-decode received invalid model logits before "
+                    f"forcing step {len(output_ids)}: nan={nan_count} "
+                    f"posinf={posinf_count} neginf={neginf_count} "
+                    f"total={logits.numel()}"
+                )
         token_id = self.token_ids[len(output_ids)]
         value = logits[token_id].clone()
         logits.fill_(float("-inf"))

@@ -24,6 +24,26 @@ def test_force_sequence_advances_from_persistent_output_state():
     torch.testing.assert_close(second, torch.tensor([4.0, -torch.inf, -torch.inf]))
 
 
+def test_force_sequence_validation_allows_masking_negative_infinity(monkeypatch):
+    monkeypatch.setenv("KVARN_FORCED_VALIDATE_FINITE", "1")
+    processor = _ForceTokenSequence([0])
+
+    result = processor([], torch.tensor([1.0, -torch.inf]))
+
+    torch.testing.assert_close(result, torch.tensor([1.0, -torch.inf]))
+
+
+@pytest.mark.parametrize("invalid", [torch.nan, torch.inf])
+def test_force_sequence_validation_rejects_nan_and_positive_infinity(
+    monkeypatch, invalid
+):
+    monkeypatch.setenv("KVARN_FORCED_VALIDATE_FINITE", "1")
+    processor = _ForceTokenSequence([0])
+
+    with pytest.raises(RuntimeError, match="invalid model logits"):
+        processor([], torch.tensor([1.0, invalid]))
+
+
 @pytest.mark.parametrize("value", [[], [1, -1], [1, "2"], "1,2"])
 def test_force_sequence_rejects_invalid_token_ids(value):
     params = SamplingParams(extra_args={"forced_token_ids": value})

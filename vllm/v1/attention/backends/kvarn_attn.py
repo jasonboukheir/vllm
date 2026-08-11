@@ -42,6 +42,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.backend import (
@@ -68,12 +69,51 @@ from vllm.v1.attention.ops.kvarn_store import (
     kvarn_store_tile_k_batch_from_sinkhorn,
     kvarn_store_tile_v_batch_from_sinkhorn,
 )
-from vllm.v1.attention.ops.triton_kvarn_decode import kvarn_decode_attention
+from vllm.v1.attention.ops.triton_kvarn_decode import (
+    kvarn_decode_attention,
+    kvarn_native_layer_selected,
+)
 from vllm.v1.attention.ops.triton_kvarn_sinkhorn import kvarn_sinkhorn_triton
+
+logger = init_logger(__name__)
 
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+
+def _cast_kvarn_activations(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    query_only: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cast only activations consumed after the cache update.
+
+    Pure one-token decode reads K/V from the cache and therefore must not
+    materialize redundant fp16 copies of the input key and value tensors.
+    """
+    if query.dtype == torch.float16:
+        return query, key, value
+    query = query.to(torch.float16)
+    if not query_only:
+        key = key.to(torch.float16)
+        value = value.to(torch.float16)
+    return query, key, value
+
+
+def _kvarn_attention_requires_fp16(
+    *, is_prefill: bool, num_decodes: int, has_cached_multiquery: bool
+) -> bool:
+    """Whether attention consumes KVarN's internal FP16 cache representation.
+
+    A fresh prefill attends directly over the model's Q/K/V tensors.  Keep
+    those tensors in the model dtype (notably BF16, whose exponent range is
+    wider than FP16).  Decode, continuation, verify, and mixed routes consume
+    KVarN FP16 cache state and retain the established boundary conversion.
+    """
+    return not (is_prefill and num_decodes == 0 and not has_cached_multiquery)
 
 
 def expand_kvarn_block_table(
@@ -159,6 +199,7 @@ class KVarNAttentionBackend(AttentionBackend):
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "kvarn_k4v4_g128",
+        "kvarn_k4v4_g128_compact",
         "kvarn_k4v2_g128",
         "kvarn_k4v4_g64",
         "kvarn_k4v2_g64",
@@ -257,7 +298,7 @@ class KVarNAttentionBackend(AttentionBackend):
         return (
             num_blocks * tiles_per_block,
             num_kv_heads,
-            cfg.tile_bytes_aligned,
+            cfg.record_bytes,
         )
 
     @classmethod
@@ -305,7 +346,6 @@ class KVarNMetadata(AttentionMetadata):
     # 28+ layer forward calls. Saves 28× .tolist() syncs per decode token.
     seq_lens_cpu: list[int] | None = None
     block_table_cpu: list[list[int]] | None = None
-    slot_mapping_cpu: list[int] | None = None
     # Stage α-2 capture-correct decode metadata. The block_table-driven
     # build-packed-KV kernel reads block_table / seq_lens / fa_cu_seqlens_k
     # directly (all PERSISTENT buffers updated in-place by the builder), so a
@@ -427,6 +467,11 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # Persistent cu_seqlens buffers (allocated lazily in build()).
         self._cu_seqlens_q_buf: torch.Tensor = None  # type: ignore[assignment]
         self._cu_seqlens_k_buf: torch.Tensor = None  # type: ignore[assignment]
+        self._metadata_stage_index = 0
+        # Keep enough generations that normal decode rarely retires a pinned
+        # metadata slot on the scheduler's critical path. Each slot remains
+        # guarded before reuse for long-running generations.
+        self._metadata_stage_events: list[torch.xpu.Event | None] = [None] * 256
         self._cu_seqlens_q_host: torch.Tensor = None  # type: ignore[assignment]
         self._cu_seqlens_k_host: torch.Tensor = None  # type: ignore[assignment]
         # Persistent verify-plan buffers (allocated lazily in build()).
@@ -471,8 +516,15 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         block_table = expand_kvarn_block_table(
             cam.block_table_tensor, self._tiles_per_block
         )
-        block_table_np = block_table.cpu().numpy()
-        slot_mapping_cpu = cam.slot_mapping.tolist()
+        block_table_cpu_source = (
+            cam.block_table_cpu
+            if cam.block_table_cpu is not None
+            else cam.block_table_tensor.cpu()
+        )
+        block_table_cpu = expand_kvarn_block_table(
+            block_table_cpu_source, self._tiles_per_block
+        )
+        block_table_np = block_table_cpu.numpy()
         bt_rows = block_table_np.shape[0]
         bt_cols = block_table_np.shape[1] if block_table_np.ndim == 2 else 0
         device = cam.seq_lens.device
@@ -535,10 +587,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 if bid >= 0:
                     blocks_needed.add(bid)
                     self._block_fill[bid] = min(sl, (k + 1) * GROUP) - k * GROUP
-        for s in slot_mapping_cpu:  # safety superset of the above
-            if s >= 0:
-                blocks_needed.add(s // GROUP)
-
         gk = self._group_key
         # Claim THIS group's impls by layer name (set on the impl in
         # Attention.__init__) and tag them with the true group key, so their
@@ -765,6 +813,12 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # A captured graph bakes in tensor addresses, so cu_seqlens MUST live
         # in fixed buffers updated in place — not recreated each step.
         cap = B + 1
+        stage_depth = len(self._metadata_stage_events)
+        stage = self._metadata_stage_index % stage_depth
+        self._metadata_stage_index += 1
+        stage_event = self._metadata_stage_events[stage]
+        if stage_event is not None:
+            stage_event.synchronize()
         if self._cu_seqlens_q_buf is None or self._cu_seqlens_q_buf.shape[0] < cap:
             new_cap = max(cap, 257)  # default max_num_seqs headroom
             self._cu_seqlens_q_buf = torch.empty(
@@ -774,18 +828,20 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 new_cap, dtype=torch.int32, device=device
             )
             self._cu_seqlens_q_host = torch.empty(
-                new_cap, dtype=torch.int32, pin_memory=True
+                (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
             )
             self._cu_seqlens_k_host = torch.empty(
-                new_cap, dtype=torch.int32, pin_memory=True
+                (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
             )
+        q_host = self._cu_seqlens_q_host[stage]
+        k_host = self._cu_seqlens_k_host[stage]
         for i in range(B + 1):
-            self._cu_seqlens_q_host[i] = i
-            self._cu_seqlens_k_host[i] = cu_seqlens_k_h[i]
+            q_host[i] = i
+            k_host[i] = cu_seqlens_k_h[i]
         fa_cu_seqlens_q = self._cu_seqlens_q_buf[: B + 1]
         fa_cu_seqlens_k = self._cu_seqlens_k_buf[: B + 1]
-        fa_cu_seqlens_q.copy_(self._cu_seqlens_q_host[: B + 1], non_blocking=True)
-        fa_cu_seqlens_k.copy_(self._cu_seqlens_k_host[: B + 1], non_blocking=True)
+        fa_cu_seqlens_q.copy_(q_host[: B + 1], non_blocking=True)
+        fa_cu_seqlens_k.copy_(k_host[: B + 1], non_blocking=True)
 
         # ── Verify (spec-as-decode) plan ─────────────────────────────────
         # When the decode portion carries multi-token queries (an MTP verify
@@ -801,17 +857,19 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 self._vq_req_buf is None
                 or self._vq_req_buf.shape[0] < num_decode_tokens
             ):
-                vq_cap = max(num_decode_tokens, 4096)
+                vq_cap = max(num_decode_tokens, 256)
                 self._vq_req_buf = torch.empty(vq_cap, dtype=torch.int32, device=device)
                 self._vq_seqlen_buf = torch.empty(
                     vq_cap, dtype=torch.int32, device=device
                 )
                 self._vq_req_host = torch.empty(
-                    vq_cap, dtype=torch.int32, pin_memory=True
+                    (stage_depth, vq_cap), dtype=torch.int32, pin_memory=True
                 )
                 self._vq_seqlen_host = torch.empty(
-                    vq_cap, dtype=torch.int32, pin_memory=True
+                    (stage_depth, vq_cap), dtype=torch.int32, pin_memory=True
                 )
+            req_host = self._vq_req_host[stage]
+            seqlen_host = self._vq_seqlen_host[stage]
             # Non-causal (DFlash cross-attention): every query row attends to
             # the full context, so its per-row limit is the whole seq_len, not
             # the bottom-right causal staircase committed+j+1.
@@ -825,8 +883,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 committed = max(seq_lens_cpu[b] - ql, 0)
                 full = committed + ql
                 for j in range(ql):
-                    self._vq_req_host[i] = b
-                    self._vq_seqlen_host[i] = full if non_causal else committed + j + 1
+                    req_host[i] = b
+                    seqlen_host[i] = full if non_causal else committed + j + 1
                     i += 1
             # Uniform query length -> the shared-dequant verify kernel (the
             # request's tokens share each block's dequant); this is always the
@@ -837,10 +895,15 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             vq_qlen = uniform if (uniform >= 2 and not non_causal) else 0
             vq_req_t = self._vq_req_buf[:num_decode_tokens]
             vq_seqlen_t = self._vq_seqlen_buf[:num_decode_tokens]
-            vq_req_t.copy_(self._vq_req_host[:num_decode_tokens], non_blocking=True)
-            vq_seqlen_t.copy_(
-                self._vq_seqlen_host[:num_decode_tokens], non_blocking=True
-            )
+            vq_req_t.copy_(req_host[:num_decode_tokens], non_blocking=True)
+            vq_seqlen_t.copy_(seqlen_host[:num_decode_tokens], non_blocking=True)
+
+        # A fresh event generation guards this host slot until both async H2D
+        # copies have consumed it. Re-recording an old event changed qlen-3
+        # acceptance in serving and is therefore intentionally avoided.
+        copy_done = torch.xpu.Event()
+        copy_done.record()
+        self._metadata_stage_events[stage] = copy_done
 
         max_blocks_per_req = (self._max_model_len + GROUP - 1) // GROUP
 
@@ -870,7 +933,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             seq_lens_cpu=seq_lens_cpu,
             # not consumed downstream; build() uses block_table_np
             block_table_cpu=None,
-            slot_mapping_cpu=slot_mapping_cpu,
             fa_cu_seqlens_q=fa_cu_seqlens_q,
             fa_cu_seqlens_k=fa_cu_seqlens_k,
             fa_max_blocks_per_req=max_blocks_per_req,
@@ -925,6 +987,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _shared_out_rot_fp32_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _shared_output_fp32_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _shared_fused_out_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    _shared_native_decode_scratch: ClassVar[
+        dict[tuple[torch.device, int, int, int], tuple[torch.Tensor, ...]]
+    ] = {}
     _shared_mid_o_buf: ClassVar[
         dict[torch.device, torch.Tensor]
     ] = {}  # split-K partials
@@ -1011,7 +1076,29 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         )
 
         self.kvarn_config = KVarNConfig.from_cache_dtype(kv_cache_dtype, head_size)
-
+        # The packed-byte layout is part of the cache ABI.  Freeze it when the
+        # implementation is constructed so changing the environment cannot
+        # reinterpret already-written cache records halfway through a run.
+        self._dpas_layout = os.environ.get("KVARN_NATIVE_XPU_DPAS_LAYOUT", "0") == "1"
+        if self._dpas_layout:
+            cfg = self.kvarn_config
+            geometry = (cfg.head_dim, cfg.group, cfg.key_bits, cfg.value_bits)
+            if geometry != (256, 128, 4, 4):
+                raise ValueError(
+                    "KVARN_NATIVE_XPU_DPAS_LAYOUT=1 currently requires "
+                    "head_dim=256, group=128, and k4v4; got "
+                    f"{geometry}"
+                )
+            if not current_platform.is_xpu():
+                raise ValueError(
+                    "KVARN_NATIVE_XPU_DPAS_LAYOUT=1 is only supported on XPU"
+                )
+            if os.environ.get("KVARN_NATIVE_XPU", "0") != "1":
+                raise ValueError(
+                    "KVARN_NATIVE_XPU_DPAS_LAYOUT=1 requires "
+                    "KVARN_NATIVE_XPU=1 so the cache has no incompatible "
+                    "native reader"
+                )
         # Per-block fp16 tail buffer (in-progress tiles). Keyed by block_id.
         # Stage 3b uses a Python dict — small concurrent batch sizes only.
         # Stage 4 will move this into a dedicated GPU buffer.
@@ -1065,6 +1152,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._out_rot_fp32_buf: torch.Tensor | None = None
         self._output_fp32_buf: torch.Tensor | None = None
         self._fused_out_buf: torch.Tensor | None = None
+        self._native_decode_scratch: tuple[torch.Tensor, ...] | None = None
+        self._pending_native_store: tuple[torch.Tensor, ...] | None = None
         self._mid_o_buf: torch.Tensor | None = None
         self._mid_lse_buf: torch.Tensor | None = None
         self._fa_K_buf: torch.Tensor = None  # type: ignore[assignment]
@@ -1300,6 +1389,36 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cls._shared_fused_out_buf[bkey] = torch.empty(
                 q_rows, D, dtype=torch.float16, device=device
             )
+        native_splits_text = os.environ.get("KVARN_NATIVE_XPU_SPLITS", "1")
+        native_splits = (
+            int(native_splits_text)
+            if native_splits_text in {"1", "2", "4", "8", "16", "17", "24", "32"}
+            else 1
+        )
+        native_key = (device, D, Hk, native_splits)
+        use_native_scratch = (
+            os.environ.get("KVARN_NATIVE_XPU_PERSISTENT_SCRATCH", "0") == "1"
+            and os.environ.get("KVARN_NATIVE_XPU", "0") == "1"
+            and os.environ.get("KVARN_NATIVE_XPU_DECODE", "0") == "1"
+            and device.type == "xpu"
+            and D == 256
+            and Hk == 4
+            and cfg.group == 128
+            and cfg.key_bits == 4
+            and cfg.value_bits == 4
+        )
+        if use_native_scratch and native_key not in cls._shared_native_decode_scratch:
+            cls._shared_native_decode_scratch[native_key] = (
+                torch.empty(
+                    4,
+                    24 * native_splits,
+                    256,
+                    dtype=torch.float16,
+                    device=device,
+                ),
+                torch.empty(4, 24, native_splits, dtype=torch.float32, device=device),
+                torch.empty(4, 24, native_splits, dtype=torch.float32, device=device),
+            )
         from vllm.v1.attention.ops.triton_kvarn_decode import adaptive_num_kv_splits
 
         # Split-K partial buffers, sized to EXACTLY what the split-K decode path
@@ -1353,6 +1472,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._out_rot_fp32_buf = cls._shared_out_rot_fp32_buf[bkey]
         self._output_fp32_buf = cls._shared_output_fp32_buf[bkey]
         self._fused_out_buf = cls._shared_fused_out_buf[bkey]
+        self._native_decode_scratch = (
+            cls._shared_native_decode_scratch[native_key]
+            if use_native_scratch
+            else None
+        )
         self._mid_o_buf = cls._shared_mid_o_buf[bkey]
         self._mid_lse_buf = cls._shared_mid_lse_buf[bkey]
         self._fa_K_buf = cls._shared_fa_K_buf[bkey]
@@ -1362,6 +1486,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         """Compile + autotune every decode-path Triton kernel on tiny synthetic
         state (see the note at the call site in ``_ensure_pool``).
         Uses throwaway tensors only — never touches the real cache/pool."""
+        # The native Xe2 decoder is AOT-compiled.  Warming the fallback Triton
+        # path here costs minutes of autotuning, obscures native-dispatch JIT
+        # checks, and can consume enough transient memory to perturb the
+        # matched serving benchmark.
+        if os.environ.get("KVARN_NATIVE_XPU", "0") == "1":
+            return
         from vllm.v1.attention.ops.triton_kvarn_decode import (
             _kvarn_build_packed_kv_kernel,
             _kvarn_fused_decode_kernel,
@@ -1377,7 +1507,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         sw = int(getattr(self, "sliding_window", 0) or 0)
 
         cache = torch.zeros(
-            B * n_blocks, Hk, cfg.tile_bytes_aligned, dtype=torch.uint8, device=device
+            B * n_blocks, Hk, cfg.record_bytes, dtype=torch.uint8, device=device
         )
         pool_k = torch.zeros(1, G, Hk, D, dtype=torch.float16, device=device)
         pool_v = torch.zeros_like(pool_k)
@@ -1409,6 +1539,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             V_S_COL_OFFSET=cfg.v_s_col_offset,
             V_S_ROW_OFFSET=cfg.v_s_row_offset,
             V_ZP_OFFSET=cfg.v_zp_offset,
+            DPAS_LAYOUT=self._dpas_layout,
             VQ_INDIRECT=False,
         )
         # 1. Single-stage fused kernel — runs the @triton.autotune sweep.
@@ -1538,56 +1669,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             HQ=Hq,
             **common_vq,
         )
-        # 2c. Shared-dequant verify kernel (uniform-QLEN spec verify) — runs
-        # its @triton.autotune sweep here so capture never benchmarks. QLEN is
-        # the deployment's 1 + num_speculative_tokens.
-        try:
-            from vllm.config import get_current_vllm_config
-
-            _spec = get_current_vllm_config().speculative_config
-            _qlen = 1 + int(_spec.num_speculative_tokens) if _spec else 0
-        except Exception:
-            _qlen = 0
-        if _qlen >= 2:
-            from vllm.v1.attention.ops.triton_kvarn_decode import (
-                _kvarn_fused_verify_stage1,
-            )
-
-            nq = B * _qlen
-            sl_vq = sl.repeat_interleave(_qlen)
-            qv = torch.zeros(nq, Hq, D, dtype=torch.float16, device=device)
-            mid_o_v = torch.zeros(
-                nq * Hq, splits, D, dtype=torch.float32, device=device
-            )
-            mid_lse_v = torch.zeros(nq * Hq, splits, dtype=torch.float32, device=device)
-            common_v = dict(common)
-            _kvarn_fused_verify_stage1[(B, Hk, splits)](
-                qv,
-                bt,
-                sl_vq,
-                b2s,
-                cache,
-                pool_k,
-                pool_v,
-                mid_o_v,
-                mid_lse_v,
-                self.scale,
-                Hq * D,
-                D,
-                bt.stride(0),
-                cache.stride(0),
-                cache.stride(1),
-                pool_k.stride(0),
-                pool_k.stride(1),
-                pool_k.stride(2),
-                mid_o_v.stride(0),
-                mid_o_v.stride(1),
-                mid_lse_v.stride(0),
-                QLEN=_qlen,
-                HQ=Hq,
-                NUM_KV_SPLITS=splits,
-                **common_v,
-            )
         # 3. Packed-KV build kernel (materialize fallback + the cached-multiquery
         # spec-verify path).
         kp = torch.zeros(B * n_blocks * G, Hk, D, dtype=torch.float16, device=device)
@@ -1625,37 +1706,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             V_S_COL_OFFSET=cfg.v_s_col_offset,
             V_S_ROW_OFFSET=cfg.v_s_row_offset,
             V_ZP_OFFSET=cfg.v_zp_offset,
+            DPAS_LAYOUT=self._dpas_layout,
             num_warps=4,
             num_stages=2,
         )
         torch.accelerator.synchronize(device)
-
-    def _batch_slot_mapping_cpu(self) -> list[int] | None:
-        """Return the slot_mapping CPU list cached on this step's metadata, or
-        None if unavailable. Looks up via the forward context so we don't need
-        the caller to plumb it through."""
-        try:
-            from vllm.forward_context import get_forward_context
-
-            ctx = get_forward_context()
-        except Exception:
-            return None
-        md = getattr(ctx, "attn_metadata", None)
-        if md is None:
-            return None
-        if isinstance(md, dict):
-            for m in md.values():
-                if isinstance(m, KVarNMetadata):
-                    return m.slot_mapping_cpu
-            return None
-        if isinstance(md, list):
-            for entry in md:
-                if isinstance(entry, dict):
-                    for m in entry.values():
-                        if isinstance(m, KVarNMetadata):
-                            return m.slot_mapping_cpu
-            return None
-        return getattr(md, "slot_mapping_cpu", None)
 
     def _hadamard(self, device: torch.device) -> torch.Tensor:
         return _build_hadamard(self.head_size, device)
@@ -1738,6 +1793,25 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
         H = self._hadamard(device)  # [D, D] fp32
 
+        # The diagnostic gather path must obey the same cache ABI as decode.
+        # Native dequant understands retained DPAS fragments and avoids a
+        # second, subtly different inverse-permutation implementation here.
+        dpas_k_rot = dpas_v_rot = None
+        if self._dpas_layout:
+            dpas_k_rot = torch.empty(
+                (1, self.num_kv_heads, D, group),
+                dtype=torch.float16,
+                device=device,
+            )
+            dpas_v_rot = torch.empty(
+                (1, self.num_kv_heads, group, D),
+                dtype=torch.float16,
+                device=device,
+            )
+            torch.ops._vllm_fa2_C.kvarn_dequant(
+                kv_cache[block_id : block_id + 1], dpas_k_rot, dpas_v_rot
+            )
+
         for h in range(self.num_kv_heads):
             flat = self._flat_block(kv_cache, block_id, h)
 
@@ -1755,9 +1829,17 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             s_row_K = flat[cfg.k_s_row_offset : cfg.k_s_row_offset + group * 2].view(
                 torch.float16
             )
-            K_rot_DG = kvarn_dequant_tile_k(
-                k_packed, s_col_K, zp_K, s_row_K, group=group, bits=cfg.key_bits
-            )
+            if dpas_k_rot is None:
+                K_rot_DG = kvarn_dequant_tile_k(
+                    k_packed,
+                    s_col_K,
+                    zp_K,
+                    s_row_K,
+                    group=group,
+                    bits=cfg.key_bits,
+                )
+            else:
+                K_rot_DG = dpas_k_rot[0, h].float()
             # Un-rotate: [D, group] → [group, D] (= K rows-tokens),
             # then ⋅H to undo rotation
             K_unrot = K_rot_DG.T @ H  # [group, D]
@@ -1781,9 +1863,17 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             zp_V = flat[cfg.v_zp_offset : cfg.v_zp_offset + group * 2].view(
                 torch.float16
             )
-            V_rot_GD = kvarn_dequant_tile_v(
-                v_packed, s_col_V, s_row_V, zp_V, head_dim=D, bits=cfg.value_bits
-            )
+            if dpas_v_rot is None:
+                V_rot_GD = kvarn_dequant_tile_v(
+                    v_packed,
+                    s_col_V,
+                    s_row_V,
+                    zp_V,
+                    head_dim=D,
+                    bits=cfg.value_bits,
+                )
+            else:
+                V_rot_GD = dpas_v_rot[0, h].float()
             V_unrot = V_rot_GD @ H  # [group, D]
             V_out[:, h, :] = V_unrot.to(torch.float16)
 
@@ -1845,16 +1935,19 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         if not flush_pairs:
             return
         if os.environ.get("KVARN_FAST_FLUSH", "1") != "1":
+            if any(impl._dpas_layout for impl, _, _ in flush_pairs):
+                raise RuntimeError(
+                    "KVARN_NATIVE_XPU_DPAS_LAYOUT requires KVARN_FAST_FLUSH=1"
+                )
             return cls._batched_flush_legacy(flush_pairs)
 
         cfg = flush_pairs[0][0].kvarn_config
         Hk = flush_pairs[0][0].num_kv_heads
         D = cfg.head_dim
         G = cfg.group
-        T = cfg.tile_bytes_aligned
+        T = cfg.record_bytes
         kpb = cfg.k_packed_bytes
         vpb = cfg.v_packed_bytes
-
         # Group by impl (layer); every impl flushes the SAME block set (the
         # builder cross-products flush_block_ids with group_impls) and pool slot
         # indices are shared across layers, so per impl we have (kvc, bids, slots).
@@ -1896,6 +1989,48 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 K_tiles = K_rot.permute(0, 2, 3, 1).reshape(nB * Hk, D, G)
                 V_tiles = V_rot.permute(0, 2, 1, 3).reshape(nB * Hk, G, D)
                 K_out, V_out = _sinkhorn_pack_kv(K_tiles, V_tiles, cfg)
+                native_dpas_layout = impl._dpas_layout
+                if native_dpas_layout:
+                    from vllm.v1.attention.ops.triton_kvarn_flush import (
+                        _kvarn_flush_record_kernel,
+                    )
+
+                    M = nB * Hk
+                    fields = (
+                        K_out["q_packed_uint8"],
+                        K_out["s_col_K"].contiguous().view(torch.uint8),
+                        K_out["zp_K"].contiguous().view(torch.uint8),
+                        K_out["s_row_K"].contiguous().view(torch.uint8),
+                        V_out["q_packed_uint8"],
+                        V_out["s_col_V"].contiguous().view(torch.uint8),
+                        V_out["s_row_V"].contiguous().view(torch.uint8),
+                        V_out["zp_V"].contiguous().view(torch.uint8),
+                    )
+                    flush_block = 1024
+                    num_chunks = (T + flush_block - 1) // flush_block
+                    _kvarn_flush_record_kernel[(M, num_chunks)](
+                        *fields,
+                        bid_t,
+                        kvc,
+                        kvc.stride(0),
+                        kvc.stride(1),
+                        K_PACKED_BYTES=kpb,
+                        V_PACKED_OFFSET=cfg.v_packed_offset,
+                        V_PACKED_BYTES=vpb,
+                        K_SCOL_OFFSET=cfg.k_s_col_offset,
+                        K_ZP_OFFSET=cfg.k_zp_offset,
+                        K_SROW_OFFSET=cfg.k_s_row_offset,
+                        V_SCOL_OFFSET=cfg.v_s_col_offset,
+                        V_SROW_OFFSET=cfg.v_s_row_offset,
+                        V_ZP_OFFSET=cfg.v_zp_offset,
+                        RECORD_BYTES=cfg.tile_bytes,
+                        TILE_BYTES=T,
+                        NUM_HEADS=Hk,
+                        NATIVE_DPAS_LAYOUT=native_dpas_layout,
+                        BLOCK=flush_block,
+                        num_warps=8,
+                    )
+                    continue
                 # Assemble the packed cache record [nB*Hk, tile_bytes] by
                 # concatenating fields in config-offset order (fp16 scales
                 # byte-reinterpreted to uint8), then pad to tile_bytes_aligned.
@@ -2039,6 +2174,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # into pool at slot=block_id directly. No Python loop, no allocator,
         # no dict mutation. Safe inside a captured CUDA graph.
         cfg = self.kvarn_config
+        if kv_cache.shape[-1] != cfg.record_bytes:
+            raise RuntimeError(
+                "KVarN cache record ABI mismatch: allocated "
+                f"{kv_cache.shape[-1]} bytes, expected {cfg.record_bytes} "
+                f"for {self.kv_cache_dtype}."
+            )
         N = slot_mapping.shape[0]
         if N <= 0:
             return
@@ -2046,14 +2187,112 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         Hk = self.num_kv_heads
         D = self.head_size
 
-        # bf16 boundary-cast (see forward): KVarN store/rotation is fp16.
-        if key.dtype != torch.float16:
-            key = key.to(torch.float16)
-            value = value.to(torch.float16)
-
         # Ensure pool + lookup tensors + rotation scratch exist (no-op during
         # capture; first call before capture sizes pool to kv_cache num_blocks).
         self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
+
+        from vllm.v1.attention.ops.triton_kvarn_decode import (
+            _kvarn_scatter_store_kernel,
+            kvarn_xpu_event_region,
+        )
+
+        # Xe2's fused FWHT consumes the model's native bf16/fp16 K/V and
+        # writes the rotated rows directly to the tail pool. Besides replacing
+        # two dense H256 GEMMs and the scatter launch, this avoids the bf16 ->
+        # fp16 boundary-cast allocations. Keep the established tensor path as
+        # the exact fallback for unsupported devices and shapes.
+        use_native_store = (
+            os.environ.get("KVARN_NATIVE_XPU", "0") == "1"
+            and os.environ.get("KVARN_NATIVE_XPU_HADAMARD_SCATTER", "0") == "1"
+            and device.type == "xpu"
+            and Hk == 4
+            and D == 256
+            and cfg.group == 128
+            and key.dtype in (torch.float16, torch.bfloat16)
+            and value.dtype == key.dtype
+            and self._block_to_slot_t is not None
+            and self._tail_K_pool is not None
+            and self._tail_V_pool is not None
+        )
+        if use_native_store:
+            k_view = key[:N].view(N, Hk, D)
+            v_view = value[:N].view(N, Hk, D)
+            if (
+                os.environ.get("KVARN_NATIVE_XPU_FUSED_QUERY_STORE", "0") == "1"
+                and N <= 4
+                and hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_query_scatter")
+            ):
+                # Decode immediately follows this update for the same layer.
+                # Retain tensor views only until forward() combines their
+                # FWHT/scatter with Q's FWHT in one native launch.
+                self._pending_native_store = (
+                    k_view,
+                    v_view,
+                    slot_mapping[:N],
+                )
+                return
+            with (
+                torch.profiler.record_function("kvarn_cache_update_fused"),
+                kvarn_xpu_event_region("cache_update_fused"),
+            ):
+                torch.ops._vllm_fa2_C.kvarn_hadamard_scatter(
+                    k_view,
+                    v_view,
+                    slot_mapping[:N],
+                    self._block_to_slot_t,
+                    self._tail_K_pool,
+                    self._tail_V_pool,
+                    cfg.group,
+                )
+                if (
+                    os.environ.get("KVARN_NATIVE_XPU_HADAMARD_SCATTER_SYNC", "0") == "1"
+                    # A queue wait is illegal while the XPU command graph is
+                    # recording. Neither is_current_stream_capturing() nor N
+                    # is a safe discriminator here on XPU: capture reports
+                    # false and decode tensors are padded to the compile
+                    # range. Keep this device-wide diagnostic eager-only.
+                    and os.environ.get("VLLM_XPU_ENABLE_XPU_GRAPH", "0") != "1"
+                ):
+                    torch.xpu.synchronize()
+                if (
+                    os.environ.get("KVARN_NATIVE_XPU_VALIDATE_HADAMARD_SCATTER", "0")
+                    == "1"
+                    and N <= 4
+                ):
+                    # Diagnose against the exact established producer using
+                    # the real model views and allocator metadata.  This is
+                    # deliberately synchronization-heavy and opt-in only.
+                    dense_k = torch.matmul(k_view.to(torch.float16), self._H_fp16)
+                    dense_v = torch.matmul(v_view.to(torch.float16), self._H_fp16)
+                    logical = slot_mapping[:N]
+                    blocks = torch.div(logical, cfg.group, rounding_mode="floor")
+                    positions = torch.remainder(logical, cfg.group)
+                    pool_slots = self._block_to_slot_t[blocks]
+                    actual_k = self._tail_K_pool[pool_slots, positions]
+                    actual_v = self._tail_V_pool[pool_slots, positions]
+                    k_error = (actual_k - dense_k).abs().amax().item()
+                    v_error = (actual_v - dense_v).abs().amax().item()
+                    logger.warning(
+                        "KVarN native scatter validation: N=%d dtype=%s "
+                        "K-stride=%s V-stride=%s slots=[%d,%d] "
+                        "pool=[%d,%d] max-error K=%g V=%g",
+                        N,
+                        key.dtype,
+                        tuple(k_view.stride()),
+                        tuple(v_view.stride()),
+                        int(logical.min().item()),
+                        int(logical.max().item()),
+                        int(pool_slots.min().item()),
+                        int(pool_slots.max().item()),
+                        k_error,
+                        v_error,
+                    )
+            return
+
+        # bf16 boundary-cast (see forward): fallback store/rotation is fp16.
+        if key.dtype != torch.float16:
+            key = key.to(torch.float16)
+            value = value.to(torch.float16)
 
         # Reshape to (N, Hk, D) — view, no copy (key/value already fp16).
         k_view = key[:N].view(N, Hk, D)
@@ -2063,34 +2302,53 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # capture-friendly (uses the caching allocator's pool).
         k_rot = self._k_rot_scratch[:N]
         v_rot = self._v_rot_scratch[:N]
-        torch.matmul(k_view, self._H_fp16, out=k_rot)
-        torch.matmul(v_view, self._H_fp16, out=v_rot)
+
+        with (
+            torch.profiler.record_function("kvarn_cache_update_rotation"),
+            kvarn_xpu_event_region("cache_update_rotation"),
+        ):
+            # Flatten token/head into a conventional 2-D GEMM.  Intel's XPU
+            # batched matmul ``out=`` path has been observed writing one value
+            # beyond this bounded scratch view during real Qwen prefill,
+            # corrupting a later layer's parameter.  The 2-D form is
+            # algebraically identical and uses the well-tested GEMM writer.
+            torch.mm(
+                k_view.reshape(N * Hk, D),
+                self._H_fp16,
+                out=k_rot.reshape(N * Hk, D),
+            )
+            torch.mm(
+                v_view.reshape(N * Hk, D),
+                self._H_fp16,
+                out=v_rot.reshape(N * Hk, D),
+            )
 
         # Scatter via the sparse pool indirection. Slot lookup (block_id →
         # pool slot) is done inside the kernel against the GPU
         # _block_to_slot_t tensor (mutated only by the metadata builder).
-        from vllm.v1.attention.ops.triton_kvarn_decode import (
-            _kvarn_scatter_store_kernel,
-        )
-
-        _kvarn_scatter_store_kernel[(N, Hk)](
-            k_rot,
-            v_rot,
-            slot_mapping[:N],
-            self._block_to_slot_t,
-            self._tail_K_pool,
-            self._tail_V_pool,
-            k_rot.stride(0),
-            k_rot.stride(1),
-            self._tail_K_pool.stride(0),
-            self._tail_K_pool.stride(1),
-            self._tail_K_pool.stride(2),
-            GROUP=cfg.group,
-            D=D,
-            NUM_BLOCKS_LOOKUP=self._block_lookup_size,
-            num_warps=2,
-            num_stages=2,
-        )
+        with (
+            torch.profiler.record_function("kvarn_cache_update_scatter"),
+            kvarn_xpu_event_region("cache_update_scatter"),
+        ):
+            _kvarn_scatter_store_kernel[(N, Hk)](
+                k_rot,
+                v_rot,
+                slot_mapping[:N],
+                self._block_to_slot_t,
+                self._tail_K_pool,
+                self._tail_V_pool,
+                k_rot.stride(0),
+                k_rot.stride(1),
+                self._tail_K_pool.stride(0),
+                self._tail_K_pool.stride(1),
+                self._tail_K_pool.stride(2),
+                GROUP=cfg.group,
+                D=D,
+                NUM_BLOCKS_LOOKUP=self._block_lookup_size,
+                POOL_SIZE=self._tail_K_pool.shape[0],
+                num_warps=2,
+                num_stages=2,
+            )
         # No CPU bookkeeping here — fill tracking + flush triggering live in
         # KVarNMetadataBuilder.build() (outside the captured region). This
         # method is now pure tensor ops, safe inside a captured CUDA graph.
@@ -2126,6 +2384,32 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         if N <= 0:
             return output.fill_(0)
 
+        validate_attention = (
+            os.environ.get("KVARN_VALIDATE_ATTENTION_FINITE", "0") == "1"
+        )
+
+        def validate_stage(stage: str, *tensors: torch.Tensor) -> None:
+            if not validate_attention:
+                return
+            for name, tensor in zip(("query", "key", "value", "output"), tensors):
+                if not bool(torch.isfinite(tensor).all().item()):
+                    nan_count = int(torch.isnan(tensor).sum().item())
+                    posinf_count = int(torch.isposinf(tensor).sum().item())
+                    neginf_count = int(torch.isneginf(tensor).sum().item())
+                    raise RuntimeError(
+                        "KVarN attention received non-finite values: "
+                        f"layer={self.layer_name} stage={stage} tensor={name} "
+                        f"dtype={tensor.dtype} shape={tuple(tensor.shape)} "
+                        f"is_prefill={attn_metadata.is_prefill} "
+                        f"num_decodes={attn_metadata.num_decodes} "
+                        "has_cached_multiquery="
+                        f"{attn_metadata.has_cached_multiquery} "
+                        f"nan={nan_count} posinf={posinf_count} "
+                        f"neginf={neginf_count}"
+                    )
+
+        validate_stage("input", query[:N], key[:N], value[:N])
+
         # Make sure pool + block-lookup tensors exist and cover num_blocks.
         self._ensure_pool(kv_cache.device, num_blocks_hint=kv_cache.shape[0])
         # Cache the kv_cache ref so the metadata builder can drive flushes
@@ -2135,16 +2419,67 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # Flush is now triggered from KVarNMetadataBuilder.build() between
         # captured graph replays — nothing to do here at the top of forward.
 
+        # Native single-token XPU decode consumes only Q here: K/V were already
+        # written by do_kv_cache_update(), and the native H256 query FWHT accepts
+        # bf16 directly.  Avoid allocating and launching three otherwise-dead
+        # bf16 -> fp16 conversions on every layer and token.  Keep the boundary
+        # casts for every fallback and multi-token path.
+        cfg = self.kvarn_config
+        native_single_token_decode = (
+            not attn_metadata.is_prefill
+            and attn_metadata.max_query_len <= 1
+            and os.environ.get("KVARN_NATIVE_XPU", "0") == "1"
+            and os.environ.get("KVARN_NATIVE_XPU_DECODE", "0") == "1"
+            and device.type == "xpu"
+            and self.num_heads == 24
+            and self.num_kv_heads == 4
+            and self.head_size == 256
+            and cfg.group == 128
+            and cfg.key_bits == 4
+            and cfg.value_bits == 4
+        )
+        native_layer_filter = os.environ.get("KVARN_NATIVE_XPU_LAYER", "")
+        if native_single_token_decode and native_layer_filter:
+            native_single_token_decode = kvarn_native_layer_selected(
+                self.layer_name, native_layer_filter
+            )
+
+        # A small-N update may have been deferred for the opt-in combined
+        # query/KV FWHT launch.  Any route other than native one-token decode
+        # must materialize it now before reading the tail pool.
+        if self._pending_native_store is not None and not native_single_token_decode:
+            pending_k, pending_v, pending_slots = self._pending_native_store
+            self._pending_native_store = None
+            torch.ops._vllm_fa2_C.kvarn_hadamard_scatter(
+                pending_k,
+                pending_v,
+                pending_slots,
+                self._block_to_slot_t,
+                self._tail_K_pool,
+                self._tail_V_pool,
+                cfg.group,
+            )
+
         # bf16 boundary-cast: KVarN's compute (rotation matmul, scratch buffers,
         # Triton stores) is fp16 internally. Cast bf16 activations to fp16 at this
         # entry point; the output write below casts back to output.dtype. fp16 is
         # untouched (byte-identical), and the cast is lossless for KVarN (fp16
         # mantissa > bf16, and the cache is 4-bit). Without this, bf16 q mixing
         # with fp16 KV buffers trips "Expected out BFloat16, got Half".
-        if query.dtype != torch.float16:
-            query = query.to(torch.float16)
-            key = key.to(torch.float16)
-            value = value.to(torch.float16)
+        requires_fp16 = _kvarn_attention_requires_fp16(
+            is_prefill=attn_metadata.is_prefill,
+            num_decodes=attn_metadata.num_decodes,
+            has_cached_multiquery=attn_metadata.has_cached_multiquery,
+        )
+        if query.dtype != torch.float16 and requires_fp16:
+            query, key, value = _cast_kvarn_activations(
+                query,
+                key,
+                value,
+                query_only=(
+                    not attn_metadata.is_prefill and attn_metadata.max_query_len <= 1
+                ),
+            )
 
         q = query[:N].view(N, self.num_heads, self.head_size)
 
@@ -2172,6 +2507,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             attn_out = self._mixed_batch_path(
                 q, key[:N], value[:N], kv_cache, attn_metadata
             )
+
+        validate_stage("attention_output", attn_out)
 
         if output.ndim == 3:
             output[:N] = attn_out.to(output.dtype)
@@ -2622,6 +2959,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             V_S_COL_OFFSET=cfg.v_s_col_offset,
             V_S_ROW_OFFSET=cfg.v_s_row_offset,
             V_ZP_OFFSET=cfg.v_zp_offset,
+            DPAS_LAYOUT=self._dpas_layout,
             num_warps=4,
             num_stages=2,
         )
