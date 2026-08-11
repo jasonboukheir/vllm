@@ -901,11 +901,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_tokens = hidden_states.size(0)
 
+        def validate_sentinel(stage: str) -> None:
+            weights = getattr(self, "_diagnostic_sentinel_weights", None)
+            if weights is None:
+                return
+            for name, weight in zip(("input", "post_attention"), weights):
+                if not bool(torch.isfinite(weight).all().item()):
+                    raise RuntimeError(
+                        "Qwen GDN XPU corrupted sentinel weight: "
+                        f"layer={self.prefix} stage={stage} target={name}"
+                    )
+
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        validate_sentinel("after_in_proj_qkvz")
         projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        validate_sentinel("after_in_proj_ba")
 
         # ============================================================
         # Part 2: Core Attention
@@ -924,6 +937,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             projected_states_ba,
             self.prefix,
         )
+        validate_sentinel("after_gdn_attention_core")
 
         # ============================================================
         # Part 3: Output Projection
@@ -933,9 +947,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
+        validate_sentinel("after_gated_rmsnorm")
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         out, _ = self.out_proj(core_attn_out)
+        validate_sentinel("after_out_proj")
         return out
 
     def forward_cpu(

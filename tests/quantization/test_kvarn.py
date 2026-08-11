@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only contracts for KVarN configuration and cache accounting."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,9 @@ from vllm.model_executor.layers.quantization.kvarn.config import (
 from vllm.platforms.xpu import XPUPlatform
 from vllm.v1.attention.backends.kvarn_attn import (
     KVarNAttentionBackend,
+    KVarNAttentionImpl,
     KVarNMetadataBuilder,
+    _cast_kvarn_activations,
     expand_kvarn_block_table,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -54,6 +57,73 @@ def test_presets_are_an_auditable_fixed_contract(name, key_bits, value_bits, gro
 def test_unknown_preset_fails_closed():
     with pytest.raises(ValueError, match="Unknown KVarN cache dtype"):
         KVarNConfig.from_cache_dtype("kvarn_k3v2_g128", head_dim=256)
+
+
+def test_pure_decode_casts_only_query_after_cache_update():
+    query = torch.randn(2, 3, dtype=torch.bfloat16)
+    key = torch.randn(2, 3, dtype=torch.bfloat16)
+    value = torch.randn(2, 3, dtype=torch.bfloat16)
+
+    cast_query, cast_key, cast_value = _cast_kvarn_activations(
+        query, key, value, query_only=True
+    )
+
+    assert cast_query.dtype == torch.float16
+    assert cast_key is key
+    assert cast_value is value
+
+
+def test_prefill_casts_all_activations_for_fp16_kvarn_compute():
+    tensors = [torch.randn(2, 3, dtype=torch.bfloat16) for _ in range(3)]
+    cast = _cast_kvarn_activations(*tensors, query_only=False)
+    assert all(tensor.dtype == torch.float16 for tensor in cast)
+
+
+
+
+def test_compact_k4v4_preset_changes_only_the_physical_record_stride():
+    """Compact is a format-bearing preset, never an ambient mode switch."""
+    padded = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128", head_dim=256)
+    compact = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128_compact", head_dim=256)
+
+    assert (compact.key_bits, compact.value_bits, compact.group) == (4, 4, 128)
+    assert compact.tile_bytes == padded.tile_bytes == 35072
+    assert padded.tile_bytes_aligned == 65536
+    assert compact.tile_bytes_aligned == compact.tile_bytes == 35072
+    assert compact.tile_bytes_aligned // compact.group == 274
+    for field in (
+        "k_packed_offset",
+        "k_s_col_offset",
+        "k_zp_offset",
+        "k_s_row_offset",
+        "v_packed_offset",
+        "v_s_col_offset",
+        "v_s_row_offset",
+        "v_zp_offset",
+    ):
+        assert getattr(compact, field) == getattr(padded, field)
+
+
+def test_compact_k4v4_preset_has_exact_memory_ratio():
+    padded = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128", head_dim=256)
+    compact = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128_compact", head_dim=256)
+    # 35072 / 65536 reduces exactly to 137 / 256: 46.484375% fewer bytes.
+    assert compact.tile_bytes_aligned * 256 == padded.tile_bytes_aligned * 137
+    assert (padded.tile_bytes_aligned - compact.tile_bytes_aligned) * 256 == (
+        padded.tile_bytes_aligned * 119
+    )
+
+
+def test_compact_preset_allows_stride_aware_native_decoder(monkeypatch):
+    monkeypatch.setenv("KVARN_NATIVE_XPU_DECODE", "1")
+    impl = KVarNAttentionImpl(
+        num_heads=24,
+        head_size=256,
+        scale=1 / 16,
+        num_kv_heads=4,
+        kv_cache_dtype="kvarn_k4v4_g128_compact",
+    )
+    assert impl.kvarn_config.record_bytes == 35072
 
 
 @pytest.mark.parametrize("cache_dtype", KVARN_PRESETS)
@@ -206,6 +276,33 @@ def test_macro_cache_shape_exposes_one_record_per_tile():
     assert shape == (65, 4, 65536)
 
 
+def test_compact_macro_cache_shape_uses_active_record_stride():
+    shape = KVarNAttentionBackend.get_kv_cache_shape(
+        num_blocks=5,
+        block_size=1664,
+        num_kv_heads=4,
+        head_size=256,
+        cache_dtype_str="kvarn_k4v4_g128_compact",
+    )
+    assert shape == (65, 4, 35072)
+    assert math.prod(shape) == 65 * 4 * 35072
+
+    # The allocator accounts in 274-byte logical token slots, while the
+    # backend materializes one 35,072-byte record per 128-token tile.  Those
+    # two views must stay byte-identical even when page unification grows a
+    # physical block to several quantization tiles.
+    spec = TQFullAttentionSpec(
+        block_size=1664,
+        num_kv_heads=4,
+        head_size=256,
+        head_size_v=256,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.KVARN,
+        tq_slot_size=274,
+    )
+    assert math.prod(shape) == 5 * spec.page_size_bytes
+
+
 def test_metadata_builder_uses_physical_spec_not_global_logical_block_size():
     spec = TQFullAttentionSpec(
         block_size=128,
@@ -233,3 +330,44 @@ def test_metadata_builder_uses_physical_spec_not_global_logical_block_size():
 
     assert builder._group == 128
     assert builder._tiles_per_block == 1
+
+
+def test_native_layer_filter_matches_components_not_numeric_prefixes():
+    from vllm.v1.attention.ops.triton_kvarn_decode import (
+        kvarn_native_layer_selected,
+    )
+
+    assert kvarn_native_layer_selected("model.layers.3.self_attn", "layers.3")
+    assert not kvarn_native_layer_selected(
+        "model.layers.31.self_attn", "layers.3"
+    )
+    assert kvarn_native_layer_selected(
+        "model.layers.31.self_attn", "layers.3, layers.31"
+    )
+    assert kvarn_native_layer_selected("model.layers.7.self_attn", "")
+
+
+@pytest.mark.parametrize(
+    ("is_prefill", "num_decodes", "has_cached_multiquery", "expected"),
+    [
+        (True, 0, False, False),
+        (True, 0, True, True),
+        (True, 1, False, True),
+        (False, 0, False, True),
+    ],
+)
+def test_kvarn_preserves_model_dtype_only_for_fresh_prefill(
+    is_prefill, num_decodes, has_cached_multiquery, expected
+):
+    from vllm.v1.attention.backends.kvarn_attn import (
+        _kvarn_attention_requires_fp16,
+    )
+
+    assert (
+        _kvarn_attention_requires_fp16(
+            is_prefill=is_prefill,
+            num_decodes=num_decodes,
+            has_cached_multiquery=has_cached_multiquery,
+        )
+        is expected
+    )

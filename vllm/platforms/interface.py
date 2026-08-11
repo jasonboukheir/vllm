@@ -868,7 +868,7 @@ class Platform:
             kvarn_cfg = KVarNConfig.from_cache_dtype(
                 cache_config.cache_dtype, model_config.get_head_size()
             )
-            slot_bytes = kvarn_cfg.tile_bytes_aligned // kvarn_cfg.group
+            slot_bytes = kvarn_cfg.record_bytes // kvarn_cfg.group
             attn_page_size_1_token = TQFullAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),

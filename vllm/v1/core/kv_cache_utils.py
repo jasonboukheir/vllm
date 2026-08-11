@@ -1888,10 +1888,13 @@ def get_kv_cache_groups(
 
     # KVarN hybrid models use independent physical pools, so their attention
     # pages do not need to be enlarged to the recurrent-state page size.
+    cache_dtype = getattr(
+        getattr(vllm_config, "cache_config", None), "cache_dtype", None
+    )
     independent_kvarn_pools = (
-        isinstance(vllm_config.cache_config.cache_dtype, str)
-        and vllm_config.cache_config.cache_dtype.startswith("kvarn_")
-        and not vllm_config.cache_config.cache_dtype.startswith("kvarn_mla")
+        isinstance(cache_dtype, str)
+        and cache_dtype.startswith("kvarn_")
+        and not cache_dtype.startswith("kvarn_mla")
         and any(isinstance(spec, MambaSpec) for spec in filtered_spec.values())
     )
     if not independent_kvarn_pools:

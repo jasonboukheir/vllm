@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -287,6 +288,86 @@ def _gdn_attention_core_xpu_impl(
         core_attn_out.index_copy_(0, spec_token_indx, spec_core)
         z.index_copy_(0, non_spec_token_indx, non_spec_z)
         z.index_copy_(0, spec_token_indx, spec_z)
+        return
+
+    diagnostic_sentinels = getattr(self, "_diagnostic_sentinel_weights", None)
+    if diagnostic_sentinels is not None:
+        intermediates = torch.ops._xpu_C.causal_conv1d(
+            z,
+            projected_states_qkvz,
+            projected_states_ba,
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            conv_state=self.kv_cache[0],
+            conv_weights=conv_weights,
+            conv_bias=self.conv1d.bias,
+            activation=self.activation,
+            num_prefills=num_prefills,
+            num_decodes=num_decodes,
+            num_spec_decodes=num_spec_decodes,
+            has_initial_state=has_initial_state,
+            non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_token_indx=non_spec_token_indx,
+            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+            spec_query_start_loc=spec_query_start_loc,
+            spec_token_indx=spec_token_indx,
+            spec_state_indices_tensor=spec_state_indices_tensor,
+            num_accepted_tokens=num_accepted_tokens,
+            num_actual_tokens=num_actual_tokens,
+            tp_size=self.tp_size,
+            reorder_input=not self.gqa_interleaved_layout,
+        )
+        if os.getenv("VLLM_QWEN3_NEXT_REPORT_GDN_SHAPES") == "1":
+            shapes = tuple(tuple(t.shape) for t in intermediates)
+            raise RuntimeError(
+                "GDN_SHAPES "
+                f"output={tuple(core_attn_out.shape)} "
+                f"intermediates={shapes} "
+                f"query_starts={tuple(non_spec_query_start_loc.shape)} "
+                f"actual_tokens={num_actual_tokens} prefills={num_prefills} "
+                f"decodes={num_decodes}"
+            )
+        if not all(
+            bool(torch.isfinite(weight).all().item()) for weight in diagnostic_sentinels
+        ):
+            raise RuntimeError("Qwen GDN causal_conv1d corrupted sentinel weight")
+        torch.ops._xpu_C.gated_delta_rule(
+            core_attn_out,
+            *intermediates,
+            self.num_v_heads,
+            self.head_v_dim,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            ssm_state=self.kv_cache[1],
+            num_prefills=num_prefills,
+            num_decodes=num_decodes,
+            num_spec_decodes=num_spec_decodes,
+            has_initial_state=has_initial_state,
+            non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_token_indx=non_spec_token_indx,
+            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+            spec_query_start_loc=spec_query_start_loc,
+            spec_token_indx=spec_token_indx,
+            spec_state_indices_tensor=spec_state_indices_tensor,
+            num_accepted_tokens=num_accepted_tokens,
+            num_actual_tokens=num_actual_tokens,
+            tp_size=self.tp_size,
+        )
+        for sentinel_name, weight in zip(
+            ("input_layernorm", "post_attention_layernorm"),
+            diagnostic_sentinels,
+        ):
+            finite = torch.isfinite(weight)
+            if not bool(finite.all().item()):
+                bad_indices = (~finite).nonzero().flatten()
+                raise RuntimeError(
+                    "Qwen GDN gated_delta_rule corrupted sentinel weight: "
+                    f"target={sentinel_name} bad={bad_indices.numel()}/"
+                    f"{weight.numel()} first={int(bad_indices[0].item())} "
+                    f"last={int(bad_indices[-1].item())}"
+                )
         return
 
     torch.ops._xpu_C.gdn_attention(

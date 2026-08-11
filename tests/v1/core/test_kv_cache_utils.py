@@ -60,6 +60,7 @@ from vllm.v1.kv_cache_interface import (
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
@@ -1366,7 +1367,6 @@ def test_is_kv_cache_spec_uniform():
     }
     assert is_kv_cache_spec_uniform(kv_cache_spec)
 
-
     kv_cache_spec = {
         "layer_1": new_kv_cache_spec(num_kv_heads=32),
         "layer_2": new_sliding_window_spec(num_kv_heads=32, sliding_window=1),
@@ -1430,6 +1430,110 @@ def test_kv_cache_config_defaults_each_group_to_shared_capacity():
     assert not config.has_independent_kv_cache_pools
 
 
+def test_kvarn_compact_padded_and_bf16_page_sizes_and_capacity():
+    """Compact accounting buys physical blocks under one fixed byte budget."""
+    compact = TQFullAttentionSpec(
+        block_size=128,
+        num_kv_heads=4,
+        head_size=256,
+        head_size_v=256,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.KVARN,
+        tq_slot_size=274,
+    )
+    padded = TQFullAttentionSpec(
+        block_size=128,
+        num_kv_heads=4,
+        head_size=256,
+        head_size_v=256,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.KVARN,
+        tq_slot_size=512,
+    )
+    bf16 = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=4,
+        head_size=256,
+        head_size_v=256,
+        dtype=torch.bfloat16,
+    )
+
+    assert compact.page_size_bytes == 140_288
+    assert padded.page_size_bytes == 262_144
+    assert bf16.page_size_bytes == 524_288
+
+    config = SimpleNamespace(cache_config=SimpleNamespace(num_gpu_blocks_override=None))
+    available_memory = 8 * bf16.page_size_bytes
+    assert (
+        kv_cache_utils.get_num_blocks(
+            config, 1, available_memory, compact.page_size_bytes
+        )
+        == 29
+    )
+    assert (
+        kv_cache_utils.get_num_blocks(
+            config, 1, available_memory, padded.page_size_bytes
+        )
+        == 16
+    )
+    assert (
+        kv_cache_utils.get_num_blocks(config, 1, available_memory, bf16.page_size_bytes)
+        == 8
+    )
+
+
+def test_compact_kvarn_and_mamba_keep_independent_physical_pages():
+    """A recurrent page must not force compact KVarN back to padded storage."""
+    compact = TQFullAttentionSpec(
+        block_size=128,
+        num_kv_heads=4,
+        head_size=256,
+        head_size_v=256,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.KVARN,
+        tq_slot_size=274,
+    )
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((1_603_584,),),
+        dtypes=(torch.bfloat16,),
+        mamba_cache_mode="none",
+    )
+    groups = [
+        KVCacheGroupSpec(["full.0"], compact),
+        KVCacheGroupSpec(["mamba.0"], mamba),
+    ]
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v4_g128_compact",
+            num_gpu_blocks_override=None,
+            mamba_cache_mode="none",
+        ),
+        model_config=SimpleNamespace(max_model_len=8192),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+    )
+    assert compact.page_size_bytes == 140_288
+    assert mamba.page_size_bytes == 3_207_168
+
+    bytes_per_request = 64 * compact.page_size_bytes + mamba.page_size_bytes
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, available_memory=2 * bytes_per_request
+    )
+
+    assert config.has_independent_kv_cache_pools
+    assert [
+        group.kv_cache_spec.page_size_bytes for group in config.kv_cache_groups
+    ] == [
+        140_288,
+        3_207_168,
+    ]
+    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [128, 2]
+    assert [tensor.size for tensor in config.kv_cache_tensors] == [
+        128 * 140_288,
+        2 * 3_207_168,
+    ]
+
+
 def test_kvarn_hybrid_config_sizes_independent_pools_by_request_capacity():
     """Every pool is provisioned for the same number of complete requests."""
     groups = [
@@ -1453,9 +1557,7 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_request_capacity():
         for group in groups
     ]
     bytes_per_request = sum(
-        len(group.layer_names)
-        * group.kv_cache_spec.page_size_bytes
-        * num_blocks
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes * num_blocks
         for group, num_blocks in zip(groups, blocks_per_request)
     )
 
@@ -1476,14 +1578,13 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_request_capacity():
     assert sum(tensor.size for tensor in config.kv_cache_tensors) == (
         bytes_per_request * 3
     )
-    assert kv_cache_utils.get_max_concurrency_for_kv_cache_config(
-        vllm_config, config
-    ) == 3
+    assert (
+        kv_cache_utils.get_max_concurrency_for_kv_cache_config(vllm_config, config) == 3
+    )
     assert kv_cache_utils._max_memory_usage_bytes_from_groups(
         vllm_config, groups
     ) == sum(
-        len(group.layer_names)
-        * group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+        len(group.layer_names) * group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
         for group in groups
     )
 
@@ -1525,9 +1626,9 @@ def test_kvarn_prefix_aligned_pool_uses_only_resident_mamba_states():
     )
 
     assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [128, 8]
-    assert kv_cache_utils.get_max_concurrency_for_kv_cache_config(
-        vllm_config, config
-    ) == 2
+    assert (
+        kv_cache_utils.get_max_concurrency_for_kv_cache_config(vllm_config, config) == 2
+    )
 
 
 @pytest.mark.parametrize("max_model_len", [128, 8192, 114688])

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -76,6 +77,64 @@ from .utils import (
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
+
+
+def _validate_qwen3_next_finite(
+    layer_idx: int,
+    layer_type: str,
+    stage: str,
+    **tensors: torch.Tensor | None,
+) -> None:
+    """Fail at the first non-finite Qwen3-Next layer boundary.
+
+    This is deliberately synchronization-heavy and is only called when
+    ``VLLM_QWEN3_NEXT_VALIDATE_FINITE=1``.  Keeping the check at model
+    boundaries makes it possible to distinguish linear-attention/MLP
+    corruption from cache-update or full-attention corruption.
+    """
+    max_tokens = int(
+        os.environ.get("VLLM_QWEN3_NEXT_VALIDATE_FINITE_MAX_TOKENS", "0")
+    )
+    log_stats = os.environ.get("VLLM_QWEN3_NEXT_LOG_FINITE_STATS", "0") == "1"
+    layer_filter = {
+        int(item)
+        for item in os.environ.get(
+            "VLLM_QWEN3_NEXT_VALIDATE_FINITE_LAYERS", ""
+        ).split(",")
+        if item.strip()
+    }
+    for name, tensor in tensors.items():
+        if tensor is None:
+            continue
+        # Profile runs intentionally exercise maximum-sized synthetic inputs;
+        # some XPU GDN kernels return NaN placeholders there.  Diagnostics can
+        # opt out of those shapes while still checking the real request.
+        if max_tokens > 0 and tensor.ndim > 1 and tensor.shape[0] > max_tokens:
+            continue
+        if log_stats and (not layer_filter or layer_idx in layer_filter):
+            tensor_f32 = tensor.float()
+            logger.warning(
+                "Qwen3-Next finite stats: layer=%d layer_type=%s stage=%s "
+                "tensor=%s maxabs=%g rms=%g",
+                layer_idx,
+                layer_type,
+                stage,
+                name,
+                float(tensor_f32.abs().amax().item()),
+                float(torch.sqrt(torch.mean(tensor_f32.square())).item()),
+            )
+        finite = torch.isfinite(tensor)
+        if not bool(finite.all().item()):
+            nan_count = int(torch.isnan(tensor).sum().item())
+            posinf_count = int(torch.isposinf(tensor).sum().item())
+            neginf_count = int(torch.isneginf(tensor).sum().item())
+            raise RuntimeError(
+                "Qwen3-Next produced non-finite values: "
+                f"layer={layer_idx} layer_type={layer_type} stage={stage} "
+                f"tensor={name} dtype={tensor.dtype} "
+                f"shape={tuple(tensor.shape)} nan={nan_count} "
+                f"posinf={posinf_count} neginf={neginf_count}"
+            )
 
 
 def _is_shared_expert_fse_compatible(quant_config) -> bool:
@@ -261,6 +320,7 @@ class Qwen3NextAttention(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self.layer_idx = extract_layer_index(prefix)
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -389,12 +449,40 @@ class Qwen3NextAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        validate_finite = (
+            os.environ.get("VLLM_QWEN3_NEXT_VALIDATE_FINITE", "0") == "1"
+        )
         qkv, _ = self.qkv_proj(hidden_states)
+        if validate_finite:
+            _validate_qwen3_next_finite(
+                self.layer_idx, "full_attention", "qkv_projection", qkv=qkv
+            )
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        if validate_finite:
+            _validate_qwen3_next_finite(
+                self.layer_idx,
+                "full_attention",
+                "attention_input",
+                query=q,
+                key=k,
+                value=v,
+                gate=gate,
+            )
         attn_output = self.attn(q, k, v)
+        if validate_finite:
+            _validate_qwen3_next_finite(
+                self.layer_idx,
+                "full_attention",
+                "attention_return",
+                output=attn_output,
+            )
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)
         output, _ = self.o_proj(attn_output)
+        if validate_finite:
+            _validate_qwen3_next_finite(
+                self.layer_idx, "full_attention", "output_projection", output=output
+            )
         return output
 
 
@@ -494,6 +582,32 @@ class Qwen3NextDecoderLayer(nn.Module):
         positions: torch.Tensor = None,
         **kwargs: object,
     ):
+        sentinel_weights = kwargs.get("sentinel_weights")
+
+        def validate_sentinel(stage: str) -> None:
+            if validate_finite and sentinel_weights is not None:
+                input_weight, post_weight = sentinel_weights
+                _validate_qwen3_next_finite(
+                    self.layer_idx,
+                    self.layer_type,
+                    stage,
+                    target_input_layernorm_weight=input_weight,
+                    target_post_attention_layernorm_weight=post_weight,
+                )
+
+        validate_finite = (
+            os.environ.get("VLLM_QWEN3_NEXT_VALIDATE_FINITE", "0") == "1"
+        )
+        if validate_finite:
+            _validate_qwen3_next_finite(
+                self.layer_idx,
+                self.layer_type,
+                "layer_input",
+                hidden_states=hidden_states,
+                residual=residual,
+                input_layernorm_weight=self.input_layernorm.weight,
+                post_attention_layernorm_weight=self.post_attention_layernorm.weight,
+            )
         full_num_tokens = positions.shape[-1]
         input_is_sequence_parallel = (
             self.use_attn_reduce_scatter_for_moe
@@ -507,12 +621,25 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        if validate_finite:
+            _validate_qwen3_next_finite(
+                self.layer_idx,
+                self.layer_type,
+                "input_layernorm",
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+
         if input_is_sequence_parallel:
             hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
             hidden_states = hidden_states[:full_num_tokens]
 
         if self.layer_type == "linear_attention":
+            if validate_finite and sentinel_weights is not None:
+                self.linear_attn._diagnostic_sentinel_weights = sentinel_weights
             hidden_states = self.linear_attn(hidden_states=hidden_states)
+            if validate_finite and sentinel_weights is not None:
+                del self.linear_attn._diagnostic_sentinel_weights
         elif self.layer_type == "full_attention":
             hidden_states = self.self_attn(
                 hidden_states=hidden_states,
@@ -520,6 +647,15 @@ class Qwen3NextDecoderLayer(nn.Module):
             )
         else:
             raise ValueError("Invalid layer_type")
+
+        if validate_finite:
+            _validate_qwen3_next_finite(
+                self.layer_idx,
+                self.layer_type,
+                "attention_output",
+                hidden_states=hidden_states,
+            )
+        validate_sentinel("after_attention_sentinel")
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -543,6 +679,15 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if validate_finite:
+            _validate_qwen3_next_finite(
+                self.layer_idx,
+                self.layer_type,
+                "post_attention_layernorm",
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        validate_sentinel("after_post_attention_layernorm_sentinel")
         if self.use_attn_reduce_scatter_for_moe:
             hidden_states = self.mlp(
                 hidden_states,
@@ -550,6 +695,16 @@ class Qwen3NextDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(hidden_states)
+
+        if validate_finite:
+            _validate_qwen3_next_finite(
+                self.layer_idx,
+                self.layer_type,
+                "mlp_output",
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        validate_sentinel("after_mlp_sentinel")
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -677,11 +832,44 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                     full_num_tokens,
                     self.config.hidden_size,
                 )
+            sentinel_weights = None
+            if os.environ.get("VLLM_QWEN3_NEXT_VALIDATE_FINITE", "0") == "1":
+                target_layer = int(
+                    os.environ.get(
+                        "VLLM_QWEN3_NEXT_VALIDATE_SENTINEL_LAYER", "10"
+                    )
+                )
+                if 0 <= target_layer < len(self.layers):
+                    target = self.layers[target_layer]
+                    sentinel_weights = (
+                        target.input_layernorm.weight,
+                        target.post_attention_layernorm.weight,
+                    )
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+                sentinel_weights=sentinel_weights,
             )
+            if os.environ.get("VLLM_QWEN3_NEXT_VALIDATE_FINITE", "0") == "1":
+                target_layer = int(
+                    os.environ.get(
+                        "VLLM_QWEN3_NEXT_VALIDATE_SENTINEL_LAYER", "10"
+                    )
+                )
+                if 0 <= target_layer < len(self.layers):
+                    target = self.layers[target_layer]
+                    _validate_qwen3_next_finite(
+                        layer_idx,
+                        layer.layer_type,
+                        f"after_layer_sentinel_{target_layer}",
+                        target_input_layernorm_weight=(
+                            target.input_layernorm.weight
+                        ),
+                        target_post_attention_layernorm_weight=(
+                            target.post_attention_layernorm.weight
+                        ),
+                    )
             if (layer_idx + 1) in self.aux_hidden_state_layers and hidden_states.shape[
                 0
             ] != full_num_tokens:

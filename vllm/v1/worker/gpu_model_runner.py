@@ -2381,8 +2381,19 @@ class GPUModelRunner(
             blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)
             return blk_table_tensor
 
+        def _get_block_table_cpu(kv_cache_gid: int):
+            kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
+            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                return torch.zeros((num_reqs_padded, 1), dtype=torch.int32)
+            block_table = self.input_batch.block_table[kv_cache_gid].get_cpu_tensor()[
+                :num_reqs_padded
+            ]
+            block_table[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)
+            return block_table
+
         assert slot_mappings is not None
         block_table_gid_0 = _get_block_table(0)
+        block_table_cpu_gid_0 = _get_block_table_cpu(0)
         slot_mapping_gid_0 = slot_mappings[0]
 
         if self.routed_experts_initialized:
@@ -2480,6 +2491,7 @@ class GPUModelRunner(
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
+            block_table_cpu=block_table_cpu_gid_0,
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
@@ -2611,6 +2623,7 @@ class GPUModelRunner(
             )
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
+                cm.block_table_cpu = _get_block_table_cpu(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:

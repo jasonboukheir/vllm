@@ -628,7 +628,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 kvarn_cfg = KVarNConfig.from_cache_dtype(
                     self.kv_cache_dtype, self.head_size
                 )
-                slot_bytes = kvarn_cfg.tile_bytes_aligned // kvarn_cfg.group
+                slot_bytes = kvarn_cfg.record_bytes // kvarn_cfg.group
                 return TQSlidingWindowSpec(
                     block_size=block_size,
                     num_kv_heads=self.num_kv_heads,
@@ -704,7 +704,7 @@ class Attention(nn.Module, AttentionLayerBase):
             # (a uint8 block of per-(token,head) "slots") is the same; only the
             # slot semantics differ. This gives the packed per-block page size
             # so vLLM allocates blocks at the compressed size.
-            slot_bytes = kvarn_cfg.tile_bytes_aligned // kvarn_cfg.group
+            slot_bytes = kvarn_cfg.record_bytes // kvarn_cfg.group
             return TQFullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
