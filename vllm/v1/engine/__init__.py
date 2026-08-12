@@ -91,6 +91,9 @@ class EngineCoreReadyResponse:
     # KV cache capacity (None for encoder-only/attention-free models).
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
+    # Resolved hybrid-cache logical block size. This may be changed by the
+    # worker platform after the frontend config has been copied.
+    mamba_block_size: int | None = None
     kv_events_config: KVEventsConfig | None = None
 
 

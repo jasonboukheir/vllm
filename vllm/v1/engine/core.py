@@ -1626,6 +1626,7 @@ class EngineCoreProc(EngineCore):
             kv_cache_max_concurrency=(
                 self.vllm_config.cache_config.kv_cache_max_concurrency
             ),
+            mamba_block_size=self.vllm_config.cache_config.mamba_block_size,
             tensor_parallel_size=parallel_config.tensor_parallel_size,
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             decode_context_parallel_size=parallel_config.decode_context_parallel_size,
