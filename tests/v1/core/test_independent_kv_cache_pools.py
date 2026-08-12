@@ -363,7 +363,9 @@ def _make_hybrid_spec_manager(num_spec_tokens: int = 2) -> KVCacheManager:
 
 
 def _make_align_mtp2_manager(
-    mamba_pool_blocks: int, attention_pool_blocks: int = 64
+    mamba_pool_blocks: int,
+    attention_pool_blocks: int = 64,
+    enable_caching: bool = False,
 ) -> KVCacheManager:
     config = KVCacheConfig(
         num_blocks=mamba_pool_blocks,
@@ -399,7 +401,7 @@ def _make_align_mtp2_manager(
         max_model_len=64,
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
-        enable_caching=False,
+        enable_caching=enable_caching,
         use_eagle=True,
     )
 
@@ -514,6 +516,73 @@ def test_attention_pool_supports_one_max_or_four_mixed_mtp2_requests():
         )
         is not None
         for request in mixed_requests
+    )
+
+
+def test_align_mtp2_prefix_hit_then_cancel_reclaims_private_states():
+    """A cached prefix is shared once; MTP scratch remains request-private."""
+    manager = _make_align_mtp2_manager(
+        mamba_pool_blocks=9,
+        attention_pool_blocks=9,
+        enable_caching=True,
+    )
+    token_ids = list(range(12))
+    first = make_request("first", token_ids, BLOCK_SIZE, sha256)
+
+    assert manager.allocate_slots(first, num_new_tokens=4) is not None
+    first.num_computed_tokens = 4
+    assert (
+        manager.allocate_slots(first, num_new_tokens=4, num_lookahead_tokens=2)
+        is not None
+    )
+    first.num_computed_tokens = 8
+    assert (
+        manager.allocate_slots(first, num_new_tokens=4, num_lookahead_tokens=2)
+        is not None
+    )
+    first.num_computed_tokens = 12
+    manager.free(first)
+
+    second = make_request("second", token_ids, BLOCK_SIZE, sha256)
+    cached, num_computed, shared_prefix_boundary = manager.get_computed_blocks(second)
+    assert num_computed == BLOCK_SIZE
+    assert all(group for group in cached.blocks)
+    second.shared_prefix_boundary = shared_prefix_boundary
+    cached_ids = [_ids(group) for group in cached.blocks]
+
+    manager.new_step_starts()
+    allocated = manager.allocate_slots(
+        second,
+        num_new_tokens=4,
+        num_new_computed_tokens=num_computed,
+        new_computed_blocks=cached,
+        num_lookahead_tokens=2,
+    )
+    assert allocated is not None
+    resident = manager.get_blocks(second.request_id).blocks
+    assert all(
+        set(cached_ids[i]).issubset(_ids(group))
+        for i, group in enumerate(resident)
+    )
+    assert len(set(_ids(resident[1])) - set(cached_ids[1])) <= 3
+    private_blocks = [
+        block
+        for i, group in enumerate(resident)
+        for block in group
+        if (block.pool_id, block.block_id) not in set(cached_ids[i])
+    ]
+
+    free_before_cancel = [pool.get_num_free_blocks() for pool in manager.block_pools]
+    manager.free(second)
+    free_after_cancel = [pool.get_num_free_blocks() for pool in manager.block_pools]
+    assert all(
+        after >= before
+        for before, after in zip(free_before_cancel, free_after_cancel)
+    )
+    assert all(block.ref_cnt == 0 for block in private_blocks)
+    assert all(
+        second.request_id not in single.req_to_blocks
+        for single in manager.coordinator.single_type_managers
     )
 
 
