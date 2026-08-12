@@ -2227,6 +2227,18 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                     "Invalid metadata format. Please use KEY=VALUE format."
                 )
 
+    # Reproducibility-critical workload and sampling parameters. These used to
+    # be present only in console output, which made saved artifacts named
+    # "seed0" impossible to distinguish from date-like seeds after the fact.
+    result_json["seed"] = args.seed
+    result_json["temperature"] = args.temperature
+    result_json["top_p"] = args.top_p
+    result_json["top_k"] = args.top_k
+    result_json["random_input_len"] = args.random_input_len
+    result_json["random_output_len"] = args.random_output_len
+    result_json["random_range_ratio"] = args.random_range_ratio
+    result_json["ignore_eos"] = args.ignore_eos
+
     # Traffic
     result_json["request_rate"] = (
         args.request_rate if args.request_rate < float("inf") else "inf"
