@@ -2129,6 +2129,14 @@ class GPUModelRunner(
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+        # Preserve ordinary CPU values before later device work is enqueued.
+        # Reading the pinned mirrors from an attention metadata builder can
+        # otherwise serialize against outstanding H2D traffic on XPU.
+        self._seq_lens_cpu_list = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            + num_scheduled_tokens
+        ).tolist()
+        self._query_lens_cpu_list = num_scheduled_tokens.tolist()
 
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
@@ -2478,6 +2486,21 @@ class GPUModelRunner(
                 self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded]
             )
 
+        seq_lens_cpu_list = None
+        query_lens_cpu_list = None
+        if (
+            not for_cudagraph_capture
+            and not self.use_async_spec_decode
+            and hasattr(self, "_seq_lens_cpu_list")
+            and hasattr(self, "_query_lens_cpu_list")
+        ):
+            seq_lens_cpu_list = self._seq_lens_cpu_list[:num_reqs] + [0] * (
+                num_reqs_padded - num_reqs
+            )
+            query_lens_cpu_list = self._query_lens_cpu_list[:num_reqs] + [0] * (
+                num_reqs_padded - num_reqs
+            )
+
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2485,6 +2508,8 @@ class GPUModelRunner(
             _seq_lens_cpu=seq_lens_cpu,
             _num_computed_tokens_cpu=num_computed_tokens_cpu,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            seq_lens_cpu_list=seq_lens_cpu_list,
+            query_lens_cpu_list=query_lens_cpu_list,
             replayssm_decode_base_cpu=replayssm_decode_base_cpu,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens_padded,

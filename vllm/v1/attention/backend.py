@@ -468,6 +468,16 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    seq_lens_cpu_list: list[int] | None = None
+    """CPU-native sequence lengths captured before device work is enqueued.
+
+    Backends that need Python scalar control flow can consume this without
+    reading pinned staging tensors after their asynchronous H2D copies start.
+    """
+
+    query_lens_cpu_list: list[int] | None = None
+    """CPU-native scheduled query lengths, paired with ``seq_lens_cpu_list``."""
+
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
     request index to list of (start, end) token position ranges
@@ -599,6 +609,12 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+            seq_lens_cpu_list=self.seq_lens_cpu_list[:num_actual_reqs]
+            if self.seq_lens_cpu_list is not None
+            else None,
+            query_lens_cpu_list=self.query_lens_cpu_list[:num_actual_reqs]
+            if self.query_lens_cpu_list is not None
+            else None,
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
         )
