@@ -313,7 +313,9 @@ def test_apply_ready_response_syncs_block_size():
 
     client = object.__new__(MPClient)
     client.vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=16, num_gpu_blocks=0),
+        cache_config=SimpleNamespace(
+            block_size=16, mamba_block_size=16, num_gpu_blocks=0
+        ),
         model_config=SimpleNamespace(max_model_len=8192),
     )
     client.stats_update_address = None
@@ -335,10 +337,12 @@ def test_apply_ready_response_syncs_block_size():
             max_num_seqs=256,
             max_num_batched_tokens=8192,
             instance_id="test-instance",
+            mamba_block_size=128,
         )
     )
     client._apply_ready_response(payload)
     assert client.vllm_config.cache_config.block_size == 1056
+    assert client.vllm_config.cache_config.mamba_block_size == 128
 
 
 def loop_until_done(client: EngineCoreClient, outputs: dict):
