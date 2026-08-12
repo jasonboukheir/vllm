@@ -886,12 +886,9 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     req_host[i] = b
                     seqlen_host[i] = full if non_causal else committed + j + 1
                     i += 1
-            # Uniform query length -> the shared-dequant verify kernel (the
-            # request's tokens share each block's dequant); this is always the
-            # case under uniform-batch graph capture. The shared kernel bakes
-            # the bottom-right causal staircase internally, so non-causal must
-            # fall back to the per-token path (which honours the flat per-row
-            # limit above) — force vq_qlen=0 in that case.
+            # Uniform qlen=3 identifies the native MTP2 verifier. Non-causal
+            # batches use the generic per-token plan, which honors the flat
+            # per-row limit above.
             vq_qlen = uniform if (uniform >= 2 and not non_causal) else 0
             vq_req_t = self._vq_req_buf[:num_decode_tokens]
             vq_seqlen_t = self._vq_seqlen_buf[:num_decode_tokens]
@@ -2786,7 +2783,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             kvarn_verify_attention,
         )
 
-        B = md.block_table.shape[0]
         return kvarn_verify_attention(
             q,
             kv_cache,
@@ -2798,7 +2794,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             md.vq_seqlen,
             max_ctx_blocks,
             qlen=md.vq_qlen,
-            seq_lens=md.seq_lens[:B],
         )
 
     def _fused_verify_path(
