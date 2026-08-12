@@ -958,13 +958,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.new_mamba_block_ids_to_zero:
+            for group_id, block_ids in scheduler_output.new_mamba_block_ids_to_zero:
+                group = self.kv_cache_config.kv_cache_groups[group_id]
+                if not isinstance(group.kv_cache_spec, MambaSpec):
+                    continue
+                indices = torch.tensor(
+                    sorted(set(block_ids)), dtype=torch.int64, device=self.device
+                )
+                seen_ptrs: set[int] = set()
+                for layer_name in group.layer_names:
+                    layer = self.compilation_config.static_forward_context[layer_name]
+                    for state in layer.kv_cache:
+                        ptr = state.data_ptr()
+                        if ptr in seen_ptrs:
+                            continue
+                        seen_ptrs.add(ptr)
+                        state.index_fill_(0, indices, 0)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
                 scheduler_output.kv_cache_block_copies,
             )
 

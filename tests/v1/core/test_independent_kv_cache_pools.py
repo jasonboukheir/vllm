@@ -406,6 +406,25 @@ def _make_align_mtp2_manager(
     )
 
 
+def test_mamba_zeroing_ids_remain_group_qualified_across_independent_pools():
+    manager = _make_align_mtp2_manager(mamba_pool_blocks=9)
+    request = _request("request", num_tokens=4)
+    blocks = manager.allocate_slots(
+        request, num_new_tokens=4, num_lookahead_tokens=2
+    )
+    assert blocks is not None
+
+    # Attention IDs keep using the existing flat zeroing stream. Recurrent
+    # IDs retain group ownership because local IDs overlap across pools.
+    assert manager.take_new_block_ids()
+    mamba = manager.take_new_mamba_block_ids()
+    assert len(mamba) == 1
+    group_id, block_ids = mamba[0]
+    assert group_id == 1
+    assert block_ids
+    assert set(block_ids).isdisjoint({0})
+
+
 def test_align_mtp2_pool_reserves_null_before_two_request_admission():
     """Two four-state bundles need nine physical blocks, not eight."""
     insufficient = _make_align_mtp2_manager(mamba_pool_blocks=8)

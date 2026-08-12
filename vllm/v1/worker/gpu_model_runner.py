@@ -1191,11 +1191,48 @@ class GPUModelRunner(
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=self.compilation_config.static_forward_context,
         )
+        # Block zero is reserved as the null/sentinel page in every physical
+        # pool.  Graph padding and unused block-table entries may read it, so
+        # initialize it once before warmup/capture.  Ordinary request pages are
+        # zeroed only through the scheduler's fresh-allocation streams; a new
+        # request's block table can contain shared prefix-cache pages and must
+        # never be treated as an ownership boundary.
+        self._zero_block_ids([NULL_BLOCK_ID])
+        self._zero_mamba_block_ids(
+            [
+                (group_id, [NULL_BLOCK_ID])
+                for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ]
+        )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
+
+    def _zero_mamba_block_ids(
+        self, blocks_by_group: list[tuple[int, list[int]]]
+    ) -> None:
+        """Zero newly allocated recurrent states without crossing pool owners."""
+        for group_id, block_ids in blocks_by_group:
+            if not block_ids:
+                continue
+            group = self.kv_cache_config.kv_cache_groups[group_id]
+            if not isinstance(group.kv_cache_spec, MambaSpec):
+                continue
+            indices = async_tensor_h2d(
+                sorted(set(block_ids)), device=self.device, dtype=torch.int64
+            )
+            seen_ptrs: set[int] = set()
+            for layer_name in group.layer_names:
+                layer = self.compilation_config.static_forward_context[layer_name]
+                for state in layer.kv_cache:
+                    ptr = state.data_ptr()
+                    if ptr in seen_ptrs:
+                        continue
+                    seen_ptrs.add(ptr)
+                    state.index_fill_(0, indices, 0)
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -1261,10 +1298,12 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.new_mamba_block_ids_to_zero:
+            self._zero_mamba_block_ids(scheduler_output.new_mamba_block_ids_to_zero)
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
                 scheduler_output.kv_cache_block_copies,
             )
 

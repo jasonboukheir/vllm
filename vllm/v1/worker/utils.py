@@ -592,42 +592,51 @@ def bind_kv_cache(
 
 
 def copy_kv_cache_blocks_inplace(
-    kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
-    num_blocks: int,
+    kv_cache_config: KVCacheConfig,
+    forward_context: Mapping[str, Attention],
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
 ) -> None:
     if not kv_cache_block_copies:
         return
 
-    storage_tensors: list[torch.Tensor] = []
-    seen_storage: set[int] = set()
-    for entry in kv_caches:
-        # Mamba layers hold a list of state tensors; attention layers a single
-        # tensor. Both alias the shared block-major backing storage.
-        tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
-        for tensor in tensors:
-            ptr = tensor.untyped_storage().data_ptr()
-            if ptr in seen_storage:
-                continue
-            seen_storage.add(ptr)
-            storage_tensors.append(tensor)
+    copies_by_pool: defaultdict[int, list[tuple[int, int]]] = defaultdict(list)
+    for copy in kv_cache_block_copies:
+        copies_by_pool[kv_cache_config.pool_id_for_group(copy.group_id)].append(
+            (copy.src_block_id, copy.dst_block_id)
+        )
 
-    if not storage_tensors:
-        return
-    device = storage_tensors[0].device
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
-    indices = async_tensor_h2d(indices_np, device=device)
-    src_indices, dst_indices = indices.unbind(dim=1)
+    assert kv_cache_config.kv_cache_pools is not None
+    for pool_id, copies in copies_by_pool.items():
+        pool = kv_cache_config.kv_cache_pools[pool_id]
+        storage_tensors: list[torch.Tensor] = []
+        seen_storage: set[int] = set()
+        for group_id in pool.group_ids:
+            group = kv_cache_config.kv_cache_groups[group_id]
+            for layer_name in group.layer_names:
+                entry = forward_context[layer_name].kv_cache
+                tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
+                for tensor in tensors:
+                    ptr = tensor.untyped_storage().data_ptr()
+                    if ptr in seen_storage:
+                        continue
+                    seen_storage.add(ptr)
+                    storage_tensors.append(tensor)
 
-    for tensor in storage_tensors:
-        assert tensor.device == device
-        blocks = torch.empty(0, dtype=torch.uint8, device=device)
-        blocks.set_(tensor.untyped_storage())
-        # Block-major backing storage: block i owns the contiguous byte range
-        # [i * page_size, (i + 1) * page_size).
-        assert blocks.numel() % num_blocks == 0
-        blocks = blocks.view(num_blocks, -1)
-        blocks[dst_indices] = blocks[src_indices]
+        if not storage_tensors:
+            continue
+        device = storage_tensors[0].device
+        indices = async_tensor_h2d(
+            np.asarray(copies, dtype=np.int64), device=device
+        )
+        src_indices, dst_indices = indices.unbind(dim=1)
+        for tensor in storage_tensors:
+            assert tensor.device == device
+            blocks = torch.empty(0, dtype=torch.uint8, device=device)
+            blocks.set_(tensor.untyped_storage())
+            # Each independent pool has its own block count and page geometry.
+            assert blocks.numel() % pool.num_blocks == 0
+            blocks = blocks.view(pool.num_blocks, -1)
+            blocks[dst_indices] = blocks[src_indices]
 
 
 def is_residual_scattered_for_sp(

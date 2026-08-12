@@ -911,7 +911,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             vq_seqlen_t = self._vq_seqlen_buf[:num_decode_tokens]
             vq_req_t.copy_(req_host[:num_decode_tokens], non_blocking=True)
             vq_seqlen_t.copy_(seqlen_host[:num_decode_tokens], non_blocking=True)
-
         # A fresh event generation guards this host slot until both async H2D
         # copies have consumed it. Re-recording an old event changed qlen-3
         # acceptance in serving and is therefore intentionally avoided.
@@ -2931,6 +2930,20 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             and B > 0
         ):
             return self._fused_verify_path(q, kv_cache, md)
+        use_native_chunk_prefill = (
+            os.environ.get("KVARN_NATIVE_XPU_CHUNK_PREFILL", "0") == "1"
+            and q.device.type == "xpu"
+            and self.num_heads == 24
+            and self.num_kv_heads == 4
+            and self.head_size == 256
+            and self.kvarn_config.group == 128
+            and self.kvarn_config.key_bits == 4
+            and self.kvarn_config.value_bits == 4
+            and getattr(md, "causal", True)
+            and hasattr(torch.ops._vllm_fa2_C, "kvarn_chunk_prefill")
+        )
+        if use_native_chunk_prefill:
+            return self._native_chunk_prefill_path(q, kv_cache, md)
         if not _HAS_FLASH_ATTN or self.head_size > 256 or self._fa_K_buf is None:
             return self._decode_path_slow(q, kv_cache, md)
 
@@ -2948,48 +2961,72 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         max_blocks = min((max_k + group - 1) // group, md.block_table.shape[1])
         max_blocks = max(max_blocks, 1)
 
-        from vllm.v1.attention.ops.triton_kvarn_decode import (
-            _kvarn_build_packed_kv_kernel,
-        )
-
         K_packed = self._fa_K_buf
         V_packed = self._fa_V_buf
-        _kvarn_build_packed_kv_kernel[(B * max_blocks, Hk)](
-            md.block_table,
-            seq_lens,
-            cu_k,
-            self._block_to_slot_t,
-            kv_cache,
-            self._tail_K_pool,
-            self._tail_V_pool,
-            K_packed,
-            V_packed,
-            md.block_table.stride(0),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            self._tail_K_pool.stride(0),
-            self._tail_K_pool.stride(1),
-            self._tail_K_pool.stride(2),
-            K_packed.stride(0),
-            K_packed.stride(1),
-            MAX_BLOCKS_PER_REQ=max_blocks,
-            D=D,
-            GROUP=group,
-            K_BITS=cfg.key_bits,
-            V_BITS=cfg.value_bits,
-            NUM_BLOCKS_LOOKUP=self._block_lookup_size,
-            K_PACKED_OFFSET=cfg.k_packed_offset,
-            K_S_COL_OFFSET=cfg.k_s_col_offset,
-            K_ZP_OFFSET=cfg.k_zp_offset,
-            K_S_ROW_OFFSET=cfg.k_s_row_offset,
-            V_PACKED_OFFSET=cfg.v_packed_offset,
-            V_S_COL_OFFSET=cfg.v_s_col_offset,
-            V_S_ROW_OFFSET=cfg.v_s_row_offset,
-            V_ZP_OFFSET=cfg.v_zp_offset,
-            DPAS_LAYOUT=self._dpas_layout,
-            num_warps=4,
-            num_stages=2,
+        use_native_materialize = (
+            os.environ.get("KVARN_NATIVE_XPU_MATERIALIZE", "0") == "1"
+            and q.device.type == "xpu"
+            and D == 256
+            and Hk == 4
+            and group == 128
+            and cfg.key_bits == 4
+            and cfg.value_bits == 4
+            and hasattr(torch.ops._vllm_fa2_C, "kvarn_materialize_packed_kv")
         )
+        if use_native_materialize:
+            torch.ops._vllm_fa2_C.kvarn_materialize_packed_kv(
+                kv_cache,
+                md.block_table,
+                seq_lens,
+                cu_k,
+                self._block_to_slot_t,
+                self._tail_K_pool,
+                self._tail_V_pool,
+                K_packed,
+                V_packed,
+                max_k,
+            )
+        else:
+            from vllm.v1.attention.ops.triton_kvarn_decode import (
+                _kvarn_build_packed_kv_kernel,
+            )
+
+            _kvarn_build_packed_kv_kernel[(B * max_blocks, Hk)](
+                md.block_table,
+                seq_lens,
+                cu_k,
+                self._block_to_slot_t,
+                kv_cache,
+                self._tail_K_pool,
+                self._tail_V_pool,
+                K_packed,
+                V_packed,
+                md.block_table.stride(0),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                self._tail_K_pool.stride(0),
+                self._tail_K_pool.stride(1),
+                self._tail_K_pool.stride(2),
+                K_packed.stride(0),
+                K_packed.stride(1),
+                MAX_BLOCKS_PER_REQ=max_blocks,
+                D=D,
+                GROUP=group,
+                K_BITS=cfg.key_bits,
+                V_BITS=cfg.value_bits,
+                NUM_BLOCKS_LOOKUP=self._block_lookup_size,
+                K_PACKED_OFFSET=cfg.k_packed_offset,
+                K_S_COL_OFFSET=cfg.k_s_col_offset,
+                K_ZP_OFFSET=cfg.k_zp_offset,
+                K_S_ROW_OFFSET=cfg.k_s_row_offset,
+                V_PACKED_OFFSET=cfg.v_packed_offset,
+                V_S_COL_OFFSET=cfg.v_s_col_offset,
+                V_S_ROW_OFFSET=cfg.v_s_row_offset,
+                V_ZP_OFFSET=cfg.v_zp_offset,
+                DPAS_LAYOUT=self._dpas_layout,
+                num_warps=4,
+                num_stages=2,
+            )
 
         # The packed K/V are in the rotated frame (the store path rotates before
         # quantizing / pooling), so rotate q in and un-rotate the output — same
@@ -3012,6 +3049,49 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             causal=getattr(md, "causal", True),
         )
         return torch.mm(out_rot.reshape(-1, D), H16).view(n_tok, self.num_heads, D)
+
+    def _native_chunk_prefill_path(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+    ) -> torch.Tensor:
+        """Attend a multi-token continuation directly from compact pages.
+
+        Unlike materialize+FA, this tiled kernel never constructs an fp16 copy
+        of the full prefix. A 256-row query tile reuses every reconstructed
+        64-token K/V tile across its query rows, avoiding quadratic prefix
+        traffic across scheduler chunks while retaining bottom-right causal
+        continuation semantics.
+        """
+        md = attn_metadata
+        batch = md.block_table.shape[0]
+        D = self.head_size
+        H16 = (
+            self._H_fp16
+            if self._H_fp16 is not None
+            else self._hadamard(q.device).to(torch.float16)
+        )
+        n_tok = q.shape[0]
+        q_rot = torch.mm(q.reshape(-1, D), H16).view(n_tok, self.num_heads, D)
+        out_rot = torch.empty_like(q_rot)
+        torch.ops._vllm_fa2_C.kvarn_chunk_prefill(
+            q_rot,
+            kv_cache,
+            md.block_table,
+            md.seq_lens[:batch].to(torch.int32),
+            md.query_start_loc[: batch + 1].to(torch.int32),
+            self._block_to_slot_t,
+            self._tail_K_pool,
+            self._tail_V_pool,
+            out_rot,
+            md.max_query_len,
+            md.max_seq_len,
+            self.scale,
+        )
+        return torch.mm(out_rot.reshape(-1, D), H16).view(
+            n_tok, self.num_heads, D
+        )
 
     def _mixed_batch_path(
         self,

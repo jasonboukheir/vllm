@@ -40,6 +40,7 @@ def test_mamba_align_split_partial_tail_schedule():
     hash_block_size = 32
     mock = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
+        block_size=block_size,
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
@@ -84,6 +85,7 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
     prompt_length = 30000
     mock = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
+        block_size=block_size,
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle=False,
@@ -120,6 +122,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
     prompt_length = 1300
     mock = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
+        block_size=block_size,
         max_num_scheduled_tokens=token_budget,
         scheduler_config=SimpleNamespace(
             long_prefill_token_threshold=long_prefill_threshold
@@ -218,6 +221,7 @@ def test_hybrid_mamba_align_partial_hash_hit():
         KVCacheBlockCopy(
             src_block_id=partial_mamba_block[0].block_id,
             dst_block_id=mamba_new_block_ids[0],
+            group_id=1,
         )
         in copies
     )
@@ -662,6 +666,7 @@ def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
         KVCacheBlockCopy(
             src_block_id=moved_block_id,
             dst_block_id=mamba_new_block_ids[0],
+            group_id=1,
         )
         in copies
     )
