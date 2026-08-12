@@ -362,11 +362,78 @@ def _make_hybrid_spec_manager(num_spec_tokens: int = 2) -> KVCacheManager:
     )
 
 
+def _make_align_mtp2_manager(mamba_pool_blocks: int) -> KVCacheManager:
+    config = KVCacheConfig(
+        num_blocks=mamba_pool_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full_layer"],
+                FullAttentionSpec(
+                    block_size=BLOCK_SIZE,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba_layer"],
+                MambaSpec(
+                    block_size=BLOCK_SIZE,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_speculative_blocks=2,
+                ),
+            ),
+        ],
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=64, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=mamba_pool_blocks, group_ids=[1]),
+        ],
+    )
+    return KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=64,
+        scheduler_block_size=BLOCK_SIZE,
+        hash_block_size=BLOCK_SIZE,
+        enable_caching=False,
+        use_eagle=True,
+    )
+
+
+def test_align_mtp2_pool_reserves_null_before_two_request_admission():
+    """Two four-state bundles need nine physical blocks, not eight."""
+    insufficient = _make_align_mtp2_manager(mamba_pool_blocks=8)
+    sufficient = _make_align_mtp2_manager(mamba_pool_blocks=9)
+
+    for manager, second_admitted in ((insufficient, False), (sufficient, True)):
+        first = _request("first", num_tokens=4)
+        second = _request("second", num_tokens=4)
+        assert (
+            manager.allocate_slots(first, num_new_tokens=4, num_lookahead_tokens=2)
+            is not None
+        )
+        assert (
+            manager.allocate_slots(second, num_new_tokens=4, num_lookahead_tokens=2)
+            is not None
+        )
+
+        first.num_computed_tokens = second.num_computed_tokens = 4
+        manager.new_step_starts()
+        assert (
+            manager.allocate_slots(first, num_new_tokens=1, num_lookahead_tokens=2)
+            is not None
+        )
+        allocated = manager.allocate_slots(
+            second, num_new_tokens=1, num_lookahead_tokens=2
+        )
+        assert (allocated is not None) is second_admitted
+
+
 @pytest.mark.parametrize("num_spec_tokens", [0, 1, 2])
 @pytest.mark.parametrize("context_len", [1, 31, 63, 64])
-def test_mamba_none_memory_is_context_invariant(
-    num_spec_tokens: int, context_len: int
-):
+def test_mamba_none_memory_is_context_invariant(num_spec_tokens: int, context_len: int):
     """Mode=none costs one running state plus gamma scratch states.
 
     Unlike full attention, recurrent cache residency must not scale with the
@@ -378,11 +445,14 @@ def test_mamba_none_memory_is_context_invariant(
     request = _request("context", num_tokens=context_len)
     initial_mamba_free = manager.block_pools[1].get_num_free_blocks()
 
-    assert manager.allocate_slots(
-        request,
-        num_new_tokens=context_len,
-        num_lookahead_tokens=num_spec_tokens,
-    ) is not None
+    assert (
+        manager.allocate_slots(
+            request,
+            num_new_tokens=context_len,
+            num_lookahead_tokens=num_spec_tokens,
+        )
+        is not None
+    )
     mamba_blocks = manager.get_blocks(request.request_id).blocks[1]
 
     assert len(mamba_blocks) == 1 + num_spec_tokens
@@ -426,9 +496,7 @@ def test_mtp2_hybrid_pools_keep_one_committed_and_two_draft_states():
     # full-attention lookahead page and all recurrent state slots. In
     # particular state_ids[0] remains the shared committed s0.
     request.num_computed_tokens = 3
-    reused = manager.allocate_slots(
-        request, num_new_tokens=1, num_lookahead_tokens=2
-    )
+    reused = manager.allocate_slots(request, num_new_tokens=1, num_lookahead_tokens=2)
     assert reused is not None
     assert all(not group for group in reused.blocks)
     full_after, states_after = manager.get_blocks(request.request_id).blocks
@@ -442,9 +510,10 @@ def test_mtp2_reject_scratch_is_reclaimed_when_request_finishes():
     request = _request("mtp2", num_tokens=3)
     initial_free = [pool.get_num_free_blocks() for pool in manager.block_pools]
 
-    assert manager.allocate_slots(
-        request, num_new_tokens=3, num_lookahead_tokens=2
-    ) is not None
+    assert (
+        manager.allocate_slots(request, num_new_tokens=3, num_lookahead_tokens=2)
+        is not None
+    )
     request.num_computed_tokens = 3  # both speculative tokens rejected
 
     # Reject does not eagerly churn allocations: scratch is safe to overwrite

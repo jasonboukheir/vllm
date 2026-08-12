@@ -1511,13 +1511,17 @@ def test_compact_kvarn_and_mamba_keep_independent_physical_pages():
         ),
         model_config=SimpleNamespace(max_model_len=8192),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
     )
     assert compact.page_size_bytes == 140_288
     assert mamba.page_size_bytes == 3_207_168
 
     bytes_per_request = 64 * compact.page_size_bytes + mamba.page_size_bytes
+    null_bytes = sum(
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in groups
+    )
     config = kv_cache_utils.get_kv_cache_config_from_groups(
-        vllm_config, groups, available_memory=2 * bytes_per_request
+        vllm_config, groups, available_memory=2 * bytes_per_request + null_bytes
     )
 
     assert config.has_independent_kv_cache_pools
@@ -1527,10 +1531,10 @@ def test_compact_kvarn_and_mamba_keep_independent_physical_pages():
         140_288,
         3_207_168,
     ]
-    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [128, 2]
+    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [129, 3]
     assert [tensor.size for tensor in config.kv_cache_tensors] == [
-        128 * 140_288,
-        2 * 3_207_168,
+        129 * 140_288,
+        3 * 3_207_168,
     ]
 
 
@@ -1548,6 +1552,7 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_request_capacity():
         ),
         model_config=SimpleNamespace(max_model_len=8192),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=3),
     )
     blocks_per_request = [
         cdiv(
@@ -1561,22 +1566,25 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_request_capacity():
         for group, num_blocks in zip(groups, blocks_per_request)
     )
 
+    null_bytes = sum(
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in groups
+    )
     config = kv_cache_utils.get_kv_cache_config_from_groups(
         vllm_config,
         groups,
-        available_memory=bytes_per_request * 3,
+        available_memory=bytes_per_request * 3 + null_bytes,
     )
 
     assert blocks_per_request == [64, 3]
-    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [192, 9]
-    assert config.num_blocks == 9
+    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [193, 10]
+    assert config.num_blocks == 10
     assert [tensor.size for tensor in config.kv_cache_tensors] == [
-        groups[0].kv_cache_spec.page_size_bytes * 192,
-        groups[0].kv_cache_spec.page_size_bytes * 192,
-        groups[1].kv_cache_spec.page_size_bytes * 9,
+        groups[0].kv_cache_spec.page_size_bytes * 193,
+        groups[0].kv_cache_spec.page_size_bytes * 193,
+        groups[1].kv_cache_spec.page_size_bytes * 10,
     ]
     assert sum(tensor.size for tensor in config.kv_cache_tensors) == (
-        bytes_per_request * 3
+        bytes_per_request * 3 + null_bytes
     )
     assert (
         kv_cache_utils.get_max_concurrency_for_kv_cache_config(vllm_config, config) == 3
@@ -1610,6 +1618,7 @@ def test_kvarn_prefix_aligned_pool_uses_only_resident_mamba_states():
         ),
         model_config=SimpleNamespace(max_model_len=8192),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
     )
     # Full attention retains 64 token pages. Align-mode Mamba exposes 66
     # position-indexed block-table columns, but only two running states plus
@@ -1621,14 +1630,85 @@ def test_kvarn_prefix_aligned_pool_uses_only_resident_mamba_states():
         for group, blocks in zip(groups, resident_blocks)
     )
 
+    null_bytes = sum(
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in groups
+    )
     config = kv_cache_utils.get_kv_cache_config_from_groups(
-        vllm_config, groups, available_memory=bytes_per_request * 2
+        vllm_config, groups, available_memory=bytes_per_request * 2 + null_bytes
     )
 
-    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [128, 8]
+    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [129, 9]
     assert (
         kv_cache_utils.get_max_concurrency_for_kv_cache_config(vllm_config, config) == 2
     )
+
+
+def test_kvarn_mamba_capacity_tracks_max_num_seqs_not_max_context_bundles():
+    """Recurrent concurrency and attention token capacity are independent."""
+    groups = [
+        KVCacheGroupSpec(["full.0"], new_kv_cache_spec(block_size=128)),
+        KVCacheGroupSpec(
+            ["mamba.0"],
+            new_mamba_spec(
+                block_size=128,
+                mamba_cache_mode="align",
+                num_speculative_blocks=2,
+            ),
+        ),
+    ]
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v4_g128",
+            num_gpu_blocks_override=None,
+            mamba_cache_mode="align",
+        ),
+        model_config=SimpleNamespace(max_model_len=8192),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=6),
+    )
+    attention_block_bytes = groups[0].kv_cache_spec.page_size_bytes
+    mamba_block_bytes = groups[1].kv_cache_spec.page_size_bytes
+    available_memory = 101 * attention_block_bytes + 25 * mamba_block_bytes
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, available_memory=available_memory
+    )
+
+    # One null plus 6 * (2 align states + 2 MTP states).
+    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == [101, 25]
+    assert get_max_concurrency_for_kv_cache_config(vllm_config, config) == 1.5625
+
+
+def test_kvarn_mamba_reservation_preserves_one_max_context_request():
+    groups = [
+        KVCacheGroupSpec(["full.0"], new_kv_cache_spec(block_size=128)),
+        KVCacheGroupSpec(
+            ["mamba.0"],
+            new_mamba_spec(
+                block_size=128,
+                mamba_cache_mode="align",
+                num_speculative_blocks=2,
+            ),
+        ),
+    ]
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v4_g128",
+            num_gpu_blocks_override=None,
+            mamba_cache_mode="align",
+        ),
+        model_config=SimpleNamespace(max_model_len=8192),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=6),
+    )
+    attention_block_bytes = groups[0].kv_cache_spec.page_size_bytes
+    mamba_block_bytes = groups[1].kv_cache_spec.page_size_bytes
+    available_memory = 64 * attention_block_bytes + 25 * mamba_block_bytes
+
+    with pytest.raises(ValueError, match="capacity 8064 tokens, required 8192"):
+        kv_cache_utils.get_kv_cache_config_from_groups(
+            vllm_config, groups, available_memory=available_memory
+        )
 
 
 @pytest.mark.parametrize("max_model_len", [128, 8192, 114688])
@@ -1862,8 +1942,8 @@ def test_get_max_concurrency_for_kv_cache_config():
             KVCacheGroupSpec(["layer_2"], full_attention_spec),
         ],
         kv_cache_pools=[
-            KVCachePoolSpec(num_blocks=1153 * 3, group_ids=[0, 1]),
-            KVCachePoolSpec(num_blocks=1024 * 4, group_ids=[2]),
+            KVCachePoolSpec(num_blocks=1153 * 3 + 1, group_ids=[0, 1]),
+            KVCachePoolSpec(num_blocks=1024 * 4 + 1, group_ids=[2]),
         ],
     )
     assert (
