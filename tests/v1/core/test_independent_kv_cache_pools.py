@@ -431,6 +431,38 @@ def test_align_mtp2_pool_reserves_null_before_two_request_admission():
         assert (allocated is not None) is second_admitted
 
 
+def test_align_mtp2_acceptance_lengths_keep_request_states_isolated():
+    manager = _make_align_mtp2_manager(mamba_pool_blocks=9)
+    requests = [_request("first", num_tokens=4), _request("second", num_tokens=4)]
+    for request in requests:
+        assert (
+            manager.allocate_slots(request, num_new_tokens=4, num_lookahead_tokens=2)
+            is not None
+        )
+        request.num_computed_tokens = 4
+
+    for accepted_by_request in ((1, 3), (2, 1), (3, 2)):
+        manager.new_step_starts()
+        state_ids_by_request = []
+        for request, accepted in zip(requests, accepted_by_request):
+            request.num_computed_tokens += accepted
+            assert (
+                manager.allocate_slots(
+                    request, num_new_tokens=1, num_lookahead_tokens=2
+                )
+                is not None
+            )
+            state_blocks = manager.get_blocks(request.request_id).blocks[1]
+            state_ids = {block.block_id for block in state_blocks if not block.is_null}
+            assert len(state_ids) <= 4
+            state_ids_by_request.append(state_ids)
+        assert state_ids_by_request[0].isdisjoint(state_ids_by_request[1])
+
+    for request in requests:
+        manager.free(request)
+    assert manager.block_pools[1].get_num_free_blocks() == 8
+
+
 @pytest.mark.parametrize("num_spec_tokens", [0, 1, 2])
 @pytest.mark.parametrize("context_len", [1, 31, 63, 64])
 def test_mamba_none_memory_is_context_invariant(num_spec_tokens: int, context_len: int):
