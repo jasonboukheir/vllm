@@ -5879,6 +5879,89 @@ def test_independent_hybrid_prefix_chunks_at_common_physical_boundary(
     )
 
 
+def test_scheduler_admits_b4_mtp2_then_reuses_cancelled_independent_bundle():
+    """Scheduler admission honors separate attention and recurrent pools."""
+    base = create_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        max_model_len=64,
+        block_size=4,
+        num_speculative_tokens=2,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=17,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attention"],
+                FullAttentionSpec(
+                    block_size=4,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=4,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_speculative_blocks=2,
+                ),
+            ),
+        ],
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=18, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=17, group_ids=[1]),
+        ],
+    )
+    scheduler = Scheduler(
+        vllm_config=base.vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(base.vllm_config),
+        block_size=4,
+        hash_block_size=4,
+        log_stats=True,
+    )
+    requests = create_requests(
+        num_requests=4,
+        num_tokens=4,
+        max_tokens=4,
+        block_size=4,
+        req_ids=[f"request-{i}" for i in range(4)],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {
+        request.request_id for request in requests
+    }
+    assert len(scheduler.running) == 4
+
+    cancelled = requests[1]
+    scheduler.finish_requests(cancelled.request_id, RequestStatus.FINISHED_ABORTED)
+    assert cancelled.request_id not in scheduler.requests
+    assert all(
+        cancelled.request_id not in single.req_to_blocks
+        for single in scheduler.kv_cache_manager.coordinator.single_type_managers
+    )
+
+    [replacement] = create_requests(
+        num_requests=1,
+        num_tokens=4,
+        max_tokens=4,
+        block_size=4,
+        req_ids=["replacement"],
+    )
+    scheduler.add_request(replacement)
+    replacement_output = scheduler.schedule()
+    assert replacement.request_id in replacement_output.num_scheduled_tokens
+    assert len(scheduler.running) == 4
+
+
 def _make_encoder_instance_request(scheduler, text_prefix=8, image_tokens=16):
     """One request whose image sits after some text, as an EPD proxy sends it.
 
