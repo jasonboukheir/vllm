@@ -182,6 +182,9 @@ class KVCacheBlock:
 class KVCacheBlockCopy(NamedTuple):
     src_block_id: int
     dst_block_id: int
+    # Block IDs are local to a physical cache pool.  The originating group
+    # identifies that pool; group 0 preserves the legacy single-pool ABI.
+    group_id: int = 0
 
 
 class FreeKVCacheBlockQueue:

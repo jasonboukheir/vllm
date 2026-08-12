@@ -488,6 +488,34 @@ def test_update_states_new_request(model_runner, dist_init):
     assert _is_req_state_block_table_match(model_runner, req_id)
 
 
+def test_update_states_does_not_zero_shared_prefix_blocks_on_admission(
+    model_runner, dist_init
+):
+    """A new request's block table can contain shared prefix-cache pages."""
+    model_runner._zero_block_ids = Mock()
+    model_runner._zero_mamba_block_ids = Mock()
+    scheduler_output = _schedule_new_request("prefix-hit")
+
+    model_runner._update_states(scheduler_output)
+
+    # Only scheduler-reported fresh allocations may be initialized.  Zeroing
+    # every block in NewRequestData would erase any shared prefix pages.
+    model_runner._zero_block_ids.assert_not_called()
+    model_runner._zero_mamba_block_ids.assert_not_called()
+
+
+def test_init_kv_zero_meta_initializes_null_pages_once(model_runner, monkeypatch):
+    zeroer = Mock()
+    monkeypatch.setattr(gpu_model_runner_module, "KVBlockZeroer", Mock(return_value=zeroer))
+    model_runner._zero_block_ids = Mock()
+    model_runner._zero_mamba_block_ids = Mock()
+
+    model_runner._init_kv_zero_meta()
+
+    model_runner._zero_block_ids.assert_called_once_with([0])
+    model_runner._zero_mamba_block_ids.assert_called_once_with([])
+
+
 def test_update_states_request_finished(model_runner, dist_init):
     req_id = "req_0"
 

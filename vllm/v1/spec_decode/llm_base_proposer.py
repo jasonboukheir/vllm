@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import (
     CUDAGraphMode,
@@ -66,6 +67,41 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _debug_log_nonfinite(stage: str, tensor: torch.Tensor) -> None:
+    """Synchronizing diagnostic enabled by the existing NaN debug switch."""
+    if not envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+        return
+    nonfinite = (~torch.isfinite(tensor)).sum().item()
+    logger.warning(
+        "MTP finite trace: stage=%s shape=%s nonfinite=%d",
+        stage,
+        tuple(tensor.shape),
+        nonfinite,
+    )
+
+
+def _invalidate_rejected_sequence_cpu_metadata(
+    common_attn_metadata: CommonAttentionMetadata,
+) -> None:
+    """Discard host sequence lengths after device-side rejection adjustment."""
+    common_attn_metadata._seq_lens_cpu = None
+    common_attn_metadata.seq_lens_cpu_list = None
+    common_attn_metadata._num_computed_tokens_cpu = None
+
+
+def _advance_single_token_draft_cpu_metadata(
+    common_attn_metadata: CommonAttentionMetadata, batch_size: int
+) -> None:
+    """Keep exact host metadata aligned with one autoregressive draft step."""
+    common_attn_metadata.query_lens_cpu_list = [1] * batch_size
+    if common_attn_metadata._seq_lens_cpu is not None:
+        common_attn_metadata._seq_lens_cpu += 1
+    if common_attn_metadata.seq_lens_cpu_list is not None:
+        common_attn_metadata.seq_lens_cpu_list = [
+            seq_len + 1 for seq_len in common_attn_metadata.seq_lens_cpu_list
+        ]
 
 
 class SpecDecodeBaseProposer:
@@ -525,6 +561,7 @@ class SpecDecodeBaseProposer:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
+        _debug_log_nonfinite("target_hidden_states", target_hidden_states)
 
         if self.method in ("eagle3", "dflash"):
             model = self.model
@@ -596,6 +633,9 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
+
+        _debug_log_nonfinite("draft_forward_0_last", last_hidden_states)
+        _debug_log_nonfinite("draft_forward_0_feedback", hidden_states)
 
         # After step 0: switch to reuse mode so steps 1+ skip the indexer
         # and read the indices that step 0 just wrote into the shared buffer.
@@ -676,9 +716,9 @@ class SpecDecodeBaseProposer:
         # (i.e., not the first proposal).
         if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
-            # Invalidate the CPU-side shadows to avoid H<>D sync.
-            common_attn_metadata._seq_lens_cpu = None
-            common_attn_metadata._num_computed_tokens_cpu = None
+            # The exact adjustment remains on-device; stale host-native fields
+            # must not drive draft attention allocation or page selection.
+            _invalidate_rejected_sequence_cpu_metadata(common_attn_metadata)
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
@@ -754,6 +794,13 @@ class SpecDecodeBaseProposer:
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
 
+            _debug_log_nonfinite(
+                f"draft_forward_{token_index + 1}_last", last_hidden_states
+            )
+            _debug_log_nonfinite(
+                f"draft_forward_{token_index + 1}_feedback", hidden_states
+            )
+
             hidden_states = hidden_states[:batch_size]
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 last_hidden_states[:batch_size], sampling_metadata
@@ -812,8 +859,7 @@ class SpecDecodeBaseProposer:
             self.max_model_len,
         )
 
-        if common_attn_metadata._seq_lens_cpu is not None:
-            common_attn_metadata._seq_lens_cpu += 1
+        _advance_single_token_draft_cpu_metadata(common_attn_metadata, batch_size)
         if common_attn_metadata._num_computed_tokens_cpu is not None:
             common_attn_metadata._num_computed_tokens_cpu += 1
         if common_attn_metadata.seq_lens_cpu_upper_bound is not None:

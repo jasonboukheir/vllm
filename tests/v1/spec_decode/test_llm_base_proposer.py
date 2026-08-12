@@ -110,3 +110,30 @@ def test_draft_layer_iteration_is_deterministic(monkeypatch: pytest.MonkeyPatch)
         assert len(proposer.draft_attn_groups) == 1
         assert proposer.draft_attn_groups[0].layer_names == expected_order
         assert proposer.block_size == KERNEL_BLOCK_SIZE
+
+
+def test_rejected_sequence_metadata_invalidates_cpu_native_lengths():
+    metadata = SimpleNamespace(
+        _seq_lens_cpu=object(),
+        seq_lens_cpu_list=[128],
+        _num_computed_tokens_cpu=object(),
+    )
+
+    llm_base_proposer._invalidate_rejected_sequence_cpu_metadata(metadata)
+
+    assert metadata._seq_lens_cpu is None
+    assert metadata.seq_lens_cpu_list is None
+    assert metadata._num_computed_tokens_cpu is None
+
+
+def test_single_token_draft_metadata_crosses_page_boundary():
+    metadata = SimpleNamespace(
+        _seq_lens_cpu=None,
+        seq_lens_cpu_list=[128, 255],
+        query_lens_cpu_list=[128, 7],
+    )
+
+    llm_base_proposer._advance_single_token_draft_cpu_metadata(metadata, 2)
+
+    assert metadata.seq_lens_cpu_list == [129, 256]
+    assert metadata.query_lens_cpu_list == [1, 1]
