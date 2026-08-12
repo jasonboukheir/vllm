@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch._higher_order_ops import auto_functionalized
@@ -74,6 +76,35 @@ def test_kv_cache_update_ops_fake_tensor_metadata(monkeypatch: pytest.MonkeyPatc
     assert runtime_output.dtype == fake_output.dtype
     assert runtime_output.device == fake_output.device
 
+
+def test_unified_kv_cache_update_slices_compile_padding(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class RecordingImpl:
+        def __init__(self):
+            self.args = None
+
+        def do_kv_cache_update(self, *args):
+            self.args = args
+
+    impl = RecordingImpl()
+    attn_layer = SimpleNamespace(impl=impl)
+    metadata = SimpleNamespace(num_actual_tokens=2)
+    kv_cache = torch.empty(1, dtype=torch.uint8)
+    slot_mapping = torch.arange(4)
+    context = (metadata, attn_layer, kv_cache, slot_mapping)
+    monkeypatch.setattr(attention_module, "get_attention_context", lambda _: context)
+
+    key = torch.arange(8).view(4, 2)
+    value = key + 10
+    attention_module.unified_kv_cache_update(key, value, "layer")
+
+    assert impl.args is not None
+    _, actual_key, actual_value, actual_cache, actual_slots = impl.args
+    assert torch.equal(actual_key, key[:2])
+    assert torch.equal(actual_value, value[:2])
+    assert actual_cache is kv_cache
+    assert torch.equal(actual_slots, slot_mapping[:2])
 
 def test_rope_kvcache_fusion_default_keeps_large_ranges_unfused():
     vllm_config = VllmConfig(

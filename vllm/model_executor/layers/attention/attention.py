@@ -778,17 +778,27 @@ def unified_kv_cache_update(
     the data dependency between them to ensure torch.compile preserves ordering.
     """
     layer_name = _resolve_layer_name(layer_name)
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )
+        # Graph-capture dummy runs do not install attention metadata; their
+        # slot mapping is already the capture shape.  Real execution carries
+        # the precise unpadded token count in the backend metadata.
+        num_actual_tokens = (
+            layer_slot_mapping.shape[0]
+            if attn_metadata is None
+            else attn_metadata.num_actual_tokens
+        )
         attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
             attn_layer,
-            key,
-            value,
+            key[:num_actual_tokens],
+            value[:num_actual_tokens],
             kv_cache,
-            layer_slot_mapping,
+            layer_slot_mapping[:num_actual_tokens],
         )
 
     return key.new_empty(0)
