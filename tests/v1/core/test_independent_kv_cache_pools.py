@@ -362,7 +362,9 @@ def _make_hybrid_spec_manager(num_spec_tokens: int = 2) -> KVCacheManager:
     )
 
 
-def _make_align_mtp2_manager(mamba_pool_blocks: int) -> KVCacheManager:
+def _make_align_mtp2_manager(
+    mamba_pool_blocks: int, attention_pool_blocks: int = 64
+) -> KVCacheManager:
     config = KVCacheConfig(
         num_blocks=mamba_pool_blocks,
         kv_cache_tensors=[],
@@ -388,7 +390,7 @@ def _make_align_mtp2_manager(mamba_pool_blocks: int) -> KVCacheManager:
             ),
         ],
         kv_cache_pools=[
-            KVCachePoolSpec(num_blocks=64, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=attention_pool_blocks, group_ids=[0]),
             KVCachePoolSpec(num_blocks=mamba_pool_blocks, group_ids=[1]),
         ],
     )
@@ -461,6 +463,58 @@ def test_align_mtp2_acceptance_lengths_keep_request_states_isolated():
     for request in requests:
         manager.free(request)
     assert manager.block_pools[1].get_num_free_blocks() == 8
+
+
+def test_align_mtp2_four_request_peak_requires_null_aware_pool_size():
+    for physical_blocks, fourth_admitted in ((16, False), (17, True)):
+        manager = _make_align_mtp2_manager(mamba_pool_blocks=physical_blocks)
+        requests = [_request(f"request-{i}", num_tokens=4) for i in range(4)]
+        for request in requests:
+            assert (
+                manager.allocate_slots(
+                    request, num_new_tokens=4, num_lookahead_tokens=2
+                )
+                is not None
+            )
+            request.num_computed_tokens = 4
+
+        manager.new_step_starts()
+        peak_results = [
+            manager.allocate_slots(request, num_new_tokens=1, num_lookahead_tokens=2)
+            for request in requests
+        ]
+        assert all(result is not None for result in peak_results[:3])
+        assert (peak_results[3] is not None) is fourth_admitted
+
+
+def test_attention_pool_supports_one_max_or_four_mixed_mtp2_requests():
+    max_context_manager = _make_align_mtp2_manager(
+        mamba_pool_blocks=17, attention_pool_blocks=18
+    )
+    max_context = _request("max-context", num_tokens=64)
+    assert (
+        max_context_manager.allocate_slots(
+            max_context, num_new_tokens=64, num_lookahead_tokens=2
+        )
+        is not None
+    )
+
+    mixed_manager = _make_align_mtp2_manager(
+        mamba_pool_blocks=17, attention_pool_blocks=18
+    )
+    mixed_requests = [
+        _request(f"mixed-{i}", num_tokens=num_tokens)
+        for i, num_tokens in enumerate((1, 4, 9, 40))
+    ]
+    assert all(
+        mixed_manager.allocate_slots(
+            request,
+            num_new_tokens=request.num_tokens,
+            num_lookahead_tokens=2,
+        )
+        is not None
+        for request in mixed_requests
+    )
 
 
 @pytest.mark.parametrize("num_spec_tokens", [0, 1, 2])

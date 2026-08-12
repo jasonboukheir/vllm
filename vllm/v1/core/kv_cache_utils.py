@@ -2057,6 +2057,7 @@ def update_kv_cache_capacity(
             logger.info_once(
                 "KV cache pool %d: groups=%s, types=%s, layers=%d, "
                 "physical_blocks=%s, null_blocks=1, usable_blocks=%s, "
+                "initially_free_blocks=%s, "
                 "block_sizes=%s, page_sizes=%s bytes, "
                 "allocated=%s bytes, max_request_blocks=%s, concurrency=%.2fx%s",
                 pool_id,
@@ -2064,6 +2065,7 @@ def update_kv_cache_capacity(
                 tuple(group_kinds),
                 sum(len(group.layer_names) for group in groups),
                 f"{pool.num_blocks:,}",
+                f"{pool.num_blocks - 1:,}",
                 f"{pool.num_blocks - 1:,}",
                 tuple(group.kv_cache_spec.block_size for group in groups),
                 tuple(group.kv_cache_spec.page_size_bytes for group in groups),
@@ -2074,6 +2076,18 @@ def update_kv_cache_capacity(
                 if (pool.num_blocks - 1) / request_blocks == max_concurrency
                 else "",
             )
+            if len(groups) == 1 and isinstance(groups[0].kv_cache_spec, MambaSpec):
+                spec = groups[0].kv_cache_spec
+                transition_blocks = int(spec.mamba_cache_mode == "align")
+                logger.info_once(
+                    "KV cache pool %d Mamba state contract per request: "
+                    "committed_blocks=1, transition_blocks=%d, "
+                    "speculative_blocks=%d, peak_resident_blocks=%d",
+                    pool_id,
+                    transition_blocks,
+                    spec.num_speculative_blocks,
+                    1 + transition_blocks + spec.num_speculative_blocks,
+                )
 
 
 def _max_memory_usage_bytes_from_groups(
