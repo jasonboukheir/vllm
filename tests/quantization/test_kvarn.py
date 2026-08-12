@@ -17,6 +17,7 @@ from vllm.v1.attention.backends.kvarn_attn import (
     KVarNAttentionImpl,
     KVarNMetadataBuilder,
     _cast_kvarn_activations,
+    _get_kvarn_cpu_lengths,
     expand_kvarn_block_table,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -330,6 +331,22 @@ def test_metadata_builder_uses_physical_spec_not_global_logical_block_size():
 
     assert builder._group == 128
     assert builder._tiles_per_block == 1
+
+
+def test_metadata_builder_prefers_host_native_lengths_over_staging_tensors():
+    class PoisonTensor:
+        def tolist(self):
+            raise AssertionError("staging tensor read would serialize device work")
+
+    metadata = SimpleNamespace(
+        seq_lens_cpu_list=[131, 259],
+        query_lens_cpu_list=[3, 3],
+        seq_lens_cpu=PoisonTensor(),
+        query_start_loc_cpu=PoisonTensor(),
+        seq_lens=PoisonTensor(),
+    )
+
+    assert _get_kvarn_cpu_lengths(metadata) == ([131, 259], [3, 3])
 
 
 def test_native_layer_filter_matches_components_not_numeric_prefixes():

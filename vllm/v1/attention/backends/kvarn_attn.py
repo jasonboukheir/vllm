@@ -369,6 +369,35 @@ class KVarNMetadata(AttentionMetadata):
     causal: bool = True
 
 
+def _get_kvarn_cpu_lengths(
+    common_attn_metadata: CommonAttentionMetadata,
+) -> tuple[list[int], list[int]]:
+    """Return host-native lengths without touching staging tensors when possible."""
+    seq_lens = common_attn_metadata.seq_lens_cpu_list
+    if seq_lens is None:
+        seq_lens_tensor = getattr(common_attn_metadata, "seq_lens_cpu", None)
+        seq_lens = (
+            seq_lens_tensor.tolist()
+            if seq_lens_tensor is not None
+            else common_attn_metadata.seq_lens.tolist()
+        )
+
+    query_lens = common_attn_metadata.query_lens_cpu_list
+    if query_lens is None:
+        query_start_loc = getattr(
+            common_attn_metadata, "query_start_loc_cpu", None
+        )
+        if query_start_loc is None:
+            query_lens = [1] * len(seq_lens)
+        else:
+            query_start_loc_list = query_start_loc.tolist()
+            query_lens = [
+                query_start_loc_list[i + 1] - query_start_loc_list[i]
+                for i in range(len(query_start_loc_list) - 1)
+            ]
+    return seq_lens, query_lens
+
+
 class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
     """Builds ``KVarNMetadata`` from scheduler output."""
 
@@ -495,19 +524,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # would otherwise re-issue these syncs (28+ syncs/token for Qwen3-0.6B).
         # Use the framework's cached CPU copy of seq_lens (cam.seq_lens_cpu) to
         # avoid an extra GPU->CPU sync per step (build-overhead reduction).
-        _slc = getattr(cam, "seq_lens_cpu", None)
-        seq_lens_cpu = _slc.tolist() if _slc is not None else cam.seq_lens.tolist()
-        # Per-request query length this step (already on CPU; no extra sync).
-        # query_len > 1 for prefill chunks and for speculative-decode verify
-        # steps (MTP / draft). Used by flush detection to compute the COMMITTED
-        # token count (seq_len - query_len) so speculative tokens that may still
-        # be rejected are never quantized into the permanent int4 cache.
-        _qsl = getattr(cam, "query_start_loc_cpu", None)
-        if _qsl is not None:
-            _qsl_l = _qsl.tolist()
-            query_lens_cpu = [_qsl_l[i + 1] - _qsl_l[i] for i in range(len(_qsl_l) - 1)]
-        else:
-            query_lens_cpu = [1] * len(seq_lens_cpu)
+        seq_lens_cpu, query_lens_cpu = _get_kvarn_cpu_lengths(cam)
         # block_table as a numpy 2-D array (C-backed, lazy element access) rather
         # than .tolist(): the full B×max_blocks nested-list build was ~7 ms/step
         # at B=256 and dominated build() once the flush was vectorized.
@@ -1077,6 +1094,21 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # implementation is constructed so changing the environment cannot
         # reinterpret already-written cache records halfway through a run.
         self._dpas_layout = os.environ.get("KVARN_NATIVE_XPU_DPAS_LAYOUT", "0") == "1"
+        logger.info_once(
+            "KVarN runtime: dtype=%s native=%s native_decode=%s dpas_layout=%s "
+            "native_splits=%s persistent_scratch=%s hadamard_scatter=%s "
+            "sinkhorn_iters=%s fused_verify=%s fused_verify_min_blocks=%s",
+            kv_cache_dtype,
+            os.environ.get("KVARN_NATIVE_XPU", "0"),
+            os.environ.get("KVARN_NATIVE_XPU_DECODE", "0"),
+            int(self._dpas_layout),
+            os.environ.get("KVARN_NATIVE_XPU_SPLITS", "1"),
+            os.environ.get("KVARN_NATIVE_XPU_PERSISTENT_SCRATCH", "0"),
+            os.environ.get("KVARN_NATIVE_XPU_HADAMARD_SCATTER", "0"),
+            self.kvarn_config.sinkhorn_iters,
+            os.environ.get("KVARN_FUSED_VERIFY", "1"),
+            os.environ.get("KVARN_FUSED_VERIFY_MIN_BLOCKS", "64"),
+        )
         if self._dpas_layout:
             cfg = self.kvarn_config
             geometry = (cfg.head_dim, cfg.group, cfg.key_bits, cfg.value_bits)
