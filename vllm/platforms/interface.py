@@ -792,9 +792,19 @@ class Platform:
         if cache_config.cache_dtype.startswith("kvarn_") and not (
             cache_config.cache_dtype.startswith("kvarn_mla")
         ):
+            if cache_config.mamba_cache_mode == "align":
+                # Independent pools decouple physical page sizes, but align
+                # mode still requires one shared logical token boundary for
+                # attention and recurrent-state publication.  Keeping the
+                # natural (typically 16-token) Mamba boundary makes a qlen=3
+                # verification window roll over before the 128-token KVarN
+                # block, so accepted recurrent candidates no longer describe
+                # the same prefix as the attention cache.
+                cache_config.mamba_block_size = cache_config.block_size
             logger.info(
-                "Keeping natural KVarN and Mamba block sizes for independent "
-                "KV cache pools."
+                "Keeping independent KVarN and Mamba page sizes; using Mamba "
+                "block size %s for align-mode logical boundaries.",
+                cache_config.mamba_block_size,
             )
             return
 
