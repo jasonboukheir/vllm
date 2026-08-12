@@ -21,6 +21,26 @@ from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.worker.utils import AttentionGroup
 
 
+def _compute_group_slot_mapping(
+    attn_group: AttentionGroup,
+    block_table: torch.Tensor,
+    positions: torch.Tensor,
+    exceeds_max_model_len: torch.Tensor,
+    batch_size: int,
+) -> torch.Tensor:
+    """Map positions through one KV group's own physical block geometry."""
+    block_size = attn_group.get_metadata_builder().kv_cache_spec.block_size
+    block_numbers = positions // block_size
+    block_numbers.clamp_(max=block_table.shape[1] - 1)
+    block_numbers = block_numbers.to(torch.long)
+    block_ids = (
+        block_table[:batch_size].gather(1, block_numbers.unsqueeze(1)).squeeze(1)
+    )
+    slot_mapping = block_ids * block_size + (positions % block_size)
+    slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+    return slot_mapping
+
+
 class Step3p5MTPProposer(EagleProposer):
     """Step3.5 MTP proposer with per-layer draft-step selection."""
 
@@ -106,13 +126,13 @@ class Step3p5MTPProposer(EagleProposer):
             block_table = self._per_group_block_tables.get(gid)
             if block_table is None:
                 continue
-            n_blocks = block_table.shape[1]
-            bn = new_positions_1d // block_size
-            bn.clamp_(max=n_blocks - 1)
-            bn = bn.to(torch.long)
-            block_ids = block_table[:batch_size].gather(1, bn.unsqueeze(1)).squeeze(1)
-            sm = block_ids * block_size + (new_positions_1d % block_size)
-            sm.masked_fill_(exceeds, PADDING_SLOT_ID)
+            sm = _compute_group_slot_mapping(
+                attn_group,
+                block_table,
+                new_positions_1d,
+                exceeds,
+                batch_size,
+            )
             buf = self._slot_mapping_buffer_for(gid)
             buf[:batch_size].copy_(sm)
             if input_batch_size > batch_size:
