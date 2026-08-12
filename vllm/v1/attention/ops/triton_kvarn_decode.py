@@ -1500,18 +1500,14 @@ def kvarn_verify_attention(
     vq_seqlen: torch.Tensor,  # [NQ] int32 — causal len: cached+i+1
     max_ctx_blocks: int,  # ceil(max context / group) upper bound
     qlen: int = 0,  # uniform query length (>= 2), else 0
-    seq_lens: torch.Tensor | None = None,  # [B] int32 (uniform path)
 ) -> torch.Tensor:
     """Fused multi-query verify (speculative decode), reading int4 tiles +
     the fp16 tail pool directly — no fp16 materialization of the context
     (whose O(context)-per-step cost dominated MTP decode).
 
     Two modes:
-    - UNIFORM (qlen >= 2, the captured/common case): one program per
-      (request, kv head, split) — the request's QLEN tokens SHARE each
-      block's dequant, so KV bytes and dequant ALU match single-token decode.
-    - per-token fallback (qlen == 0, non-uniform eager batches): one program
-      per (query token, kv head) via the vq plan; QLEN-x redundant dequant.
+    - native qlen=3 MTP2 verification on the supported Xe2 shape;
+    - per-token Triton fallback via the virtual-query plan.
 
     Output: ``[NQ, Hq, D]`` in ``query``'s dtype, un-rotated frame.
     """
