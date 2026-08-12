@@ -77,6 +77,43 @@ def _create_vllm_config(
 
 
 class TestCudagraphDispatcher:
+    def test_mtp2_capture_sizes_count_tokens_not_requests(self):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[3, 6],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=4)
+        config.num_speculative_tokens = 2
+
+        dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=3,
+        )
+
+        for num_reqs in (1, 2):
+            num_tokens = num_reqs * 3
+            mode, key = dispatcher.dispatch(
+                num_tokens=num_tokens,
+                uniform_decode=True,
+            )
+            assert mode == CUDAGraphMode.FULL
+            assert key == BatchDescriptor(
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                uniform=True,
+            )
+
+        for num_reqs in (3, 4):
+            num_tokens = num_reqs * 3
+            mode, key = dispatcher.dispatch(
+                num_tokens=num_tokens,
+                uniform_decode=True,
+            )
+            assert mode == CUDAGraphMode.NONE
+            assert key == BatchDescriptor(num_tokens=num_tokens)
+
     @pytest.mark.parametrize(
         "cudagraph_mode_str,compilation_mode,lora_config",
         [
