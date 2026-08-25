@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 import pydantic
 import pytest
-from huggingface_hub import ResolvedRevision
 from pydantic import ValidationError
 
 import vllm.config.vllm as vllm_config_module
@@ -1861,17 +1860,17 @@ def test_load_config_rejects_non_string_load_format(bad_load_format):
 REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
 
 
-@patch("vllm.config.model.resolve_revision", return_value=ResolvedRevision(REVISION))
+@patch("vllm.config.model.resolve_revision", return_value=REVISION)
 def test_revision_not_resolved_when_weights_differ_from_model(mock_resolve):
     model_weights = "unsloth/Qwen3-0.6B-GGUF:Q8_0"
     config = ModelConfig("Qwen/Qwen3-0.6B", model_weights=model_weights)
     assert config.revision is None
 
 
-@patch("vllm.config.model.resolve_revision", return_value=ResolvedRevision(REVISION))
+@patch("vllm.config.model.resolve_revision", return_value=REVISION)
 def test_revision_resolved_when_weights_match_model(mock_resolve):
     model = "Qwen/Qwen3-0.6B"
     config = ModelConfig(model)
-    assert isinstance(config.revision, ResolvedRevision)
-    assert config.revision.resolved == REVISION
+    assert type(config.revision) is str
+    assert config.revision == REVISION
     mock_resolve.assert_any_call(model, None, config.hf_token)

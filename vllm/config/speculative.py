@@ -766,6 +766,10 @@ class SpeculativeConfig:
                     self.enforce_eager = True
                 # use the draft model from the same model:
                 self.model = self.target_model_config.model
+                if self.revision is None:
+                    self.revision = self.target_model_config.revision
+                if self.code_revision is None:
+                    self.code_revision = self.target_model_config.code_revision
                 # Align the quantization of draft model for cases such as
                 # --quantization fp8 with a bf16 checkpoint.
                 if not self.quantization:
