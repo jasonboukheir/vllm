@@ -2,19 +2,34 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import pickle
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-from huggingface_hub import _CACHED_NO_EXIST
+from huggingface_hub import _CACHED_NO_EXIST, ResolvedRevision
 
 from vllm.transformers_utils.repo_utils import (
     any_pattern_in_repo_files,
     get_hf_file_to_dict,
     is_mistral_model_repo,
     list_filtered_repo_files,
+    resolve_revision,
 )
+
+
+def test_resolve_revision_returns_pickle_safe_commit():
+    commit = "c1899de289a04d12100db370d81485cdf75e47ca"
+    api = MagicMock()
+    api.resolve_revision.return_value = ResolvedRevision(commit, initial="main")
+
+    with patch("vllm.transformers_utils.repo_utils.hf_api", return_value=api):
+        revision = resolve_revision("Qwen/Qwen3-0.6B", revision="main")
+
+    assert type(revision) is str
+    assert revision == commit
+    assert pickle.loads(pickle.dumps(revision)) == commit
 
 
 @pytest.mark.parametrize(
