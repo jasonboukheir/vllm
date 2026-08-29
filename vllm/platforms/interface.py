@@ -859,7 +859,7 @@ class Platform:
             )
             kvarn_page = (
                 model_config.get_num_kv_heads(parallel_config)
-                * kvarn_config.tile_bytes_aligned
+                * kvarn_config.record_bytes
                 // kvarn_config.group
             )
             if cache_config.kv_cache_dtype_skip_layers:

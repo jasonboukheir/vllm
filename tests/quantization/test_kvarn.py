@@ -67,6 +67,7 @@ def test_kvarn_presets_are_registered_as_quantized_cache_modes(cache_dtype):
     [
         ("kvarn_k4v2_g128", 26880, 32768, 256),
         ("kvarn_k4v4_g128", 35072, 65536, 512),
+        ("kvarn_k4v4_g128_compact", 35072, 35072, 274),
         ("kvarn_k4v2_g64", 14208, 16384, 256),
         ("kvarn_k4v4_g64", 18304, 32768, 512),
     ],
@@ -94,6 +95,26 @@ def test_head_dim_256_layout_is_contiguous_and_page_aligned(
     for (offset, size), (next_offset, _) in zip(regions, regions[1:]):
         assert offset + size == next_offset
     assert regions[-1][0] + regions[-1][1] == config.tile_bytes
+
+
+def test_compact_d256_k4v4_record_has_no_power_of_two_padding():
+    config = KVarNConfig.from_cache_dtype(
+        "kvarn_k4v4_g128_compact", head_dim=256
+    )
+    assert config.compact_records
+    assert config.record_bytes == config.tile_bytes == 35_072
+    assert 4 * config.record_bytes == 140_288
+    spec = KVarNAttentionBackend.customize_spec(
+        FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=4,
+            head_size=256,
+            dtype=torch.bfloat16,
+            kv_quant_mode=get_kv_quant_mode("kvarn_k4v4_g128_compact"),
+        )
+    )
+    assert spec.page_size_bytes == 140_288
+    assert spec.state_content_size_bytes == 35_072
 
 
 class _ModelConfig:
