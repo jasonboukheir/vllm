@@ -647,7 +647,21 @@ class Platform:
         # Phase 3: Align block/page sizes when multiple KV dtypes share the
         # block pool (e.g. nvfp4 primary + unquantized skip layers).
         # May override the user's --block-size.
-        if cache_config.kv_cache_dtype_skip_layers:
+        # Non-MLA KVarN hybrid models allocate attention and recurrent cache
+        # groups in independent physical pools.  Their page sizes must remain
+        # independent: heterogeneous alignment is only valid for groups that
+        # coexist in the legacy shared pool, and it would also enlarge a
+        # fixed-size KVarN tile beyond the backend's supported group size.
+        independent_kvarn_pools = (
+            model_config.is_hybrid
+            and isinstance(cache_config.cache_dtype, str)
+            and cache_config.cache_dtype.startswith("kvarn_")
+            and not cache_config.cache_dtype.startswith("kvarn_mla")
+        )
+        if (
+            cache_config.kv_cache_dtype_skip_layers
+            and not independent_kvarn_pools
+        ):
             cls._align_heterogeneous_kv_block_size(vllm_config, backend_cls)
 
     @classmethod
