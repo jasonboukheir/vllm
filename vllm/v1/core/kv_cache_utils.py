@@ -991,9 +991,11 @@ def get_max_concurrency_for_kv_cache_config(
         for group in kv_cache_config.kv_cache_groups
     ]
     if kv_cache_config.has_independent_kv_cache_pools:
+        assert kv_cache_config.kv_cache_pools is not None
         max_concurrency = min(
-            kv_cache_config.num_blocks_for_group(group_id) / request_blocks
-            for group_id, request_blocks in enumerate(blocks_per_request)
+            pool.num_blocks
+            / sum(blocks_per_request[group_id] for group_id in pool.group_ids)
+            for pool in kv_cache_config.kv_cache_pools
         )
     else:
         max_concurrency = kv_cache_config.num_blocks / sum(blocks_per_request)
@@ -1986,6 +1988,38 @@ def update_kv_cache_capacity(
         f"{max_model_len:,}",
         max_concurrency,
     )
+    if kv_cache_config.has_independent_kv_cache_pools:
+        assert kv_cache_config.kv_cache_pools is not None
+        for pool_id, pool in enumerate(kv_cache_config.kv_cache_pools):
+            groups = [kv_cache_config.kv_cache_groups[i] for i in pool.group_ids]
+            request_blocks = sum(
+                _physical_blocks_per_request(vllm_config, group)
+                for group in groups
+            )
+            pool_tensor_sizes = {
+                tensor.size
+                for tensor in kv_cache_config.kv_cache_tensors
+                if tensor.pool_id == pool_id
+            }
+            assert len(pool_tensor_sizes) <= 1
+            allocated_bytes = next(iter(pool_tensor_sizes), 0)
+            pool_concurrency = pool.num_blocks / request_blocks
+            logger.info_once(
+                "KV cache pool %d: groups=%s, types=%s, layers=%d, "
+                "physical_blocks=%s, block_sizes=%s, page_sizes=%s bytes, "
+                "allocated=%s bytes, max_request_blocks=%s, concurrency=%.2fx%s",
+                pool_id,
+                tuple(pool.group_ids),
+                tuple(type(group.kv_cache_spec).__name__ for group in groups),
+                sum(len(group.layer_names) for group in groups),
+                f"{pool.num_blocks:,}",
+                tuple(group.kv_cache_spec.block_size for group in groups),
+                tuple(group.kv_cache_spec.page_size_bytes for group in groups),
+                f"{allocated_bytes:,}",
+                f"{request_blocks:,}",
+                pool_concurrency,
+                " (limiting)" if pool_concurrency == max_concurrency else "",
+            )
 
 
 def _max_memory_usage_bytes_from_groups(
