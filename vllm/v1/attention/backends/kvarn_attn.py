@@ -146,6 +146,7 @@ class KVarNAttentionBackend(AttentionBackend):
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "kvarn_k4v4_g128",
+        "kvarn_k4v4_g128_compact",
         "kvarn_k4v2_g128",
         "kvarn_k4v4_g64",
         "kvarn_k4v2_g64",
@@ -165,7 +166,7 @@ class KVarNAttentionBackend(AttentionBackend):
         )
         return replace(
             spec,
-            state_content_bytes=cfg.tile_bytes_aligned,
+            state_content_bytes=cfg.record_bytes,
             tokens_per_state=cfg.group,
         )
 
@@ -1344,7 +1345,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         sw = int(getattr(self, "sliding_window", 0) or 0)
 
         cache = torch.zeros(
-            B * n_blocks, Hk, cfg.tile_bytes_aligned, dtype=torch.uint8, device=device
+            B * n_blocks, Hk, cfg.record_bytes, dtype=torch.uint8, device=device
         )
         pool_k = torch.zeros(1, G, Hk, D, dtype=torch.float16, device=device)
         pool_v = torch.zeros_like(pool_k)
@@ -1630,9 +1631,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     def _flat_block(
         self, kv_cache: torch.Tensor, block_id: int, head: int
     ) -> torch.Tensor:
-        """Contiguous ``[tile_bytes_aligned]`` uint8 view for one (block, head).
+        """Contiguous ``[record_bytes]`` uint8 view for one (block, head).
 
-        ``kv_cache`` has shape ``(num_blocks, num_kv_heads, tile_bytes_aligned)``,
+        ``kv_cache`` has shape ``(num_blocks, num_kv_heads, record_bytes)``,
         so this selects a single contiguous row — no copy, writes propagate
         back to the cache tensor.
         """
@@ -1835,7 +1836,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         Hk = flush_pairs[0][0].num_kv_heads
         D = cfg.head_dim
         G = cfg.group
-        T = cfg.tile_bytes_aligned
+        T = cfg.record_bytes
         kpb = cfg.k_packed_bytes
         vpb = cfg.v_packed_bytes
 
@@ -1882,7 +1883,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 K_out, V_out = _sinkhorn_pack_kv(K_tiles, V_tiles, cfg)
                 # Assemble the packed cache record [nB*Hk, tile_bytes] by
                 # concatenating fields in config-offset order (fp16 scales
-                # byte-reinterpreted to uint8), then pad to tile_bytes_aligned.
+                # byte-reinterpreted to uint8), then pad to record_bytes.
                 M = nB * Hk
                 parts = [
                     K_out["q_packed_uint8"].reshape(M, kpb),
@@ -2024,6 +2025,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # into pool at slot=block_id directly. No Python loop, no allocator,
         # no dict mutation. Safe inside a captured CUDA graph.
         cfg = self.kvarn_config
+        if kv_cache.shape[-1] != cfg.record_bytes:
+            raise RuntimeError(
+                "KVarN cache record ABI mismatch: allocated "
+                f"{kv_cache.shape[-1]} bytes, expected {cfg.record_bytes} "
+                f"for {self.kv_cache_dtype}."
+            )
         N = slot_mapping.shape[0]
         if N <= 0:
             return
@@ -2095,6 +2102,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         kv_cache = self._record_cache_view(kv_cache)
+        if kv_cache.shape[-1] != self.kvarn_config.record_bytes:
+            raise RuntimeError(
+                "KVarN cache record ABI mismatch: allocated "
+                f"{kv_cache.shape[-1]} bytes, expected "
+                f"{self.kvarn_config.record_bytes} for {self.kv_cache_dtype}."
+            )
         num_tokens = query.shape[0]
         device = query.device
 

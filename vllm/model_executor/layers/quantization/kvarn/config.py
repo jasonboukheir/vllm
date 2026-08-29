@@ -21,12 +21,18 @@ from dataclasses import dataclass
 KVARN_PRESETS: dict[str, dict] = {
     "kvarn_k4v2_g128": {"key_bits": 4, "value_bits": 2, "group": 128},
     "kvarn_k4v4_g128": {"key_bits": 4, "value_bits": 4, "group": 128},
+    "kvarn_k4v4_g128_compact": {
+        "key_bits": 4,
+        "value_bits": 4,
+        "group": 128,
+        "compact_records": True,
+    },
     "kvarn_k4v2_g64": {"key_bits": 4, "value_bits": 2, "group": 64},
     "kvarn_k4v4_g64": {"key_bits": 4, "value_bits": 4, "group": 64},
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class KVarNConfig:
     """Configuration for KVarN KV-cache quantization.
 
@@ -67,6 +73,10 @@ class KVarNConfig:
     boundary_skip_layers: int = (
         0  # layer-level skipping off by default; sink_tokens replaces it
     )
+    # Compact presets allocate the natural record size. Padded presets retain
+    # the historical power-of-two slot used by heterogeneous cache-page
+    # unification.
+    compact_records: bool = False
 
     # ── derived: storage layout ──────────────────────────────────────────────
     @property
@@ -122,11 +132,18 @@ class KVarNConfig:
         make the ratio an exact power of 2. head_dim<=128 keeps the tight 8-byte
         alignment (the common case; no padding). Trailing pad only — offsets are
         unchanged, so the layout/kernels are byte-compatible."""
+        if self.compact_records:
+            return ((self.tile_bytes + 7) // 8) * 8
         if self.head_dim >= 256:
             slot = math.ceil(self.tile_bytes / self.group)
             slot_pow2 = 1 << (slot - 1).bit_length()
             return slot_pow2 * self.group
         return ((self.tile_bytes + 7) // 8) * 8
+
+    @property
+    def record_bytes(self) -> int:
+        """Physical bytes allocated for one block/head cache record."""
+        return self.tile_bytes_aligned
 
     # ── slot byte offsets within one tile (used by the kernels) ──────────────
     @property
@@ -394,6 +411,7 @@ class KVarNConfig:
             key_bits=preset["key_bits"],
             value_bits=preset["value_bits"],
             group=preset["group"],
+            compact_records=preset.get("compact_records", False),
             sinkhorn_iters=iters,
             sink_tokens=sink_tokens,
         )
