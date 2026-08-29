@@ -1581,6 +1581,50 @@ def test_kvarn_hybrid_non_align_mode_preserves_mamba_logical_block_size():
 
 
 @pytest.mark.parametrize(
+    ("cache_dtype", "is_hybrid", "expected_calls"),
+    [
+        ("kvarn_k4v4_g128_compact", True, ["hybrid"]),
+        ("kvarn_k4v4_g128_compact", False, ["heterogeneous"]),
+        ("auto", True, ["hybrid", "heterogeneous"]),
+    ],
+)
+def test_kvarn_hybrid_skips_shared_pool_heterogeneous_alignment(
+    monkeypatch, cache_dtype, is_hybrid, expected_calls
+):
+    """Independent KVarN pools must retain their natural page geometry."""
+    calls = []
+    monkeypatch.setattr(
+        Platform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        Platform,
+        "_align_hybrid_block_size",
+        classmethod(lambda cls, vllm_config, backend: calls.append("hybrid")),
+    )
+    monkeypatch.setattr(
+        Platform,
+        "_align_heterogeneous_kv_block_size",
+        classmethod(
+            lambda cls, vllm_config, backend: calls.append("heterogeneous")
+        ),
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            user_specified_block_size=True,
+            cache_dtype=cache_dtype,
+            kv_cache_dtype_skip_layers=["sliding_window"],
+        ),
+        model_config=SimpleNamespace(is_hybrid=is_hybrid),
+    )
+
+    Platform.update_block_size_for_backend(vllm_config)
+
+    assert calls == expected_calls
+
+
+@pytest.mark.parametrize(
     ("model_id", "max_model_len", "want_estimated_max_len"),
     [
         ("Qwen/Qwen1.5-7B", 16385, 16384),
