@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Compare paired BF16 and KVarN persistent forced-decode artifacts."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+
+def _rows(token_ids: np.ndarray, logits: np.ndarray) -> list[dict[int, float]]:
+    if token_ids.ndim != 2 or logits.shape != token_ids.shape:
+        raise ValueError("logit_token_ids and raw_logits must be equal-size matrices")
+    rows: list[dict[int, float]] = []
+    for ids, values in zip(token_ids, logits):
+        row = {
+            int(token_id): float(value)
+            for token_id, value in zip(ids, values)
+            if token_id >= 0 and math.isfinite(float(value))
+        }
+        if not row:
+            raise ValueError("every decode step must contain at least one finite logit")
+        rows.append(row)
+    return rows
+
+
+def load_artifact(path: Path) -> dict[str, Any]:
+    with np.load(path, allow_pickle=False) as data:
+        required = {
+            "prompt_token_ids",
+            "forced_token_ids",
+            "logit_token_ids",
+            "raw_logits",
+        }
+        missing = required.difference(data.files)
+        if missing:
+            raise ValueError(f"{path} is missing arrays: {sorted(missing)}")
+        prompt = np.asarray(data["prompt_token_ids"], dtype=np.int64)
+        forced = np.asarray(data["forced_token_ids"], dtype=np.int64)
+        rows = _rows(data["logit_token_ids"], data["raw_logits"])
+        full_logits = bool(data["full_logits"]) if "full_logits" in data else False
+    if prompt.ndim != 1 or forced.ndim != 1:
+        raise ValueError("prompt_token_ids and forced_token_ids must be vectors")
+    if len(rows) != forced.size:
+        raise ValueError("the number of logit rows must match forced_token_ids")
+    return {
+        "path": str(path.resolve()),
+        "prompt": prompt,
+        "forced": forced,
+        "rows": rows,
+        "full_logits": full_logits,
+    }
+
+
+def _summary(values: Iterable[float]) -> dict[str, float | int]:
+    array = np.asarray(list(values), dtype=np.float64)
+    if not array.size:
+        return {"count": 0}
+    return {
+        "count": int(array.size),
+        "mean": float(array.mean()),
+        "mae": float(np.abs(array).mean()),
+        "rmse": float(np.sqrt(np.square(array).mean())),
+        "p50_abs": float(np.percentile(np.abs(array), 50)),
+        "p95_abs": float(np.percentile(np.abs(array), 95)),
+        "p99_abs": float(np.percentile(np.abs(array), 99)),
+        "max_abs": float(np.abs(array).max()),
+    }
+
+
+def _top_ids(row: dict[int, float], count: int) -> list[int]:
+    return [
+        token_id
+        for token_id, _ in sorted(row.items(), key=lambda item: (-item[1], item[0]))[
+            :count
+        ]
+    ]
+
+
+def _tie_set(row: dict[int, float], tolerance: float) -> set[int]:
+    maximum = max(row.values())
+    return {token_id for token_id, value in row.items() if maximum - value <= tolerance}
+
+
+def _bucket_name(context_position: int, boundaries: tuple[int, ...]) -> str:
+    lower = 0
+    for upper in boundaries:
+        if context_position <= upper:
+            return f"{lower + 1}-{upper}"
+        lower = upper
+    return f"{lower + 1}+"
+
+
+def compare(
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    tie_tolerance: float,
+    boundaries: tuple[int, ...],
+) -> dict[str, Any]:
+    if not np.array_equal(reference["prompt"], candidate["prompt"]):
+        raise ValueError("prompt token IDs differ")
+    if not np.array_equal(reference["forced"], candidate["forced"]):
+        raise ValueError("forced token IDs differ")
+
+    forced = reference["forced"]
+    prompt_length = int(reference["prompt"].size)
+    row_deltas: list[float] = []
+    selected_deltas: list[float] = []
+    top1_matches = 0
+    tie_matches = 0
+    top5_exact_matches = 0
+    top5_overlap: list[float] = []
+    intersection_coverage: list[float] = []
+    bucket_values: dict[str, dict[str, list[float] | int]] = {}
+
+    for step, (reference_row, candidate_row) in enumerate(
+        zip(reference["rows"], candidate["rows"])
+    ):
+        common = reference_row.keys() & candidate_row.keys()
+        if not common:
+            raise ValueError(f"decode step {step} has no token IDs in common")
+        differences = [candidate_row[token] - reference_row[token] for token in common]
+        row_deltas.extend(differences)
+        intersection_coverage.append(
+            len(common) / max(len(reference_row), len(candidate_row))
+        )
+
+        forced_token = int(forced[step])
+        if forced_token not in common:
+            raise ValueError(
+                f"forced token {forced_token} is absent from step {step} logits"
+            )
+        selected_delta = candidate_row[forced_token] - reference_row[forced_token]
+        selected_deltas.append(selected_delta)
+
+        reference_top1 = _top_ids(reference_row, 1)[0]
+        candidate_top1 = _top_ids(candidate_row, 1)[0]
+        top1_matches += reference_top1 == candidate_top1
+        tie_matches += candidate_top1 in _tie_set(
+            reference_row, tie_tolerance
+        ) and reference_top1 in _tie_set(candidate_row, tie_tolerance)
+
+        reference_top5 = set(_top_ids(reference_row, 5))
+        candidate_top5 = set(_top_ids(candidate_row, 5))
+        top5_exact_matches += reference_top5 == candidate_top5
+        top5_overlap.append(
+            len(reference_top5 & candidate_top5)
+            / max(len(reference_top5 | candidate_top5), 1)
+        )
+
+        context_position = prompt_length + step + 1
+        bucket = bucket_values.setdefault(
+            _bucket_name(context_position, boundaries),
+            {"steps": 0, "selected_deltas": [], "row_deltas": []},
+        )
+        bucket["steps"] = int(bucket["steps"]) + 1
+        assert isinstance(bucket["selected_deltas"], list)
+        assert isinstance(bucket["row_deltas"], list)
+        bucket["selected_deltas"].append(selected_delta)
+        bucket["row_deltas"].extend(differences)
+
+    steps = len(reference["rows"])
+    drift = {
+        name: {
+            "steps": values["steps"],
+            "selected_token_delta": _summary(values["selected_deltas"]),
+            "matched_logit_delta": _summary(values["row_deltas"]),
+        }
+        for name, values in bucket_values.items()
+    }
+    return {
+        "schema_version": 1,
+        "reference": reference["path"],
+        "candidate": candidate["path"],
+        "prompt_tokens": prompt_length,
+        "decode_steps": steps,
+        "context_end": prompt_length + steps,
+        "full_logits": {
+            "reference": reference["full_logits"],
+            "candidate": candidate["full_logits"],
+        },
+        "top1_agreement_rate": top1_matches / steps,
+        "tie_aware_top1_agreement_rate": tie_matches / steps,
+        "tie_tolerance": tie_tolerance,
+        "top5_exact_agreement_rate": top5_exact_matches / steps,
+        "top5_mean_jaccard": float(np.mean(top5_overlap)),
+        "mean_intersection_coverage": float(np.mean(intersection_coverage)),
+        "selected_token_delta": _summary(selected_deltas),
+        "matched_logit_delta": _summary(row_deltas),
+        "drift_by_context": drift,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--tie-tolerance", type=float, default=1e-5)
+    parser.add_argument(
+        "--context-boundary",
+        type=int,
+        action="append",
+        default=[],
+        help="upper context-position boundary; repeat as needed",
+    )
+    args = parser.parse_args()
+    if args.tie_tolerance < 0:
+        parser.error("--tie-tolerance must be non-negative")
+    if any(boundary <= 0 for boundary in args.context_boundary):
+        parser.error("--context-boundary values must be positive")
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+    boundaries = tuple(sorted(set(args.context_boundary or [4096, 16384, 32768])))
+    document = compare(
+        load_artifact(args.reference),
+        load_artifact(args.candidate),
+        tie_tolerance=args.tie_tolerance,
+        boundaries=boundaries,
+    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    rendered = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    args.output.write_text(rendered, encoding="utf-8")
+    print(rendered, end="")
+
+
+if __name__ == "__main__":
+    main()
