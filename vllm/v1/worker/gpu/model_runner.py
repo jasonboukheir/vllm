@@ -157,6 +157,7 @@ from vllm.v1.worker.utils import (
     KVBlockZeroer,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
+    zero_mamba_block_ids,
 )
 from vllm.v1.worker.workspace import use_workspace_lane
 
@@ -670,6 +671,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
         )
+        # Every physical pool owns block zero as a null/sentinel page. Graph
+        # padding can read it, so initialize attention and recurrent storage
+        # once before warmup rather than treating a new request as ownership.
+        self.kv_block_zeroer.zero_block_ids([0])
+        zero_mamba_block_ids(
+            self.kv_cache_config,
+            self.compilation_config.static_forward_context,
+            [
+                (group_id, [0])
+                for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ],
+            self.device,
+        )
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
@@ -1071,13 +1086,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.new_mamba_block_ids_to_zero:
+            zero_mamba_block_ids(
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
+                scheduler_output.new_mamba_block_ids_to_zero,
+                self.device,
+            )
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
                 scheduler_output.kv_cache_block_copies,
             )
 

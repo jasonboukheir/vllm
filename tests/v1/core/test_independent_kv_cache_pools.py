@@ -15,6 +15,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCachePoolSpec,
+    MambaSpec,
 )
 
 from .test_prefix_caching import make_request
@@ -187,3 +188,46 @@ def test_usage_reports_pressure_of_limiting_pool():
         pytest.approx(1.0),
     ]
     assert manager.usage == pytest.approx(1.0)
+
+
+def test_mamba_zeroing_ids_remain_group_qualified():
+    config = KVCacheConfig(
+        num_blocks=5,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attention"],
+                FullAttentionSpec(
+                    block_size=BLOCK_SIZE,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=64,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="none",
+                ),
+            ),
+        ],
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=32, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=5, group_ids=[1]),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=64,
+        scheduler_block_size=64,
+        hash_block_size=BLOCK_SIZE,
+        enable_caching=False,
+    )
+
+    blocks = manager.allocate_slots(_request("request", 4), num_new_tokens=4)
+    assert blocks is not None
+    assert manager.take_new_block_ids()
+    assert manager.take_new_mamba_block_ids() == [(1, [1])]

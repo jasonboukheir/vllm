@@ -833,6 +833,15 @@ class KVCacheManager:
             ids.extend(mgr.take_new_block_ids())
         return ids
 
+    def take_new_mamba_block_ids(self) -> list[tuple[int, list[int]]]:
+        """Drain recurrent allocations with cache-group ownership intact."""
+        result: list[tuple[int, list[int]]] = []
+        for group_id, mgr in enumerate(self.coordinator.single_type_managers):
+            ids = mgr.take_new_mamba_block_ids()
+            if ids:
+                result.append((group_id, ids))
+        return result
+
     def get_zeroing_block_ids_in_range(
         self, request_id: str, start_token: int, end_token: int
     ) -> list[int]:
@@ -865,17 +874,25 @@ class KVCacheManager:
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
         """Drain pending copies and return their retained endpoints."""
-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
-        for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
+        pending_copies: list[tuple[int, KVCacheBlock, KVCacheBlock]] = []
+        for group_id, mgr in enumerate(self.coordinator.single_type_managers):
+            pending_copies.extend(
+                (group_id, source_block, cow_block)
+                for source_block, cow_block in mgr.take_pending_cow_copies()
+            )
         copies = [
             KVCacheBlockCopy(
                 src_block_id=source_block.block_id,
                 dst_block_id=cow_block.block_id,
+                group_id=group_id,
             )
-            for source_block, cow_block in pending_copies
+            for group_id, source_block, cow_block in pending_copies
         ]
-        retained_blocks = [block for pair in pending_copies for block in pair]
+        retained_blocks = [
+            block
+            for _group_id, source_block, cow_block in pending_copies
+            for block in (source_block, cow_block)
+        ]
         return copies, retained_blocks
 
     def take_partial_tail_offloads(self) -> dict[str, list[tuple[int, int, int]]]:

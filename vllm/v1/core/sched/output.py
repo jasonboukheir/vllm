@@ -270,6 +270,9 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+    # Recurrent block IDs are local to independent physical pools, so their
+    # owning cache group must remain attached through worker-side zeroing.
+    new_mamba_block_ids_to_zero: list[tuple[int, list[int]]] | None = None
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None

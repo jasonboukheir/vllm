@@ -617,14 +617,44 @@ def bind_kv_cache(
 
 
 def copy_kv_cache_blocks_inplace(
-    kv_caches: Iterable[torch.Tensor],
-    num_blocks: int,
+    kv_caches: Iterable[torch.Tensor] | KVCacheConfig,
+    num_blocks: int | Mapping[str, Attention],
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
 ) -> None:
     if not kv_cache_block_copies:
         return
 
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    if isinstance(kv_caches, KVCacheConfig):
+        kv_cache_config = kv_caches
+        if not isinstance(num_blocks, Mapping):
+            raise TypeError("forward context is required with KVCacheConfig")
+        forward_context = num_blocks
+        copies_by_pool: defaultdict[int, list[KVCacheBlockCopy]] = defaultdict(list)
+        for copy in kv_cache_block_copies:
+            pool_id = kv_cache_config.pool_id_for_group(copy.group_id)
+            copies_by_pool[pool_id].append(copy)
+
+        assert kv_cache_config.kv_cache_pools is not None
+        for pool_id, copies in copies_by_pool.items():
+            pool = kv_cache_config.kv_cache_pools[pool_id]
+            pool_caches: list[torch.Tensor] = []
+            for group_id in pool.group_ids:
+                group = kv_cache_config.kv_cache_groups[group_id]
+                for layer_name in group.layer_names:
+                    entry = forward_context[layer_name].kv_cache
+                    if isinstance(entry, (list, tuple)):
+                        pool_caches.extend(entry)
+                    else:
+                        pool_caches.append(entry)
+            copy_kv_cache_blocks_inplace(pool_caches, pool.num_blocks, copies)
+        return
+
+    if not isinstance(num_blocks, int):
+        raise TypeError("num_blocks must be an integer with a cache iterable")
+    indices_np = np.asarray(
+        [(copy.src_block_id, copy.dst_block_id) for copy in kv_cache_block_copies],
+        dtype=np.int64,
+    )
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
@@ -663,6 +693,34 @@ def copy_kv_cache_blocks_inplace(
             # scheduler blocks; unflatten of dim 0 is always a view.
             blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
         blocks[dst] = blocks[src]
+
+
+def zero_mamba_block_ids(
+    kv_cache_config: KVCacheConfig,
+    forward_context: Mapping[str, Attention],
+    blocks_by_group: Sequence[tuple[int, list[int]]],
+    device: torch.device,
+) -> None:
+    """Zero recurrent states without applying local IDs to another pool."""
+    for group_id, block_ids in blocks_by_group:
+        if not block_ids:
+            continue
+        group = kv_cache_config.kv_cache_groups[group_id]
+        if not isinstance(group.kv_cache_spec, MambaSpec):
+            continue
+        indices = async_tensor_h2d(
+            sorted(set(block_ids)), device=device, dtype=torch.int64
+        )
+        seen_ptrs: set[int] = set()
+        for layer_name in group.layer_names:
+            entry = forward_context[layer_name].kv_cache
+            states = entry if isinstance(entry, (list, tuple)) else (entry,)
+            for state in states:
+                ptr = state.data_ptr()
+                if ptr in seen_ptrs:
+                    continue
+                seen_ptrs.add(ptr)
+                state.index_fill_(0, indices, 0)
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
