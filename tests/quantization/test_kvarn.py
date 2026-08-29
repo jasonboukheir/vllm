@@ -11,9 +11,12 @@ from vllm.model_executor.layers.quantization.kvarn.config import (
     KVarNConfig,
 )
 from vllm.platforms.xpu import XPUPlatform
-from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionBackend
-from vllm.v1.attention.backends.turboquant_attn import TurboQuantAttentionBackend
+from vllm.v1.attention.backends.kvarn_attn import (
+    KVarNAttentionBackend,
+    KVarNAttentionImpl,
+)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.turboquant_attn import TurboQuantAttentionBackend
 from vllm.v1.attention.selector import AttentionSelectorConfig
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import (
@@ -98,9 +101,7 @@ def test_head_dim_256_layout_is_contiguous_and_page_aligned(
 
 
 def test_compact_d256_k4v4_record_has_no_power_of_two_padding():
-    config = KVarNConfig.from_cache_dtype(
-        "kvarn_k4v4_g128_compact", head_dim=256
-    )
+    config = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128_compact", head_dim=256)
     assert config.compact_records
     assert config.record_bytes == config.tile_bytes == 35_072
     assert 4 * config.record_bytes == 140_288
@@ -167,7 +168,7 @@ def test_kvarn_current_layout_uses_one_packed_record_per_tile():
         num_kv_heads=1,
         head_size=256,
         head_size_v=256,
-        dtype=torch.bfloat16,
+        dtype=torch.uint8,
         kv_quant_mode=get_kv_quant_mode("kvarn_k4v4_g128"),
     )
     kvarn = KVarNAttentionBackend.customize_spec(base)
@@ -191,11 +192,10 @@ def test_kvarn_current_layout_uses_one_packed_record_per_tile():
         block_stride=block_stride,
     )
     raw = torch.empty(tensor.size, dtype=torch.int8)
-    (view,) = create_kv_cache_views(
-        raw, kvarn, 3, KVCacheLayout.LBHNC, tensor
-    )
+    (view,) = create_kv_cache_views(raw, kvarn, 3, KVCacheLayout.LBHNC, tensor)
+    assert view.dtype == torch.uint8
     assert view.shape == (3, 1, 1, config.tile_bytes_aligned)
-    records = KVarNAttentionBackend._record_cache_view(view)
+    records = KVarNAttentionImpl._record_cache_view(view)
     assert records.shape == (3, 1, config.tile_bytes_aligned)
     assert records.stride() == view.squeeze(2).stride()
 

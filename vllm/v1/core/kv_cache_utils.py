@@ -1476,9 +1476,16 @@ def get_kv_cache_config_from_groups(
             ),
         )
 
-    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
-    validate_kv_cache_layout(layout, kv_cache_groups)
     independent_pools = _uses_independent_kvarn_pools(vllm_config, kv_cache_groups)
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    if independent_pools:
+        # Each group below receives its own physical allocation, so unequal
+        # page sizes in different pools impose no shared-tensor layout
+        # constraint. Validate the pages that actually coexist in each pool.
+        for group in kv_cache_groups:
+            validate_kv_cache_layout(layout, [group])
+    else:
+        validate_kv_cache_layout(layout, kv_cache_groups)
 
     if independent_pools:
         blocks_per_request = [
