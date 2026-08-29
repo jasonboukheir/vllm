@@ -1534,11 +1534,31 @@ def test_mamba_none_pool_cost_is_constant_with_context_length(max_model_len):
     assert spec.max_num_blocks_per_req(vllm_config, max_model_len) == 1
 
 
-def test_kvarn_hybrid_alignment_preserves_natural_block_sizes():
+def test_kvarn_hybrid_alignment_shares_logical_boundary_not_physical_page():
     cache_config = SimpleNamespace(
         cache_dtype="kvarn_k4v4_g128",
         block_size=128,
         mamba_block_size=8192,
+        mamba_cache_mode="align",
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(),
+    )
+
+    Platform._align_hybrid_block_size(vllm_config, SimpleNamespace())
+
+    assert cache_config.block_size == 128
+    assert cache_config.mamba_block_size == 128
+
+
+def test_kvarn_hybrid_non_align_mode_preserves_mamba_logical_block_size():
+    cache_config = SimpleNamespace(
+        cache_dtype="kvarn_k4v4_g128",
+        block_size=128,
+        mamba_block_size=8192,
+        mamba_cache_mode="all",
     )
     vllm_config = SimpleNamespace(
         cache_config=cache_config,
