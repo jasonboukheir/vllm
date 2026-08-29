@@ -1401,7 +1401,6 @@ def test_is_kv_cache_spec_uniform():
     }
     assert is_kv_cache_spec_uniform(kv_cache_spec)
 
-
     kv_cache_spec = {
         "layer_1": new_kv_cache_spec(num_kv_heads=32),
         "layer_2": new_sliding_window_spec(num_kv_heads=32, sliding_window=1),
@@ -1474,6 +1473,7 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=512))
     vllm_config.cache_config.cache_dtype = "kvarn_k4v4_g128"
     vllm_config.cache_config.kv_cache_layout = "LBHNC"
+    vllm_config.scheduler_config.max_num_seqs = 3
 
     blocks_per_request = [
         group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
@@ -1481,19 +1481,20 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
         for group in groups
     ]
     bytes_per_request = sum(
-        len(group.layer_names)
-        * group.kv_cache_spec.page_size_bytes
-        * blocks
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes * blocks
         for group, blocks in zip(groups, blocks_per_request)
+    )
+    null_bytes = sum(
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in groups
     )
 
     config = kv_cache_utils.get_kv_cache_config_from_groups(
         vllm_config,
         groups,
-        available_memory=bytes_per_request * 3,
+        available_memory=bytes_per_request * 3 + null_bytes,
     )
 
-    expected_pool_blocks = [blocks * 3 for blocks in blocks_per_request]
+    expected_pool_blocks = [blocks * 3 + 1 for blocks in blocks_per_request]
     assert [pool.num_blocks for pool in config.kv_cache_pools or []] == (
         expected_pool_blocks
     )
@@ -1508,11 +1509,29 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
         * expected_pool_blocks[1],
     ]
     assert sum(tensor.size for tensor in config.kv_cache_tensors) == (
-        bytes_per_request * 3
+        bytes_per_request * 3 + null_bytes
     )
-    assert kv_cache_utils._max_memory_usage_bytes_from_groups(
-        vllm_config, groups
-    ) == bytes_per_request
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+        == bytes_per_request
+    )
+
+
+@pytest.mark.parametrize("max_model_len", [128, 8192, 65536])
+def test_mamba_none_pool_cost_is_constant_with_context_length(max_model_len):
+    spec = MambaSpec(
+        block_size=max_model_len,
+        shapes=((1_603_584,),),
+        dtypes=(torch.bfloat16,),
+        mamba_cache_mode="none",
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+    )
+
+    assert spec.max_memory_usage_bytes(vllm_config) == spec.page_size_bytes
+    assert spec.max_num_blocks_per_req(vllm_config, max_model_len) == 1
 
 
 def test_kvarn_hybrid_alignment_preserves_natural_block_sizes():
@@ -1728,8 +1747,8 @@ def test_get_max_concurrency_for_kv_cache_config():
             KVCacheGroupSpec(["layer_2"], full_attention_spec),
         ],
         kv_cache_pools=[
-            KVCachePoolSpec(num_blocks=1153 * 3, group_ids=[0, 1]),
-            KVCachePoolSpec(num_blocks=1024 * 4, group_ids=[2]),
+            KVCachePoolSpec(num_blocks=1153 * 3 + 1, group_ids=[0, 1]),
+            KVCachePoolSpec(num_blocks=1024 * 4 + 1, group_ids=[2]),
         ],
     )
     assert (

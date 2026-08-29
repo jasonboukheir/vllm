@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
+    KVCachePoolSpec,
     KVCacheTensor,
     MLAAttentionSpec,
     compute_layout_strides,
@@ -181,6 +182,50 @@ def test_allocate_compressed_mla_cache(
     )
 
     assert caches["layer.0"].shape == (expected_num_blocks, 1, expected_num_states, 128)
+
+
+def test_allocate_independent_pools_with_local_block_namespaces():
+    spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+    )
+    block_counts = [3, 5]
+    tensors = []
+    for pool_id, num_blocks in enumerate(block_counts):
+        layer_stride, block_stride, _, _, _ = compute_layout_strides(
+            spec, num_blocks, 1, KVCacheLayout.LBHNC
+        )
+        tensors.append(
+            KVCacheTensor(
+                size=num_blocks * spec.page_size_bytes,
+                layers=[f"layer.{pool_id}"],
+                layer_stride=layer_stride,
+                block_stride=block_stride,
+                pool_id=pool_id,
+            )
+        )
+    config = KVCacheConfig(
+        num_blocks=min(block_counts),
+        kv_cache_tensors=tensors,
+        kv_cache_groups=[
+            KVCacheGroupSpec([f"layer.{pool_id}"], spec) for pool_id in range(2)
+        ],
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=num_blocks, group_ids=[pool_id])
+            for pool_id, num_blocks in enumerate(block_counts)
+        ],
+    )
+
+    caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.LBHNC)
+    assert [caches[f"layer.{i}"].shape[0] for i in range(2)] == block_counts
+    assert (
+        caches["layer.0"].untyped_storage().data_ptr()
+        != caches["layer.1"].untyped_storage().data_ptr()
+    )
+    caches["layer.0"][1].fill_(1)
+    assert not torch.any(caches["layer.1"][1])
 
 
 @pytest.mark.parametrize("layout", list(KVCacheLayout))
