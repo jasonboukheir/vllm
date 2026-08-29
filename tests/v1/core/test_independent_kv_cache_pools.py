@@ -9,7 +9,7 @@ import torch
 
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, init_none_hash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -60,6 +60,7 @@ def _make_manager(
 
 
 def _request(request_id: str, num_tokens: int = 1):
+    init_none_hash(sha256)
     return make_request(
         request_id,
         list(range(num_tokens)),

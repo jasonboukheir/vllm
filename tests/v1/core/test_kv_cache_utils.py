@@ -50,6 +50,7 @@ from vllm.v1.kv_cache_interface import (
     HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheLayout,
     KVCachePoolSpec,
     KVCacheSpec,
     KVCacheSpecKind,
@@ -1470,10 +1471,17 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
         KVCacheGroupSpec(["full.0", "full.1"], new_kv_cache_spec(block_size=128)),
         KVCacheGroupSpec(["mamba.0"], new_mamba_spec(block_size=512)),
     ]
-    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=512))
-    vllm_config.cache_config.cache_dtype = "kvarn_k4v4_g128"
-    vllm_config.cache_config.kv_cache_layout = "LBHNC"
-    vllm_config.scheduler_config.max_num_seqs = 3
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=512),
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v4_g128",
+            mamba_cache_mode="none",
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=3),
+    )
 
     blocks_per_request = [
         group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
