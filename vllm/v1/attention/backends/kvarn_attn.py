@@ -893,6 +893,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _shared_out_rot_fp32_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _shared_output_fp32_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _shared_fused_out_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    # Optional native Xe2 split-K scratch. The class-level owner keeps the
+    # allocations alive across asynchronous layer launches and lets every
+    # KVarN layer on the device reuse the same stream-ordered buffers.
+    _shared_native_decode_scratch: ClassVar[
+        dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    ] = {}
     _shared_mid_o_buf: ClassVar[
         dict[torch.device, torch.Tensor]
     ] = {}  # split-K partials
@@ -1033,6 +1039,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._out_rot_fp32_buf: torch.Tensor | None = None
         self._output_fp32_buf: torch.Tensor | None = None
         self._fused_out_buf: torch.Tensor | None = None
+        self._native_decode_scratch: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
         self._mid_o_buf: torch.Tensor | None = None
         self._mid_lse_buf: torch.Tensor | None = None
         self._fa_K_buf: torch.Tensor = None  # type: ignore[assignment]
@@ -1268,7 +1277,56 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cls._shared_fused_out_buf[bkey] = torch.empty(
                 q_rows, D, dtype=torch.float16, device=device
             )
-        from vllm.v1.attention.ops.triton_kvarn_decode import adaptive_num_kv_splits
+        from vllm.v1.attention.ops.triton_kvarn_decode import (
+            adaptive_num_kv_splits,
+            kvarn_native_feature_enabled,
+            kvarn_native_split_count,
+        )
+
+        use_native_scratch = (
+            kvarn_native_feature_enabled("PERSISTENT_SCRATCH")
+            and device.type == "xpu"
+            and D == 256
+            and Hq == 24
+            and Hk == 4
+            and cfg.group == 128
+            and cfg.key_bits == 4
+            and cfg.value_bits == 4
+            and cfg.record_bytes >= 35_072
+            and cfg.record_bytes % 4 == 0
+            and int(getattr(self, "sliding_window", 0) or 0) == 0
+            and os.environ.get("KVARN_NATIVE_XPU_DPAS_LAYOUT", "0") != "1"
+            and hasattr(torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch")
+        )
+        native_key = None
+        if use_native_scratch:
+            native_splits = kvarn_native_split_count(self._max_model_len)
+            native_batch = min(max(self._max_num_seqs, 1), 12)
+            native_key = (device, D, Hk, native_batch, native_splits)
+            if native_key not in cls._shared_native_decode_scratch:
+                cls._shared_native_decode_scratch[native_key] = (
+                    torch.empty(
+                        native_batch,
+                        Hq * native_splits,
+                        D,
+                        dtype=torch.float16,
+                        device=device,
+                    ),
+                    torch.empty(
+                        native_batch,
+                        Hq,
+                        native_splits,
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    torch.empty(
+                        native_batch,
+                        Hq,
+                        native_splits,
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                )
 
         # Split-K partial buffers, sized to EXACTLY what the split-K decode path
         # can index: it runs ONLY on pure single-query decode steps, whose row
@@ -1321,6 +1379,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._out_rot_fp32_buf = cls._shared_out_rot_fp32_buf[bkey]
         self._output_fp32_buf = cls._shared_output_fp32_buf[bkey]
         self._fused_out_buf = cls._shared_fused_out_buf[bkey]
+        self._native_decode_scratch = (
+            cls._shared_native_decode_scratch[native_key]
+            if native_key is not None
+            else None
+        )
         self._mid_o_buf = cls._shared_mid_o_buf[bkey]
         self._mid_lse_buf = cls._shared_mid_lse_buf[bkey]
         self._fa_K_buf = cls._shared_fa_K_buf[bkey]

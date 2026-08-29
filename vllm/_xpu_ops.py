@@ -25,6 +25,67 @@ else:
     except ImportError:
         from torch.library import impl_abstract as register_fake
 
+
+# The Xe2 KVarN operators are registered by vllm-xpu-kernels. They mutate
+# caller-owned outputs and intentionally return nothing, so their fake kernels
+# only need to preserve that schema contract for Dynamo/FakeTensor tracing.
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode"):
+
+    @register_fake("_vllm_fa2_C::kvarn_decode")
+    def _kvarn_decode_fake(
+        query: torch.Tensor,
+        packed_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        output: torch.Tensor,
+        max_seq_len: int,
+        softmax_scale: float,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch"):
+
+    @register_fake("_vllm_fa2_C::kvarn_decode_with_scratch")
+    def _kvarn_decode_with_scratch_fake(
+        query: torch.Tensor,
+        packed_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        temp_output: torch.Tensor,
+        exp_sums: torch.Tensor,
+        max_logits: torch.Tensor,
+        output: torch.Tensor,
+        max_seq_len: int,
+        softmax_scale: float,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_materialize_packed_kv"):
+
+    @register_fake("_vllm_fa2_C::kvarn_materialize_packed_kv")
+    def _kvarn_materialize_packed_kv_fake(
+        packed_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        max_seq_len: int,
+    ) -> None:
+        return
+
+
 if hasattr(torch.ops._xpu_C, "fp8_gemm"):
 
     @register_fake("_xpu_C::fp8_gemm")

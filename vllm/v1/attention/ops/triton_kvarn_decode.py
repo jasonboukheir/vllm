@@ -21,9 +21,99 @@ import os
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import num_compute_units
+
+logger = init_logger(__name__)
+
+_KVARN_NATIVE_RECORD_BYTES = 35_072
+_KVARN_NATIVE_SPLIT_COUNTS = frozenset({1, 2, 4, 8, 16, 17, 24, 32})
+_KVARN_NATIVE_MAX_BATCH = 12
+
+
+def kvarn_native_feature_enabled(feature: str) -> bool:
+    """Return whether an opt-in native KVarN sub-feature is enabled.
+
+    ``KVARN_NATIVE_XPU`` is the master switch. Individual sub-features default
+    on once the master switch is set, and can be disabled independently while
+    comparing the direct decoder and materializer against their Triton peers.
+    """
+    return (
+        os.environ.get("KVARN_NATIVE_XPU", "0") == "1"
+        and os.environ.get(f"KVARN_NATIVE_XPU_{feature}", "1") == "1"
+    )
+
+
+def kvarn_native_split_count(max_seq_len: int) -> int:
+    """Mirror the native decoder's split selection for scratch sizing."""
+    text = os.environ.get("KVARN_NATIVE_XPU_SPLITS", "1")
+    try:
+        splits = int(text)
+    except ValueError as exc:
+        raise ValueError(
+            "KVARN_NATIVE_XPU_SPLITS must be one of 1, 2, 4, 8, 16, 17, 24, or 32"
+        ) from exc
+    if splits not in _KVARN_NATIVE_SPLIT_COUNTS:
+        raise ValueError(
+            "KVARN_NATIVE_XPU_SPLITS must be one of 1, 2, 4, 8, 16, 17, 24, or 32"
+        )
+    # The C++ wrapper collapses short-context multi-split requests to one split
+    # to avoid empty partials and their reduction drift.
+    kv_tiles = (max_seq_len + 63) // 64
+    return 1 if splits > 1 and kv_tiles < splits else splits
+
+
+def kvarn_native_problem_supported(
+    *,
+    device_type: str,
+    batch_size: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    group: int,
+    key_bits: int,
+    value_bits: int,
+    record_bytes: int,
+    sliding_window: int,
+    has_lookup: bool,
+    has_tail_pool: bool,
+    is_capturing: bool,
+) -> bool:
+    """Pure eligibility check for the narrow Xe2 qlen=1 decoder ABI."""
+    return (
+        device_type == "xpu"
+        and 1 <= batch_size <= _KVARN_NATIVE_MAX_BATCH
+        and num_query_heads == 24
+        and num_kv_heads == 4
+        and head_dim == 256
+        and group == 128
+        and key_bits == 4
+        and value_bits == 4
+        and record_bytes >= _KVARN_NATIVE_RECORD_BYTES
+        and record_bytes % 4 == 0
+        and sliding_window == 0
+        and has_lookup
+        and has_tail_pool
+        and not is_capturing
+        # The current vLLM store writes the natural compact layout. A DPAS
+        # reader is only valid after the separately-scoped DPAS store lands.
+        and os.environ.get("KVARN_NATIVE_XPU_DPAS_LAYOUT", "0") != "1"
+    )
+
+
+def kvarn_native_layer_selected(layer_name: str, layer_filter: str) -> bool:
+    """Match comma-separated layer paths on dot-component boundaries."""
+    if not layer_filter:
+        return True
+    dotted_name = f".{layer_name.strip('.')}."
+    return any(
+        f".{candidate.strip().strip('.')}." in dotted_name
+        for candidate in layer_filter.split(",")
+        if candidate.strip()
+    )
+
 
 # Number of KV-sequence splits for the split-K flash-decoding kernel. More
 # splits = better load-balancing of ragged burst seqlens across SMs, at the cost
@@ -858,6 +948,100 @@ def kvarn_decode_attention(
     with torch.profiler.record_function("kvarn_q_rotation"):
         torch.mm(query.reshape(N, D), H16, out=q_rot_fp16)
 
+    is_capturing = (
+        query.device.type == "xpu" and torch.xpu.is_current_stream_capturing()
+    )
+    native_layer_selected = kvarn_native_layer_selected(
+        getattr(impl, "layer_name", ""),
+        os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
+    )
+    use_native_xpu = (
+        kvarn_native_feature_enabled("DECODE")
+        and kvarn_native_problem_supported(
+            device_type=query.device.type,
+            batch_size=B,
+            num_query_heads=Hq,
+            num_kv_heads=Hk,
+            head_dim=D,
+            group=group,
+            key_bits=cfg.key_bits,
+            value_bits=cfg.value_bits,
+            record_bytes=cfg.record_bytes,
+            sliding_window=int(getattr(impl, "sliding_window", 0) or 0),
+            has_lookup=impl._block_to_slot_t is not None,
+            has_tail_pool=(
+                impl._tail_K_pool is not None and impl._tail_V_pool is not None
+            ),
+            is_capturing=is_capturing,
+        )
+        and native_layer_selected
+        and kv_cache.shape[-1] == cfg.record_bytes
+        and kv_cache.is_contiguous()
+        and md.block_table[:B].is_contiguous()
+        and md.seq_lens[:B].is_contiguous()
+        and impl._block_to_slot_t.is_contiguous()
+        and impl._tail_K_pool.is_contiguous()
+        and impl._tail_V_pool.is_contiguous()
+        and q_rot_fp16.is_contiguous()
+        and int(md.max_seq_len) >= 1
+        and hasattr(torch.ops._vllm_fa2_C, "kvarn_decode")
+    )
+    if use_native_xpu:
+        logger.info_once(
+            "Using the native Xe2 KVarN qlen=1 decoder (batch limit %d)",
+            _KVARN_NATIVE_MAX_BATCH,
+        )
+        output_rot = impl._fused_out_buf[:N].view(B, Hq, D)
+        native_splits = kvarn_native_split_count(int(md.max_seq_len))
+        native_scratch = impl._native_decode_scratch
+        scratch_fits = (
+            native_scratch is not None
+            and native_scratch[0].shape[0] >= B
+            and native_scratch[0].shape[1] >= Hq * native_splits
+            and native_scratch[1].shape[0] >= B
+            and native_scratch[1].shape[2] >= native_splits
+        )
+        with torch.profiler.record_function("kvarn_native_xpu_decode"):
+            if scratch_fits and hasattr(
+                torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch"
+            ):
+                temp_output, exp_sums, max_logits = native_scratch
+                torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+                    q_rot_fp16.view(B, Hq, D),
+                    kv_cache,
+                    md.block_table[:B],
+                    md.seq_lens[:B],
+                    impl._block_to_slot_t,
+                    impl._tail_K_pool,
+                    impl._tail_V_pool,
+                    temp_output[:B],
+                    exp_sums[:B],
+                    max_logits[:B],
+                    output_rot,
+                    int(md.max_seq_len),
+                    scale,
+                )
+            else:
+                # This wrapper owns temporary scratch internally. Its C++
+                # implementation records all three allocations on the current
+                # XPU stream before returning, so the caching allocator cannot
+                # recycle them while the asynchronous reducer still reads them.
+                torch.ops._vllm_fa2_C.kvarn_decode(
+                    q_rot_fp16.view(B, Hq, D),
+                    kv_cache,
+                    md.block_table[:B],
+                    md.seq_lens[:B],
+                    impl._block_to_slot_t,
+                    impl._tail_K_pool,
+                    impl._tail_V_pool,
+                    output_rot,
+                    int(md.max_seq_len),
+                    scale,
+                )
+        with torch.profiler.record_function("kvarn_output_unrotation"):
+            out_unrot = torch.mm(output_rot.reshape(N, D), H16)
+            return out_unrot.view(B, Hq, D).to(out_dtype)
+
     # 2+3. Attention. Two paths (KVARN_FUSED_DECODE, default fused):
     #   FUSED      — one kernel reads int4/pool directly, dequants in registers,
     #                online-softmax; never materializes fp16 K/V to HBM. Moves
@@ -1008,41 +1192,82 @@ def kvarn_decode_attention(
         K_packed = impl._fa_K_buf
         V_packed = impl._fa_V_buf
         with torch.profiler.record_function("kvarn_build_packed_kv"):
-            _kvarn_build_packed_kv_kernel[(B * max_blocks_per_req, Hk)](
-                md.block_table,
-                md.seq_lens,
-                md.fa_cu_seqlens_k,
-                impl._block_to_slot_t,
-                kv_cache,
-                impl._tail_K_pool,
-                impl._tail_V_pool,
-                K_packed,
-                V_packed,
-                md.block_table.stride(0),
-                kv_cache.stride(0),
-                kv_cache.stride(1),
-                impl._tail_K_pool.stride(0),
-                impl._tail_K_pool.stride(1),
-                impl._tail_K_pool.stride(2),
-                K_packed.stride(0),
-                K_packed.stride(1),
-                MAX_BLOCKS_PER_REQ=max_blocks_per_req,
-                D=D,
-                GROUP=group,
-                K_BITS=cfg.key_bits,
-                V_BITS=cfg.value_bits,
-                NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
-                K_PACKED_OFFSET=cfg.k_packed_offset,
-                K_S_COL_OFFSET=cfg.k_s_col_offset,
-                K_ZP_OFFSET=cfg.k_zp_offset,
-                K_S_ROW_OFFSET=cfg.k_s_row_offset,
-                V_PACKED_OFFSET=cfg.v_packed_offset,
-                V_S_COL_OFFSET=cfg.v_s_col_offset,
-                V_S_ROW_OFFSET=cfg.v_s_row_offset,
-                V_ZP_OFFSET=cfg.v_zp_offset,
-                num_warps=4,
-                num_stages=2,
+            use_native_materializer = (
+                kvarn_native_feature_enabled("MATERIALIZE")
+                and query.device.type == "xpu"
+                and not is_capturing
+                and native_layer_selected
+                and Hk == 4
+                and D == 256
+                and group == 128
+                and cfg.key_bits == 4
+                and cfg.value_bits == 4
+                and cfg.record_bytes >= _KVARN_NATIVE_RECORD_BYTES
+                and cfg.record_bytes % 4 == 0
+                and os.environ.get("KVARN_NATIVE_XPU_DPAS_LAYOUT", "0") != "1"
+                and kv_cache.shape[-1] == cfg.record_bytes
+                and kv_cache.is_contiguous()
+                and md.block_table[:B].is_contiguous()
+                and md.seq_lens[:B].is_contiguous()
+                and md.fa_cu_seqlens_k[: B + 1].is_contiguous()
+                and impl._block_to_slot_t.is_contiguous()
+                and impl._tail_K_pool.is_contiguous()
+                and impl._tail_V_pool.is_contiguous()
+                and K_packed.is_contiguous()
+                and V_packed.is_contiguous()
+                and int(md.max_seq_len) >= 1
+                and hasattr(torch.ops._vllm_fa2_C, "kvarn_materialize_packed_kv")
             )
+            if use_native_materializer:
+                logger.info_once("Using the native Xe2 KVarN FP16 materializer")
+                torch.ops._vllm_fa2_C.kvarn_materialize_packed_kv(
+                    kv_cache,
+                    md.block_table[:B],
+                    md.seq_lens[:B],
+                    md.fa_cu_seqlens_k[: B + 1],
+                    impl._block_to_slot_t,
+                    impl._tail_K_pool,
+                    impl._tail_V_pool,
+                    K_packed,
+                    V_packed,
+                    int(md.max_seq_len),
+                )
+            else:
+                _kvarn_build_packed_kv_kernel[(B * max_blocks_per_req, Hk)](
+                    md.block_table,
+                    md.seq_lens,
+                    md.fa_cu_seqlens_k,
+                    impl._block_to_slot_t,
+                    kv_cache,
+                    impl._tail_K_pool,
+                    impl._tail_V_pool,
+                    K_packed,
+                    V_packed,
+                    md.block_table.stride(0),
+                    kv_cache.stride(0),
+                    kv_cache.stride(1),
+                    impl._tail_K_pool.stride(0),
+                    impl._tail_K_pool.stride(1),
+                    impl._tail_K_pool.stride(2),
+                    K_packed.stride(0),
+                    K_packed.stride(1),
+                    MAX_BLOCKS_PER_REQ=max_blocks_per_req,
+                    D=D,
+                    GROUP=group,
+                    K_BITS=cfg.key_bits,
+                    V_BITS=cfg.value_bits,
+                    NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
+                    K_PACKED_OFFSET=cfg.k_packed_offset,
+                    K_S_COL_OFFSET=cfg.k_s_col_offset,
+                    K_ZP_OFFSET=cfg.k_zp_offset,
+                    K_S_ROW_OFFSET=cfg.k_s_row_offset,
+                    V_PACKED_OFFSET=cfg.v_packed_offset,
+                    V_S_COL_OFFSET=cfg.v_s_col_offset,
+                    V_S_ROW_OFFSET=cfg.v_s_row_offset,
+                    V_ZP_OFFSET=cfg.v_zp_offset,
+                    num_warps=4,
+                    num_stages=2,
+                )
         with torch.profiler.record_function("kvarn_flash_attn"):
             output_rot = flash_attn_varlen_func(
                 q=q_rot_fp16.view(B, Hq, D),
