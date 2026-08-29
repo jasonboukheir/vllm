@@ -11,13 +11,20 @@ from vllm.model_executor.layers.quantization.kvarn.config import (
     KVarNConfig,
 )
 from vllm.platforms.xpu import XPUPlatform
+from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionBackend
+from vllm.v1.attention.backends.turboquant_attn import TurboQuantAttentionBackend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
-    KVarNFullAttentionSpec,
-    TQFullAttentionSpec,
+    KVCacheLayout,
+    KVCacheTensor,
+    compute_layer_kv_cache_shape_bytes,
+    compute_layout_strides,
+    create_kv_cache_views,
+    get_kv_quant_mode,
+    is_quantized_kv_cache,
 )
 
 
@@ -47,6 +54,12 @@ def test_presets_are_an_auditable_fixed_contract(name, key_bits, value_bits, gro
 def test_unknown_preset_fails_closed():
     with pytest.raises(ValueError, match="Unknown KVarN cache dtype"):
         KVarNConfig.from_cache_dtype("kvarn_k3v2_g128", head_dim=256)
+
+
+@pytest.mark.parametrize("cache_dtype", KVARN_PRESETS)
+def test_kvarn_presets_are_registered_as_quantized_cache_modes(cache_dtype):
+    assert get_kv_quant_mode(cache_dtype).is_kvarn
+    assert is_quantized_kv_cache(cache_dtype)
 
 
 @pytest.mark.parametrize(
@@ -127,14 +140,55 @@ def test_xpu_routes_every_kvarn_preset_to_kvarn_backend(cache_dtype):
     )
 
 
-def test_kvarn_page_unification_does_not_change_quantization_group():
-    kvarn = KVarNFullAttentionSpec(
+def test_kvarn_current_layout_uses_one_packed_record_per_tile():
+    base = FullAttentionSpec(
         block_size=128,
         num_kv_heads=1,
         head_size=256,
         head_size_v=256,
         dtype=torch.bfloat16,
-        tq_slot_size=256,
+        kv_quant_mode=get_kv_quant_mode("kvarn_k4v4_g128"),
+    )
+    kvarn = KVarNAttentionBackend.customize_spec(base)
+    config = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128", head_dim=256)
+    assert kvarn.tokens_per_state == config.group
+    assert kvarn.state_content_size_bytes == config.tile_bytes_aligned
+    assert compute_layer_kv_cache_shape_bytes(kvarn, 3) == (
+        3,
+        1,
+        1,
+        config.tile_bytes_aligned,
+    )
+
+    layer_stride, block_stride, _, _, _ = compute_layout_strides(
+        kvarn, 3, 1, KVCacheLayout.LBHNC
+    )
+    tensor = KVCacheTensor(
+        size=kvarn.page_size_bytes * 3,
+        layers=["kvarn"],
+        layer_stride=layer_stride,
+        block_stride=block_stride,
+    )
+    raw = torch.empty(tensor.size, dtype=torch.int8)
+    (view,) = create_kv_cache_views(
+        raw, kvarn, 3, KVCacheLayout.LBHNC, tensor
+    )
+    assert view.shape == (3, 1, 1, config.tile_bytes_aligned)
+    records = KVarNAttentionBackend._record_cache_view(view)
+    assert records.shape == (3, 1, config.tile_bytes_aligned)
+    assert records.stride() == view.squeeze(2).stride()
+
+
+def test_kvarn_page_unification_scales_by_whole_quantization_tiles():
+    kvarn = KVarNAttentionBackend.customize_spec(
+        FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=256,
+            head_size_v=256,
+            dtype=torch.bfloat16,
+            kv_quant_mode=get_kv_quant_mode("kvarn_k4v4_g128"),
+        )
     )
     native = FullAttentionSpec(
         block_size=128,
@@ -144,18 +198,20 @@ def test_kvarn_page_unification_does_not_change_quantization_group():
         dtype=torch.bfloat16,
     )
     unified = unify_kv_cache_spec_page_size({"kvarn": kvarn, "native": native})
-    assert unified["kvarn"].block_size == 128
+    assert unified["kvarn"].block_size % kvarn.tokens_per_state == 0
     assert unified["kvarn"].page_size_bytes == unified["native"].page_size_bytes
 
 
 def test_turboquant_page_unification_retains_scaling_behavior():
-    turboquant = TQFullAttentionSpec(
-        block_size=128,
-        num_kv_heads=1,
-        head_size=256,
-        head_size_v=256,
-        dtype=torch.bfloat16,
-        tq_slot_size=256,
+    turboquant = TurboQuantAttentionBackend.customize_spec(
+        FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=256,
+            head_size_v=256,
+            dtype=torch.bfloat16,
+            kv_quant_mode=get_kv_quant_mode("turboquant_4bit_nc"),
+        )
     )
     native = FullAttentionSpec(
         block_size=128,
@@ -167,5 +223,5 @@ def test_turboquant_page_unification_retains_scaling_behavior():
     unified = unify_kv_cache_spec_page_size(
         {"turboquant": turboquant, "native": native}
     )
-    assert unified["turboquant"].block_size == 256
+    assert unified["turboquant"].block_size >= turboquant.block_size
     assert unified["turboquant"].page_size_bytes == unified["native"].page_size_bytes
