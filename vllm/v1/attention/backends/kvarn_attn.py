@@ -182,11 +182,10 @@ class KVarNAttentionBackend(AttentionBackend):
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         # One vLLM block == one KVarN tile (cfg.group). Supported tile sizes are
         # the distinct `group` values across the registered presets (64, 128).
+        from vllm.config.vllm import get_current_vllm_config
         from vllm.model_executor.layers.quantization.kvarn.config import (
             KVARN_PRESETS,
         )
-
-        from vllm.config.vllm import get_current_vllm_config
 
         try:
             cache_dtype = get_current_vllm_config().cache_config.cache_dtype
@@ -1705,6 +1704,10 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     @staticmethod
     def _record_cache_view(kv_cache: torch.Tensor) -> torch.Tensor:
         """Normalize vLLM's logical ``[B,H,1,C]`` view to packed records."""
+        if kv_cache.numel() == 0:
+            # vLLM profiles activation memory before allocating the KV cache
+            # and passes an empty one-dimensional sentinel to every backend.
+            return kv_cache
         if kv_cache.ndim == 4:
             if kv_cache.shape[2] != 1:
                 raise ValueError(
@@ -2165,7 +2168,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         kv_cache = self._record_cache_view(kv_cache)
-        if kv_cache.shape[-1] != self.kvarn_config.record_bytes:
+        profiling_without_cache = kv_cache.numel() == 0
+        if (
+            not profiling_without_cache
+            and kv_cache.shape[-1] != self.kvarn_config.record_bytes
+        ):
             raise RuntimeError(
                 "KVarN cache record ABI mismatch: allocated "
                 f"{kv_cache.shape[-1]} bytes, expected "
@@ -2181,6 +2188,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 dtype=query.dtype,
                 device=device,
             )
+        if profiling_without_cache:
+            # Persistent tail/scratch pools and their kernel warmups must be
+            # included in vLLM's memory profile even though the physical KV
+            # tensor does not exist yet.
+            self._ensure_pool(device, num_blocks_hint=0)
         if attn_metadata is None:
             return output.fill_(0)
 
@@ -2189,10 +2201,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             return output.fill_(0)
 
         # Make sure pool + block-lookup tensors exist and cover num_blocks.
-        self._ensure_pool(kv_cache.device, num_blocks_hint=kv_cache.shape[0])
-        # Cache the kv_cache ref so the metadata builder can drive flushes
-        # into this layer's int4 cache (outside the captured region).
-        self._kv_cache_ref = kv_cache
+        if not profiling_without_cache:
+            self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
+            # Cache the kv_cache ref so the metadata builder can drive flushes
+            # into this layer's int4 cache (outside the captured region).
+            self._kv_cache_ref = kv_cache
 
         # Flush is now triggered from KVarNMetadataBuilder.build() between
         # captured graph replays — nothing to do here at the top of forward.
@@ -2209,6 +2222,17 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             value = value.to(torch.float16)
 
         q = query[:N].view(N, self.num_heads, self.head_size)
+
+        # The empty-cache profiling batch is expected to be a first-chunk
+        # prefill, which can compute attention directly from Q/K/V.  If a
+        # future profiler supplies cached/decode metadata without a cache,
+        # return a deterministic placeholder instead of indexing the sentinel.
+        if profiling_without_cache and (
+            not attn_metadata.is_prefill
+            or attn_metadata.num_decodes != 0
+            or attn_metadata.has_cached_multiquery
+        ):
+            return output.fill_(0)
 
         if not attn_metadata.is_prefill:
             attn_out = self._decode_path(q, kv_cache, attn_metadata)

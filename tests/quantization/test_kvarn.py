@@ -200,6 +200,40 @@ def test_kvarn_current_layout_uses_one_packed_record_per_tile():
     assert records.stride() == view.squeeze(2).stride()
 
 
+def test_kvarn_forward_profiles_with_empty_cache_sentinel():
+    impl = object.__new__(KVarNAttentionImpl)
+    impl.kvarn_config = SimpleNamespace(record_bytes=35072)
+    impl.num_heads = 2
+    impl.num_kv_heads = 1
+    impl.head_size = 4
+    pool_calls = []
+    impl._ensure_pool = lambda device, num_blocks_hint: pool_calls.append(
+        (device, num_blocks_hint)
+    )
+    impl._prefill_first_chunk = (
+        lambda q, k, v, metadata, cache: torch.full_like(q, 2)
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=3,
+        is_prefill=True,
+        num_decodes=0,
+        num_decode_tokens=0,
+        has_cached_multiquery=False,
+        vq_seqlen=None,
+    )
+    query = torch.zeros(3, 8, dtype=torch.float16)
+    key = torch.zeros(3, 4, dtype=torch.float16)
+    value = torch.zeros_like(key)
+    empty_cache = torch.empty(0, dtype=torch.uint8)
+
+    output = impl.forward(None, query, key, value, empty_cache, metadata)
+
+    assert pool_calls == [(query.device, 0)]
+    assert output.shape == query.shape
+    assert torch.equal(output, torch.full_like(query, 2))
+    assert not hasattr(impl, "_kv_cache_ref")
+
+
 def test_kvarn_page_unification_scales_by_whole_quantization_tiles():
     kvarn = KVarNAttentionBackend.customize_spec(
         FullAttentionSpec(
