@@ -993,7 +993,7 @@ def get_max_concurrency_for_kv_cache_config(
     if kv_cache_config.has_independent_kv_cache_pools:
         assert kv_cache_config.kv_cache_pools is not None
         max_concurrency = min(
-            pool.num_blocks
+            (pool.num_blocks - 1)
             / sum(blocks_per_request[group_id] for group_id in pool.group_ids)
             for pool in kv_cache_config.kv_cache_pools
         )
@@ -1380,79 +1380,20 @@ def validate_kv_cache_layout(
         )
 
 
-def get_kv_cache_config_from_groups(
-    vllm_config: VllmConfig,
+def _plan_kv_cache_tensors(
     kv_cache_groups: list[KVCacheGroupSpec],
-    available_memory: int,
-) -> KVCacheConfig:
-    """
-    Generate the KV cache configuration from the KV cache groups and spec
-    of each layer.
-
-    Args:
-        vllm_config: The global VllmConfig
-        kv_cache_groups: The KV cache groups
-        available_memory: Memory available for KV cache in bytes
-    Returns:
-        The generated KVCacheConfig
-    """
-    if len(kv_cache_groups) == 0:
-        # Attention free models do not have KV cache.
-        # Return num_blocks=1 as BlockPool always needs a null_block.
-        return KVCacheConfig(
-            num_blocks=1,
-            kv_cache_tensors=[],
-            kv_cache_groups=kv_cache_groups,
-            prefix_cache_retention_interval=(
-                vllm_config.cache_config.prefix_cache_retention_interval
-            ),
-        )
-
-    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
-    validate_kv_cache_layout(layout, kv_cache_groups)
-    independent_pools = _uses_independent_kvarn_pools(vllm_config, kv_cache_groups)
-
-    if independent_pools:
-        # Size each namespace for the same number of simultaneously resident
-        # requests. Mamba align-mode block tables span the sequence, but only
-        # their small rolling set of state pages is resident.
-        blocks_per_request = [
-            _physical_blocks_per_request(vllm_config, group)
-            for group in kv_cache_groups
-        ]
-        bytes_per_request = sum(
-            len(group.layer_names)
-            * group.kv_cache_spec.page_size_bytes
-            * request_blocks
-            for group, request_blocks in zip(kv_cache_groups, blocks_per_request)
-        )
-        num_requests = may_override_num_blocks(
-            vllm_config, available_memory // bytes_per_request
-        )
-        pool_block_counts = [
-            num_requests * request_blocks for request_blocks in blocks_per_request
-        ]
-        kv_cache_pools = [
-            KVCachePoolSpec(num_blocks=num_blocks, group_ids=[group_id])
-            for group_id, num_blocks in enumerate(pool_block_counts)
-        ]
-    else:
-        bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
-        num_blocks = may_override_num_blocks(
-            vllm_config, available_memory // bytes_per_block
-        )
-        pool_block_counts = [num_blocks]
-        kv_cache_pools = None
-
-    # Groups in the legacy pool alias from byte zero. Independent KVarN pools
-    # instead get one allocation each while retaining the current stride-aware
-    # layout contract.
+    pool_block_counts: list[int],
+    layout: KVCacheLayout,
+    independent_pools: bool,
+) -> list[KVCacheTensor]:
+    """Build current stride-aware views for shared or independent pools."""
     kv_cache_tensors: list[KVCacheTensor] = []
     group_sets = (
         [[group] for group in kv_cache_groups]
         if independent_pools
         else [kv_cache_groups]
     )
+    assert len(group_sets) == len(pool_block_counts)
     for pool_id, (pool_groups, pool_num_blocks) in enumerate(
         zip(group_sets, pool_block_counts)
     ):
@@ -1501,6 +1442,127 @@ def get_kv_cache_config_from_groups(
                     )
                 )
                 byte_offset += len(layer_names) * spec.page_size_bytes
+    return kv_cache_tensors
+
+
+def get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    """
+    Generate the KV cache configuration from the KV cache groups and spec
+    of each layer.
+
+    Args:
+        vllm_config: The global VllmConfig
+        kv_cache_groups: The KV cache groups
+        available_memory: Memory available for KV cache in bytes
+    Returns:
+        The generated KVCacheConfig
+    """
+    if len(kv_cache_groups) == 0:
+        # Attention free models do not have KV cache.
+        # Return num_blocks=1 as BlockPool always needs a null_block.
+        return KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[],
+            kv_cache_groups=kv_cache_groups,
+            prefix_cache_retention_interval=(
+                vllm_config.cache_config.prefix_cache_retention_interval
+            ),
+        )
+
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    validate_kv_cache_layout(layout, kv_cache_groups)
+    independent_pools = _uses_independent_kvarn_pools(vllm_config, kv_cache_groups)
+
+    if independent_pools:
+        blocks_per_request = [
+            _physical_blocks_per_request(vllm_config, group)
+            for group in kv_cache_groups
+        ]
+        bytes_per_block = [
+            len(group.layer_names) * group.kv_cache_spec.page_size_bytes
+            for group in kv_cache_groups
+        ]
+        max_num_seqs = getattr(
+            getattr(vllm_config, "scheduler_config", None), "max_num_seqs", 1
+        )
+
+        # Every namespace owns one null block. Recurrent state has a fixed
+        # per-live-request cost, while attention pages are shared dynamically
+        # among short and long requests. Reserve Mamba for the scheduler's
+        # concurrency ceiling, then spend the remaining budget on attention.
+        pool_block_counts = [1] * len(kv_cache_groups)
+        for group_id, (group, request_blocks) in enumerate(
+            zip(kv_cache_groups, blocks_per_request)
+        ):
+            if isinstance(group.kv_cache_spec, MambaSpec):
+                pool_block_counts[group_id] += max_num_seqs * request_blocks
+
+        reserved_bytes = sum(
+            block_count * block_bytes
+            for block_count, block_bytes in zip(pool_block_counts, bytes_per_block)
+        )
+        if reserved_bytes > available_memory:
+            raise ValueError(
+                "Insufficient KV cache memory to reserve Mamba state for "
+                f"max_num_seqs={max_num_seqs}: required {reserved_bytes} bytes, "
+                f"available {available_memory} bytes"
+            )
+
+        attention_group_ids = [
+            group_id
+            for group_id, group in enumerate(kv_cache_groups)
+            if not isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        assert attention_group_ids
+        token_quantum = math.lcm(
+            *(
+                kv_cache_groups[group_id].kv_cache_spec.block_size
+                for group_id in attention_group_ids
+            )
+        )
+        blocks_per_quantum = {
+            group_id: token_quantum
+            // kv_cache_groups[group_id].kv_cache_spec.block_size
+            for group_id in attention_group_ids
+        }
+        bytes_per_quantum = sum(
+            bytes_per_block[group_id] * blocks_per_quantum[group_id]
+            for group_id in attention_group_ids
+        )
+        # get_kv_cache_configs has already translated num_gpu_blocks_override
+        # into an effective independent-pool byte budget. Applying the legacy
+        # block override again here would confuse resident requests with
+        # attention token quanta.
+        num_quanta = (available_memory - reserved_bytes) // bytes_per_quantum
+        attention_capacity_tokens = num_quanta * token_quantum
+        max_model_len = vllm_config.model_config.max_model_len
+        if attention_capacity_tokens < max_model_len:
+            raise ValueError(
+                "Insufficient attention KV cache after reserving Mamba state "
+                f"for max_num_seqs={max_num_seqs}: capacity "
+                f"{attention_capacity_tokens} tokens, required {max_model_len}"
+            )
+        for group_id in attention_group_ids:
+            pool_block_counts[group_id] += num_quanta * blocks_per_quantum[group_id]
+        kv_cache_pools = [
+            KVCachePoolSpec(num_blocks=num_blocks, group_ids=[group_id])
+            for group_id, num_blocks in enumerate(pool_block_counts)
+        ]
+    else:
+        bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
+        num_blocks = may_override_num_blocks(
+            vllm_config, available_memory // bytes_per_block
+        )
+        pool_block_counts = [num_blocks]
+        kv_cache_pools = None
+
+    kv_cache_tensors = _plan_kv_cache_tensors(
+        kv_cache_groups, pool_block_counts, layout, independent_pools
+    )
 
     num_blocks = min(pool_block_counts)
 
@@ -1993,8 +2055,7 @@ def update_kv_cache_capacity(
         for pool_id, pool in enumerate(kv_cache_config.kv_cache_pools):
             groups = [kv_cache_config.kv_cache_groups[i] for i in pool.group_ids]
             request_blocks = sum(
-                _physical_blocks_per_request(vllm_config, group)
-                for group in groups
+                _physical_blocks_per_request(vllm_config, group) for group in groups
             )
             pool_tensor_sizes = {
                 tensor.size
@@ -2003,16 +2064,18 @@ def update_kv_cache_capacity(
             }
             assert len(pool_tensor_sizes) <= 1
             allocated_bytes = next(iter(pool_tensor_sizes), 0)
-            pool_concurrency = pool.num_blocks / request_blocks
+            pool_concurrency = (pool.num_blocks - 1) / request_blocks
             logger.info_once(
                 "KV cache pool %d: groups=%s, types=%s, layers=%d, "
-                "physical_blocks=%s, block_sizes=%s, page_sizes=%s bytes, "
+                "physical_blocks=%s, null_blocks=1, usable_blocks=%s, "
+                "block_sizes=%s, page_sizes=%s bytes, "
                 "allocated=%s bytes, max_request_blocks=%s, concurrency=%.2fx%s",
                 pool_id,
                 tuple(pool.group_ids),
                 tuple(type(group.kv_cache_spec).__name__ for group in groups),
                 sum(len(group.layer_names) for group in groups),
                 f"{pool.num_blocks:,}",
+                f"{pool.num_blocks - 1:,}",
                 tuple(group.kv_cache_spec.block_size for group in groups),
                 tuple(group.kv_cache_spec.page_size_bytes for group in groups),
                 f"{allocated_bytes:,}",
@@ -2296,16 +2359,18 @@ def get_kv_cache_configs(
                     vllm_config, groups
                 )
                 unit_name = "resident requests"
+                null_bytes = _null_block_bytes(vllm_config, groups)
             else:
                 bytes_per_unit = _pool_bytes_per_block(groups)
                 unit_name = "blocks"
+                null_bytes = 0
             logger.info(
                 "Overriding KV cache capacity from %d to %d %s",
                 avail_mem // bytes_per_unit,
                 override,
                 unit_name,
             )
-            adjusted_memory.append(override * bytes_per_unit)
+            adjusted_memory.append(override * bytes_per_unit + null_bytes)
         available_memory = adjusted_memory
 
     # Reserve the null block BlockPool permanently holds back, so auto-fit and
@@ -2343,37 +2408,37 @@ def get_kv_cache_configs(
             )
         )
 
-    # Change the num_blocks of each rank to the smallest among all ranks.
-    # We also need to shrink the tensor size proportionally to avoid
-    # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+    # Reconcile each physical namespace independently across workers. KVarN
+    # attention and recurrent pools intentionally have different policies, so
+    # one legacy num_blocks ratio cannot describe both.
+    num_pools = len(kv_cache_configs[0].kv_cache_pools or ())
+    assert all(
+        len(config.kv_cache_pools or ()) == num_pools for config in kv_cache_configs
     )
-    for i, kv_cache_config in enumerate(kv_cache_configs):
-        if kv_cache_config.num_blocks == min_num_blocks:
+    min_pool_blocks = [
+        min(config.num_blocks_for_pool(pool_id) for config in kv_cache_configs)
+        for pool_id in range(num_pools)
+    ]
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    for kv_cache_config in kv_cache_configs:
+        assert kv_cache_config.kv_cache_pools is not None
+        old_pool_blocks = [pool.num_blocks for pool in kv_cache_config.kv_cache_pools]
+        if old_pool_blocks == min_pool_blocks:
             continue
-        # Re-plan with exactly the memory the smallest rank can afford, so
-        # strides and offsets stay consistent with the shrunken allocation.
-        groups = kv_cache_config.kv_cache_groups
-        if kv_cache_config.has_independent_kv_cache_pools:
-            request_blocks = [
-                _physical_blocks_per_request(vllm_config, group)
-                for group in groups
-            ]
-            limiting_blocks = min(request_blocks)
-            assert min_num_blocks % limiting_blocks == 0
-            num_requests = min_num_blocks // limiting_blocks
-            target_memory = num_requests * sum(
-                len(group.layer_names)
-                * group.kv_cache_spec.page_size_bytes
-                * blocks
-                for group, blocks in zip(groups, request_blocks)
+        kv_cache_config.kv_cache_pools = [
+            KVCachePoolSpec(
+                num_blocks=num_blocks,
+                group_ids=list(pool.group_ids),
             )
-        else:
-            target_memory = min_num_blocks * _pool_bytes_per_block(groups)
-        kv_cache_configs[i] = get_kv_cache_config_from_groups(
-            vllm_config, groups, target_memory
+            for pool, num_blocks in zip(kv_cache_config.kv_cache_pools, min_pool_blocks)
+        ]
+        kv_cache_config.kv_cache_tensors = _plan_kv_cache_tensors(
+            kv_cache_config.kv_cache_groups,
+            min_pool_blocks,
+            layout,
+            kv_cache_config.has_independent_kv_cache_pools,
         )
+        kv_cache_config.num_blocks = min(min_pool_blocks)
 
     return kv_cache_configs
 
