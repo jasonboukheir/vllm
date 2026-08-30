@@ -15,6 +15,7 @@ from vllm.v1.attention.backends.kvarn_attn import (
     KVarNAttentionBackend,
     KVarNAttentionImpl,
     _reconcile_kvarn_sink_ownership,
+    _rotate_kvarn_kv_into_scratch,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.turboquant_attn import TurboQuantAttentionBackend
@@ -211,9 +212,7 @@ def test_kvarn_forward_profiles_with_empty_cache_sentinel():
     impl._ensure_pool = lambda device, num_blocks_hint: pool_calls.append(
         (device, num_blocks_hint)
     )
-    impl._prefill_first_chunk = (
-        lambda q, k, v, metadata, cache: torch.full_like(q, 2)
-    )
+    impl._prefill_first_chunk = lambda q, k, v, metadata, cache: torch.full_like(q, 2)
     metadata = SimpleNamespace(
         num_actual_tokens=3,
         is_prefill=True,
@@ -256,6 +255,64 @@ def test_immediately_recycled_sink_is_delabeled_outside_new_row_zero():
     assert sinks == {new_sink}
     assert not is_sink_t[old_sink]
     assert is_sink_t[new_sink]
+
+
+def test_kvarn_rotation_uses_2d_gemm_and_preserves_scratch_canary(monkeypatch):
+    """The XPU batched matmul writer must not return to the K/V store path."""
+    num_tokens, num_heads, head_dim = 3, 2, 4
+    generator = torch.Generator().manual_seed(0)
+    key = torch.randn(
+        num_tokens, num_heads, head_dim, generator=generator, dtype=torch.float32
+    )
+    value = torch.randn(
+        num_tokens, num_heads, head_dim, generator=generator, dtype=torch.float32
+    )
+    hadamard = torch.randn(head_dim, head_dim, generator=generator, dtype=torch.float32)
+
+    k_storage = torch.empty(num_tokens + 1, num_heads, head_dim, dtype=torch.float32)
+    v_storage = torch.empty_like(k_storage)
+    k_canary = torch.arange(num_heads * head_dim, dtype=torch.float32).view(
+        num_heads, head_dim
+    )
+    v_canary = -k_canary - 1
+    k_storage[num_tokens].copy_(k_canary)
+    v_storage[num_tokens].copy_(v_canary)
+
+    original_mm = torch.mm
+    expected_k = original_mm(
+        key.reshape(num_tokens * num_heads, head_dim), hadamard
+    ).view_as(key)
+    expected_v = original_mm(
+        value.reshape(num_tokens * num_heads, head_dim), hadamard
+    ).view_as(value)
+    gemm_shapes = []
+
+    def checked_mm(left, right, *, out=None):
+        gemm_shapes.append(
+            (left.shape, right.shape, out.shape if out is not None else None)
+        )
+        assert left.ndim == right.ndim == 2
+        assert out is not None and out.ndim == 2
+        return original_mm(left, right, out=out)
+
+    monkeypatch.setattr(torch, "mm", checked_mm)
+    _rotate_kvarn_kv_into_scratch(
+        key,
+        value,
+        hadamard,
+        k_storage[:num_tokens],
+        v_storage[:num_tokens],
+    )
+
+    flat_shape = torch.Size((num_tokens * num_heads, head_dim))
+    assert gemm_shapes == [
+        (flat_shape, hadamard.shape, flat_shape),
+        (flat_shape, hadamard.shape, flat_shape),
+    ]
+    torch.testing.assert_close(k_storage[:num_tokens], expected_k)
+    torch.testing.assert_close(v_storage[:num_tokens], expected_v)
+    assert torch.equal(k_storage[num_tokens], k_canary)
+    assert torch.equal(v_storage[num_tokens], v_canary)
 
 
 def test_kvarn_page_unification_scales_by_whole_quantization_tiles():
