@@ -14,6 +14,7 @@ from vllm.platforms.xpu import XPUPlatform
 from vllm.v1.attention.backends.kvarn_attn import (
     KVarNAttentionBackend,
     KVarNAttentionImpl,
+    _reconcile_kvarn_sink_ownership,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.turboquant_attn import TurboQuantAttentionBackend
@@ -232,6 +233,29 @@ def test_kvarn_forward_profiles_with_empty_cache_sentinel():
     assert output.shape == query.shape
     assert torch.equal(output, torch.full_like(query, 2))
     assert not hasattr(impl, "_kv_cache_ref")
+
+
+def test_immediately_recycled_sink_is_delabeled_outside_new_row_zero():
+    """LIFO reuse must not carry a finished request's sink role into history."""
+    old_sink = 5
+    new_sink = 7
+    sinks = {old_sink, new_sink}
+    is_sink_t = torch.zeros(16, dtype=torch.bool)
+    # The failure requires immediate reuse, before an absence step can retire it.
+    retired_sinks = {}
+    is_sink_t[list(sinks)] = True
+
+    _reconcile_kvarn_sink_ownership(
+        sinks=sinks,
+        retired_sinks=retired_sinks,
+        blocks_needed={new_sink, old_sink},
+        row0_set={new_sink},
+        is_sink_t=is_sink_t,
+    )
+
+    assert sinks == {new_sink}
+    assert not is_sink_t[old_sink]
+    assert is_sink_t[new_sink]
 
 
 def test_kvarn_page_unification_scales_by_whole_quantization_tiles():

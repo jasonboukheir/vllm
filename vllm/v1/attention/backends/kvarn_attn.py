@@ -129,6 +129,23 @@ def _sinkhorn_pack_kv(K_tiles, V_tiles, cfg):
     return K_out, V_out
 
 
+def _reconcile_kvarn_sink_ownership(
+    sinks: set[int],
+    retired_sinks: dict[int, None],
+    blocks_needed: set[int],
+    row0_set: set[int],
+    is_sink_t: torch.Tensor,
+) -> None:
+    """Remove stale sink roles when block IDs are reused without an idle step."""
+    for bid in retired_sinks.keys() & blocks_needed:
+        retired_sinks.pop(bid)
+
+    for bid in sinks & blocks_needed - row0_set:
+        sinks.discard(bid)
+        if bid < is_sink_t.shape[0]:
+            is_sink_t[bid] = False
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Backend metadata classes
 # ──────────────────────────────────────────────────────────────────────────────
@@ -568,14 +585,19 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             # re-adopting a retired sink (its fp16 data is intact and byte-
             # identical), or vLLM recycling the id for a fresh write. Either
             # way the block is live again and must not be evicted under it.
-            # A recycled block that is no request's first block sheds its
-            # stale sink label so the normal walk-back flush applies to it.
-            for bid in [b for b in self._retired_sinks if b in blocks_needed]:
-                self._retired_sinks.pop(bid, None)
-                if bid not in row0_set and bid in sinks:
-                    sinks.discard(bid)
-                    if bid < is_sink_t.shape[0]:
-                        is_sink_t[bid] = False
+            # A finished request's blocks can be freed and LIFO-reused by a new
+            # request before the builder observes a step where they are absent.
+            # In that case its old sink never entered _retired_sinks. Reconcile
+            # every actively-written block against the current row-zero set so
+            # a recycled sink used as ordinary history cannot stop walk-back
+            # flushing and make quantization depend on prior request ordering.
+            _reconcile_kvarn_sink_ownership(
+                sinks,
+                self._retired_sinks,
+                blocks_needed,
+                row0_set,
+                is_sink_t,
+            )
 
             # (2) Flush detection (Stage α-2 Step B).
             # CRITICAL timing: token (k+1)*GROUP-1 (the one that completes
