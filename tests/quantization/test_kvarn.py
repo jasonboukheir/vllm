@@ -14,6 +14,7 @@ from vllm.platforms.xpu import XPUPlatform
 from vllm.v1.attention.backends.kvarn_attn import (
     KVarNAttentionBackend,
     KVarNAttentionImpl,
+    _KVarNMetadataStageRing,
     _reconcile_kvarn_sink_ownership,
     _rotate_kvarn_kv_into_scratch,
 )
@@ -313,6 +314,48 @@ def test_kvarn_rotation_uses_2d_gemm_and_preserves_scratch_canary(monkeypatch):
     torch.testing.assert_close(v_storage[:num_tokens], expected_v)
     assert torch.equal(k_storage[num_tokens], k_canary)
     assert torch.equal(v_storage[num_tokens], v_canary)
+
+
+def test_kvarn_metadata_stage_waits_before_reuse_and_uses_fresh_events():
+    class FakeEvent:
+        def __init__(self, generation):
+            self.generation = generation
+            self.records = 0
+            self.synchronizes = 0
+
+        def record(self):
+            self.records += 1
+
+        def synchronize(self):
+            self.synchronizes += 1
+
+    events = []
+
+    def new_event():
+        event = FakeEvent(len(events))
+        events.append(event)
+        return event
+
+    ring = _KVarNMetadataStageRing(depth=2)
+    assert ring.acquire() == 0
+    first = ring.release(0, new_event)
+    assert ring.acquire() == 1
+    second = ring.release(1, new_event)
+
+    # Wrapping to slot zero must wait for its previous DMA generation before
+    # the caller is allowed to mutate that pinned host row.
+    assert ring.acquire() == 0
+    assert first.synchronizes == 1
+    replacement = ring.release(0, new_event)
+
+    # An event is never re-recorded for a later generation.
+    assert replacement is not first
+    assert first.records == replacement.records == 1
+    assert second.synchronizes == 0
+
+    ring.drain()
+    assert second.synchronizes == 1
+    assert replacement.synchronizes == 1
 
 
 def test_kvarn_page_unification_scales_by_whole_quantization_tiles():
