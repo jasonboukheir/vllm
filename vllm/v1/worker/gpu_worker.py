@@ -460,6 +460,16 @@ class Worker(WorkerBase):
             # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
+            cache_dtype = self.cache_config.cache_dtype
+            if isinstance(cache_dtype, str) and cache_dtype.startswith("kvarn_"):
+                # A worker owns one model at a time. KVarN keeps cross-layer
+                # allocator/scratch state at process scope, so discard the prior
+                # model generation immediately before constructing its replacement.
+                from vllm.v1.attention.backends.kvarn_attn import (
+                    KVarNAttentionImpl,
+                )
+
+                KVarNAttentionImpl.reset_process_state()
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
         if self.vllm_config.weight_transfer_config is not None:
