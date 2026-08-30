@@ -12,17 +12,39 @@ from typing import Any
 
 import numpy as np
 
+ACCEPTANCE_THRESHOLD_SPECS = {
+    "min_top1_agreement_rate": ("top1_agreement_rate", ">="),
+    "min_tie_aware_top1_agreement_rate": (
+        "tie_aware_top1_agreement_rate",
+        ">=",
+    ),
+    "min_top5_exact_agreement_rate": ("top5_exact_agreement_rate", ">="),
+    "min_top5_mean_jaccard": ("top5_mean_jaccard", ">="),
+    "min_mean_intersection_coverage": ("mean_intersection_coverage", ">="),
+    "max_selected_token_mae": ("selected_token_delta.mae", "<="),
+    "max_selected_token_p99_abs": ("selected_token_delta.p99_abs", "<="),
+    "max_matched_logit_rmse": ("matched_logit_delta.rmse", "<="),
+    "max_matched_logit_p99_abs": ("matched_logit_delta.p99_abs", "<="),
+}
+
 
 def _rows(token_ids: np.ndarray, logits: np.ndarray) -> list[dict[int, float]]:
     if token_ids.ndim != 2 or logits.shape != token_ids.shape:
         raise ValueError("logit_token_ids and raw_logits must be equal-size matrices")
     rows: list[dict[int, float]] = []
-    for ids, values in zip(token_ids, logits):
-        row = {
-            int(token_id): float(value)
-            for token_id, value in zip(ids, values)
-            if token_id >= 0 and math.isfinite(float(value))
-        }
+    for step, (ids, values) in enumerate(zip(token_ids, logits)):
+        row: dict[int, float] = {}
+        for column, (token_id, value) in enumerate(zip(ids, values)):
+            token_id = int(token_id)
+            if token_id < 0:
+                continue
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError(
+                    "non-finite logit at decode step "
+                    f"{step}, column {column}, token ID {token_id}"
+                )
+            row[token_id] = value
         if not row:
             raise ValueError("every decode step must contain at least one finite logit")
         rows.append(row)
@@ -197,7 +219,62 @@ def compare(
     }
 
 
-def parse_args() -> argparse.Namespace:
+def _metric_value(report: dict[str, Any], path: str) -> float:
+    value: Any = report
+    for component in path.split("."):
+        if not isinstance(value, dict) or component not in value:
+            raise ValueError(f"comparison report is missing metric {path}")
+        value = value[component]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"comparison metric {path} must be numeric")
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise ValueError(f"comparison metric {path} must be finite")
+    return normalized
+
+
+def evaluate_acceptance(
+    report: dict[str, Any], thresholds: dict[str, float]
+) -> dict[str, Any]:
+    """Evaluate inclusive quality bounds against a comparison report."""
+    unknown = thresholds.keys() - ACCEPTANCE_THRESHOLD_SPECS.keys()
+    if unknown:
+        raise ValueError("unknown acceptance thresholds: " + ", ".join(sorted(unknown)))
+
+    checks: list[dict[str, Any]] = []
+    for name, threshold in thresholds.items():
+        metric, comparison = ACCEPTANCE_THRESHOLD_SPECS[name]
+        actual = _metric_value(report, metric)
+        passed = actual >= threshold if comparison == ">=" else actual <= threshold
+        checks.append(
+            {
+                "name": name,
+                "metric": metric,
+                "comparison": comparison,
+                "threshold": threshold,
+                "actual": actual,
+                "passed": passed,
+            }
+        )
+
+    failures = [check for check in checks if not check["passed"]]
+    return {
+        "status": "failed" if failures else "passed",
+        "thresholds": dict(thresholds),
+        "checks": checks,
+        "failures": failures,
+    }
+
+
+def _thresholds_from_args(args: argparse.Namespace) -> dict[str, float]:
+    return {
+        name: value
+        for name in ACCEPTANCE_THRESHOLD_SPECS
+        if (value := getattr(args, name)) is not None
+    }
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
@@ -210,16 +287,69 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="upper context-position boundary; repeat as needed",
     )
-    args = parser.parse_args()
-    if args.tie_tolerance < 0:
-        parser.error("--tie-tolerance must be non-negative")
+    parser.add_argument(
+        "--min-top1-agreement-rate",
+        type=float,
+        help="require top-1 agreement at or above this inclusive rate",
+    )
+    parser.add_argument(
+        "--min-tie-aware-top1-agreement-rate",
+        type=float,
+        help="require tie-aware top-1 agreement at or above this inclusive rate",
+    )
+    parser.add_argument(
+        "--min-top5-exact-agreement-rate",
+        type=float,
+        help="require exact top-5-set agreement at or above this inclusive rate",
+    )
+    parser.add_argument(
+        "--min-top5-mean-jaccard",
+        type=float,
+        help="require mean top-5 Jaccard similarity at or above this value",
+    )
+    parser.add_argument(
+        "--min-mean-intersection-coverage",
+        type=float,
+        help="require mean captured-logit intersection coverage at or above this value",
+    )
+    parser.add_argument(
+        "--max-selected-token-mae",
+        type=float,
+        help="require selected-token logit MAE at or below this value",
+    )
+    parser.add_argument(
+        "--max-selected-token-p99-abs",
+        type=float,
+        help="require selected-token absolute p99 error at or below this value",
+    )
+    parser.add_argument(
+        "--max-matched-logit-rmse",
+        type=float,
+        help="require matched-logit RMSE at or below this value",
+    )
+    parser.add_argument(
+        "--max-matched-logit-p99-abs",
+        type=float,
+        help="require matched-logit absolute p99 error at or below this value",
+    )
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.tie_tolerance) or args.tie_tolerance < 0:
+        parser.error("--tie-tolerance must be finite and non-negative")
     if any(boundary <= 0 for boundary in args.context_boundary):
         parser.error("--context-boundary values must be positive")
+    for name, value in _thresholds_from_args(args).items():
+        option = "--" + name.replace("_", "-")
+        if not math.isfinite(value):
+            parser.error(f"{option} must be finite")
+        if name.startswith("min_") and not 0 <= value <= 1:
+            parser.error(f"{option} must be between zero and one")
+        if name.startswith("max_") and value < 0:
+            parser.error(f"{option} must be non-negative")
     return args
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     boundaries = tuple(sorted(set(args.context_boundary or [4096, 16384, 32768])))
     document = compare(
         load_artifact(args.reference),
@@ -227,11 +357,25 @@ def main() -> None:
         tie_tolerance=args.tie_tolerance,
         boundaries=boundaries,
     )
+    thresholds = _thresholds_from_args(args)
+    if thresholds:
+        acceptance = evaluate_acceptance(document, thresholds)
+        document["status"] = acceptance["status"]
+    else:
+        acceptance = {
+            "status": "not_evaluated",
+            "thresholds": {},
+            "checks": [],
+            "failures": [],
+        }
+        document["status"] = "report_only"
+    document["acceptance"] = acceptance
     args.output.parent.mkdir(parents=True, exist_ok=True)
     rendered = json.dumps(document, indent=2, sort_keys=True) + "\n"
     args.output.write_text(rendered, encoding="utf-8")
     print(rendered, end="")
+    return int(document["status"] == "failed")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
