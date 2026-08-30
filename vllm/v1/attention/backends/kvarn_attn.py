@@ -35,8 +35,9 @@ from __future__ import annotations
 import functools
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import ClassVar
+from typing import ClassVar, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -177,6 +178,48 @@ def _rotate_kvarn_kv_into_scratch(
         hadamard,
         out=v_out.reshape(num_rows, head_dim),
     )
+
+
+class _EventLike(Protocol):
+    def record(self) -> None: ...
+
+    def synchronize(self) -> None: ...
+
+
+class _KVarNMetadataStageRing:
+    """Keep pinned H2D sources alive and immutable until DMA consumes them."""
+
+    def __init__(self, depth: int = 256) -> None:
+        if depth <= 0:
+            raise ValueError("metadata stage depth must be positive")
+        self.depth = depth
+        self._index = 0
+        self._events: list[_EventLike | None] = [None] * depth
+
+    def acquire(self) -> int:
+        stage = self._index % self.depth
+        self._index += 1
+        event = self._events[stage]
+        if event is not None:
+            event.synchronize()
+        return stage
+
+    def release(
+        self, stage: int, event_factory: Callable[[], _EventLike]
+    ) -> _EventLike:
+        # Use a fresh event generation. Re-recording an event that may still be
+        # observed by another generation does not provide an ownership fence.
+        event = event_factory()
+        event.record()
+        self._events[stage] = event
+        return event
+
+    def drain(self) -> None:
+        """Wait for every staged source before replacing its backing tensor."""
+        for event in self._events:
+            if event is not None:
+                event.synchronize()
+        self._events = [None] * self.depth
 
 
 class KVarNAttentionBackend(AttentionBackend):
@@ -442,6 +485,10 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # Persistent cu_seqlens buffers (allocated lazily in build()).
         self._cu_seqlens_q_buf: torch.Tensor = None  # type: ignore[assignment]
         self._cu_seqlens_k_buf: torch.Tensor = None  # type: ignore[assignment]
+        # Default async scheduling can start preparing the next generation
+        # while this generation's non-blocking H2D copies remain in flight.
+        # Rotate pinned host sources and fence each slot before CPU reuse.
+        self._metadata_stages = _KVarNMetadataStageRing()
         self._cu_seqlens_q_host: torch.Tensor = None  # type: ignore[assignment]
         self._cu_seqlens_k_host: torch.Tensor = None  # type: ignore[assignment]
         # Persistent verify-plan buffers (allocated lazily in build()).
@@ -782,7 +829,10 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # A captured graph bakes in tensor addresses, so cu_seqlens MUST live
         # in fixed buffers updated in place — not recreated each step.
         cap = B + 1
+        stage = self._metadata_stages.acquire()
+        stage_depth = self._metadata_stages.depth
         if self._cu_seqlens_q_buf is None or self._cu_seqlens_q_buf.shape[0] < cap:
+            self._metadata_stages.drain()
             new_cap = max(cap, 257)  # default max_num_seqs headroom
             self._cu_seqlens_q_buf = torch.empty(
                 new_cap, dtype=torch.int32, device=device
@@ -791,18 +841,20 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 new_cap, dtype=torch.int32, device=device
             )
             self._cu_seqlens_q_host = torch.empty(
-                new_cap, dtype=torch.int32, pin_memory=True
+                (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
             )
             self._cu_seqlens_k_host = torch.empty(
-                new_cap, dtype=torch.int32, pin_memory=True
+                (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
             )
+        q_host = self._cu_seqlens_q_host[stage]
+        k_host = self._cu_seqlens_k_host[stage]
         for i in range(B + 1):
-            self._cu_seqlens_q_host[i] = i
-            self._cu_seqlens_k_host[i] = cu_seqlens_k_h[i]
+            q_host[i] = i
+            k_host[i] = cu_seqlens_k_h[i]
         fa_cu_seqlens_q = self._cu_seqlens_q_buf[: B + 1]
         fa_cu_seqlens_k = self._cu_seqlens_k_buf[: B + 1]
-        fa_cu_seqlens_q.copy_(self._cu_seqlens_q_host[: B + 1], non_blocking=True)
-        fa_cu_seqlens_k.copy_(self._cu_seqlens_k_host[: B + 1], non_blocking=True)
+        fa_cu_seqlens_q.copy_(q_host[: B + 1], non_blocking=True)
+        fa_cu_seqlens_k.copy_(k_host[: B + 1], non_blocking=True)
 
         # ── Verify (spec-as-decode) plan ─────────────────────────────────
         # When the decode portion carries multi-token queries (an MTP verify
@@ -818,17 +870,20 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 self._vq_req_buf is None
                 or self._vq_req_buf.shape[0] < num_decode_tokens
             ):
+                self._metadata_stages.drain()
                 vq_cap = max(num_decode_tokens, 4096)
                 self._vq_req_buf = torch.empty(vq_cap, dtype=torch.int32, device=device)
                 self._vq_seqlen_buf = torch.empty(
                     vq_cap, dtype=torch.int32, device=device
                 )
                 self._vq_req_host = torch.empty(
-                    vq_cap, dtype=torch.int32, pin_memory=True
+                    (stage_depth, vq_cap), dtype=torch.int32, pin_memory=True
                 )
                 self._vq_seqlen_host = torch.empty(
-                    vq_cap, dtype=torch.int32, pin_memory=True
+                    (stage_depth, vq_cap), dtype=torch.int32, pin_memory=True
                 )
+            req_host = self._vq_req_host[stage]
+            seqlen_host = self._vq_seqlen_host[stage]
             # Non-causal (DFlash cross-attention): every query row attends to
             # the full context, so its per-row limit is the whole seq_len, not
             # the bottom-right causal staircase committed+j+1.
@@ -842,8 +897,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 committed = max(seq_lens_cpu[b] - ql, 0)
                 full = committed + ql
                 for j in range(ql):
-                    self._vq_req_host[i] = b
-                    self._vq_seqlen_host[i] = full if non_causal else committed + j + 1
+                    req_host[i] = b
+                    seqlen_host[i] = full if non_causal else committed + j + 1
                     i += 1
             # Uniform query length -> the shared-dequant verify kernel (the
             # request's tokens share each block's dequant); this is always the
@@ -854,10 +909,14 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             vq_qlen = uniform if (uniform >= 2 and not non_causal) else 0
             vq_req_t = self._vq_req_buf[:num_decode_tokens]
             vq_seqlen_t = self._vq_seqlen_buf[:num_decode_tokens]
-            vq_req_t.copy_(self._vq_req_host[:num_decode_tokens], non_blocking=True)
-            vq_seqlen_t.copy_(
-                self._vq_seqlen_host[:num_decode_tokens], non_blocking=True
-            )
+            vq_req_t.copy_(req_host[:num_decode_tokens], non_blocking=True)
+            vq_seqlen_t.copy_(seqlen_host[:num_decode_tokens], non_blocking=True)
+
+        # The event is recorded after every H2D copy issued above on the current
+        # stream. The corresponding host slot cannot be refilled until acquire()
+        # observes completion. This is required even when MTP is disabled because
+        # cu_seqlens are copied on every generation.
+        self._metadata_stages.release(stage, torch.xpu.Event)
 
         max_blocks_per_req = (self._max_model_len + GROUP - 1) // GROUP
 
