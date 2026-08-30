@@ -21,6 +21,17 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
+def _enable_kvarn_onednn_determinism(cache_dtype: str | None) -> bool:
+    if not isinstance(cache_dtype, str) or not cache_dtype.startswith("kvarn_"):
+        return False
+
+    # KVarN requires repeatable model projections as well as repeatable cache
+    # operations. oneDNN may otherwise select global split-K XPU matmuls whose
+    # floating-point accumulation order varies between identical requests.
+    torch.backends.mkldnn.deterministic = True
+    return True
+
+
 class XPUWorker(Worker):
     """A XPU worker class."""
 
@@ -83,6 +94,11 @@ class XPUWorker(Worker):
             ).total_memory
         else:
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
+
+        if _enable_kvarn_onednn_determinism(self.cache_config.cache_dtype):
+            logger.info_once(
+                "Enabled deterministic oneDNN primitives for KVarN on XPU."
+            )
 
         ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
         ENV_LOCAL_WORLD_SIZE = os.getenv(
