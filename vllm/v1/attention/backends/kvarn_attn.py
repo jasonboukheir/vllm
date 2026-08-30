@@ -151,6 +151,34 @@ def _reconcile_kvarn_sink_ownership(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _rotate_kvarn_kv_into_scratch(
+    k_view: torch.Tensor,
+    v_view: torch.Tensor,
+    hadamard: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+) -> None:
+    """Rotate K/V through the reliable 2-D GEMM path into bounded views.
+
+    Intel XPU's batched ``matmul(out=...)`` path has been observed writing one
+    value beyond a bounded output view during real Qwen prefill. Flattening the
+    token and head dimensions is algebraically identical and uses the 2-D GEMM
+    writer, which does not have that corruption failure mode.
+    """
+    num_tokens, num_heads, head_dim = k_view.shape
+    num_rows = num_tokens * num_heads
+    torch.mm(
+        k_view.reshape(num_rows, head_dim),
+        hadamard,
+        out=k_out.reshape(num_rows, head_dim),
+    )
+    torch.mm(
+        v_view.reshape(num_rows, head_dim),
+        hadamard,
+        out=v_out.reshape(num_rows, head_dim),
+    )
+
+
 class KVarNAttentionBackend(AttentionBackend):
     """Attention backend using KVarN KV-cache compression."""
 
@@ -2139,12 +2167,16 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         k_view = key[:N].view(N, Hk, D)
         v_view = value[:N].view(N, Hk, D)
 
-        # Rotate via cached fp16 Hadamard. torch.matmul `out=` is
-        # capture-friendly (uses the caching allocator's pool).
+        # Rotate via the cached fp16 Hadamard into bounded scratch views.
         k_rot = self._k_rot_scratch[:N]
         v_rot = self._v_rot_scratch[:N]
-        torch.matmul(k_view, self._H_fp16, out=k_rot)
-        torch.matmul(v_view, self._H_fp16, out=v_rot)
+        _rotate_kvarn_kv_into_scratch(
+            k_view,
+            v_view,
+            self._H_fp16,
+            k_rot,
+            v_rot,
+        )
 
         # Scatter via the sparse pool indirection. Slot lookup (block_id →
         # pool slot) is done inside the kernel against the GPU
