@@ -1042,6 +1042,76 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _tiles_dumped: ClassVar[bool] = False
 
     @classmethod
+    def reset_process_state(cls) -> None:
+        """Release state from the worker's previous KVarN model load.
+
+        KVarN shares allocator mirrors and scratch across every layer in one
+        model.  Those objects are process-global for fast layer-to-layer reuse,
+        so a worker that loads another model must drop the previous generation
+        before constructing the replacement.
+        """
+        cls._shared_q_fp32_buf.clear()
+        cls._shared_q_rot_fp32_buf.clear()
+        cls._shared_q_rot_fp16_buf.clear()
+        cls._shared_out_rot_fp32_buf.clear()
+        cls._shared_output_fp32_buf.clear()
+        cls._shared_fused_out_buf.clear()
+        cls._shared_native_decode_scratch.clear()
+        cls._shared_mid_o_buf.clear()
+        cls._shared_mid_lse_buf.clear()
+        cls._shared_fa_K_buf.clear()
+        cls._shared_fa_V_buf.clear()
+        cls._block_to_slot_dict.clear()
+        cls._global_sink_blocks.clear()
+        cls._free_slots.clear()
+        cls._allocator_pool_size.clear()
+        cls._block_to_slot_t_per_device.clear()
+        cls._is_sink_t_per_device.clear()
+        cls._max_known_block_id.clear()
+        cls._kernel_warmed.clear()
+        cls._all_impls.clear()
+        cls._tiles_dumped = False
+
+    @classmethod
+    def _ensure_shared_q_output_scratch(
+        cls,
+        bkey: tuple,
+        q_rows: int,
+        head_dim: int,
+        device: torch.device,
+    ) -> None:
+        """Create or atomically grow the six shared Q/output buffers."""
+        existing = (
+            cls._shared_q_fp32_buf.get(bkey),
+            cls._shared_q_rot_fp32_buf.get(bkey),
+            cls._shared_q_rot_fp16_buf.get(bkey),
+            cls._shared_out_rot_fp32_buf.get(bkey),
+            cls._shared_output_fp32_buf.get(bkey),
+            cls._shared_fused_out_buf.get(bkey),
+        )
+        if all(buf is not None and buf.shape[0] >= q_rows for buf in existing):
+            return
+
+        # Finish every allocation before publishing any replacement. If one
+        # allocation raises, callers continue to see the complete old set.
+        replacements = (
+            torch.empty(q_rows, head_dim, dtype=torch.float32, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float32, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float16, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float32, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float32, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float16, device=device),
+        )
+        (
+            cls._shared_q_fp32_buf[bkey],
+            cls._shared_q_rot_fp32_buf[bkey],
+            cls._shared_q_rot_fp16_buf[bkey],
+            cls._shared_out_rot_fp32_buf[bkey],
+            cls._shared_output_fp32_buf[bkey],
+            cls._shared_fused_out_buf[bkey],
+        ) = replacements
+
+    @classmethod
     def _impls_for_group(cls, group_key: tuple) -> list[KVarNAttentionImpl]:
         """Impls belonging to one KV-cache group (same group_key)."""
         return [i for i in cls._all_impls if i._group_key == group_key]
@@ -1366,25 +1436,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # (caused a reshape(N,512)-on-256-wide-buffer crash). One scratch set per
         # combo (Gemma-4 = 2 sets; cost is small).
         bkey = (device, D, Hk)
-        if bkey not in cls._shared_q_fp32_buf:
-            cls._shared_q_fp32_buf[bkey] = torch.empty(
-                q_rows, D, dtype=torch.float32, device=device
-            )
-            cls._shared_q_rot_fp32_buf[bkey] = torch.empty(
-                q_rows, D, dtype=torch.float32, device=device
-            )
-            cls._shared_q_rot_fp16_buf[bkey] = torch.empty(
-                q_rows, D, dtype=torch.float16, device=device
-            )
-            cls._shared_out_rot_fp32_buf[bkey] = torch.empty(
-                q_rows, D, dtype=torch.float32, device=device
-            )
-            cls._shared_output_fp32_buf[bkey] = torch.empty(
-                q_rows, D, dtype=torch.float32, device=device
-            )
-            cls._shared_fused_out_buf[bkey] = torch.empty(
-                q_rows, D, dtype=torch.float16, device=device
-            )
+        cls._ensure_shared_q_output_scratch(bkey, q_rows, D, device)
         from vllm.v1.attention.ops.triton_kvarn_decode import (
             adaptive_num_kv_splits,
             kvarn_native_feature_enabled,

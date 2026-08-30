@@ -2,6 +2,7 @@
 """CPU-only contracts for KVarN configuration and cache accounting."""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -32,6 +33,116 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
     is_quantized_kv_cache,
 )
+
+
+def _shared_q_output_maps():
+    return (
+        KVarNAttentionImpl._shared_q_fp32_buf,
+        KVarNAttentionImpl._shared_q_rot_fp32_buf,
+        KVarNAttentionImpl._shared_q_rot_fp16_buf,
+        KVarNAttentionImpl._shared_out_rot_fp32_buf,
+        KVarNAttentionImpl._shared_output_fp32_buf,
+        KVarNAttentionImpl._shared_fused_out_buf,
+    )
+
+
+def test_reset_process_state_releases_previous_model_generation():
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        device = torch.device("cpu")
+        group_key = ("model.layers.3.self_attn",)
+        mirror_key = (device, group_key)
+        scratch_key = (device, 8, 2)
+
+        KVarNAttentionImpl._all_impls.append(object())  # type: ignore[arg-type]
+        KVarNAttentionImpl._block_to_slot_dict[group_key] = {7: 1}
+        KVarNAttentionImpl._global_sink_blocks[group_key] = {7}
+        KVarNAttentionImpl._free_slots[group_key] = [0]
+        KVarNAttentionImpl._allocator_pool_size[group_key] = 2
+        KVarNAttentionImpl._max_known_block_id[group_key] = 7
+        KVarNAttentionImpl._block_to_slot_t_per_device[mirror_key] = torch.ones(1)
+        KVarNAttentionImpl._is_sink_t_per_device[mirror_key] = torch.ones(1)
+        KVarNAttentionImpl._kernel_warmed.add(("decode", device))
+        KVarNAttentionImpl._tiles_dumped = True
+        for mapping in _shared_q_output_maps():
+            mapping[scratch_key] = torch.ones(1)
+        KVarNAttentionImpl._shared_native_decode_scratch[scratch_key] = (
+            torch.ones(1),
+            torch.ones(1),
+            torch.ones(1),
+        )
+        KVarNAttentionImpl._shared_mid_o_buf[scratch_key] = torch.ones(1)
+        KVarNAttentionImpl._shared_mid_lse_buf[scratch_key] = torch.ones(1)
+        KVarNAttentionImpl._shared_fa_K_buf[scratch_key] = torch.ones(1)
+        KVarNAttentionImpl._shared_fa_V_buf[scratch_key] = torch.ones(1)
+
+        KVarNAttentionImpl.reset_process_state()
+
+        mappings = (
+            *_shared_q_output_maps(),
+            KVarNAttentionImpl._shared_native_decode_scratch,
+            KVarNAttentionImpl._shared_mid_o_buf,
+            KVarNAttentionImpl._shared_mid_lse_buf,
+            KVarNAttentionImpl._shared_fa_K_buf,
+            KVarNAttentionImpl._shared_fa_V_buf,
+            KVarNAttentionImpl._block_to_slot_dict,
+            KVarNAttentionImpl._global_sink_blocks,
+            KVarNAttentionImpl._free_slots,
+            KVarNAttentionImpl._allocator_pool_size,
+            KVarNAttentionImpl._block_to_slot_t_per_device,
+            KVarNAttentionImpl._is_sink_t_per_device,
+            KVarNAttentionImpl._max_known_block_id,
+        )
+        assert all(not mapping for mapping in mappings)
+        assert not KVarNAttentionImpl._all_impls
+        assert not KVarNAttentionImpl._kernel_warmed
+        assert KVarNAttentionImpl._tiles_dumped is False
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_shared_q_output_scratch_grows_as_one_complete_set():
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        device = torch.device("cpu")
+        bkey = (device, 8, 2)
+        KVarNAttentionImpl._ensure_shared_q_output_scratch(bkey, 4, 8, device)
+        first = tuple(mapping[bkey] for mapping in _shared_q_output_maps())
+
+        KVarNAttentionImpl._ensure_shared_q_output_scratch(bkey, 8, 8, device)
+        grown = tuple(mapping[bkey] for mapping in _shared_q_output_maps())
+        assert all(buffer.shape == (8, 8) for buffer in grown)
+        assert all(new is not old for new, old in zip(grown, first, strict=True))
+
+        real_empty = torch.empty
+        allocation_count = 0
+
+        def fail_partway_through_growth(*args, **kwargs):
+            nonlocal allocation_count
+            allocation_count += 1
+            if allocation_count == 3:
+                raise RuntimeError("synthetic allocation failure")
+            return real_empty(*args, **kwargs)
+
+        with (
+            patch.object(torch, "empty", side_effect=fail_partway_through_growth),
+            pytest.raises(RuntimeError, match="synthetic allocation failure"),
+        ):
+            KVarNAttentionImpl._ensure_shared_q_output_scratch(bkey, 16, 8, device)
+        after_failure = tuple(mapping[bkey] for mapping in _shared_q_output_maps())
+        assert all(
+            current is previous
+            for current, previous in zip(after_failure, grown, strict=True)
+        )
+
+        KVarNAttentionImpl._ensure_shared_q_output_scratch(bkey, 2, 8, device)
+        retained = tuple(mapping[bkey] for mapping in _shared_q_output_maps())
+        assert all(
+            current is previous
+            for current, previous in zip(retained, grown, strict=True)
+        )
+    finally:
+        KVarNAttentionImpl.reset_process_state()
 
 
 @pytest.mark.parametrize(
