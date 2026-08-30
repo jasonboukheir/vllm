@@ -31,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.platforms import current_platform
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -322,9 +323,57 @@ class Scheduler(SchedulerInterface):
         # Blocks that async KV loads will overwrite this step, skipped from
         # zeroing since the zeroing could race the out-of-band write.
         self._skip_zero_block_ids: set[int] = set()
-        self.need_mamba_block_aligned_split = (
+        needs_mamba_cache_alignment = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        self.needs_mamba_cache_alignment = needs_mamba_cache_alignment
+        xpu_prefill_chunk_sizes: set[int] = set()
+        use_xpu_recurrent_arithmetic_grid = (
+            current_platform.is_xpu()
+            and self.cache_config.mamba_cache_mode == "none"
+            and self.num_spec_tokens == 0
+            and not supports_mm_inputs
+            and not self.is_encoder_decoder
+        )
+        if use_xpu_recurrent_arithmetic_grid:
+            for group in kv_cache_config.kv_cache_groups:
+                spec = group.kv_cache_spec
+                if not isinstance(spec, MambaSpec):
+                    continue
+                chunk_size = (
+                    spec.mamba_type.get_class().get_required_prefill_chunk_size()
+                )
+                if chunk_size is not None:
+                    xpu_prefill_chunk_sizes.add(chunk_size)
+        if len(xpu_prefill_chunk_sizes) > 1:
+            raise ValueError(
+                "All XPU recurrent backends must use the same prefill chunk size."
+            )
+        xpu_prefill_chunk_size = next(iter(xpu_prefill_chunk_sizes), None)
+        if xpu_prefill_chunk_size is not None:
+            # Up to max_num_seqs - 1 one-token decodes can be scheduled before
+            # a prefill. Leave one full arithmetic chunk after that reservation
+            # so a non-final prefill cannot be floored to zero indefinitely.
+            min_scheduler_budget = (
+                xpu_prefill_chunk_size + self.scheduler_config.max_num_seqs - 1
+            )
+            if self.max_num_scheduled_tokens < min_scheduler_budget:
+                raise ValueError(
+                    "The effective scheduler token budget must be at least the XPU "
+                    "recurrent prefill chunk size plus one decode token for every "
+                    f"other sequence ({min_scheduler_budget})."
+                )
+            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+            if 0 < long_prefill_threshold < xpu_prefill_chunk_size:
+                raise ValueError(
+                    "long_prefill_token_threshold must be zero or at least the "
+                    f"XPU recurrent prefill chunk size ({xpu_prefill_chunk_size})."
+                )
+
+        self.mamba_prefill_alignment = xpu_prefill_chunk_size or (
+            self.cache_config.block_size if needs_mamba_cache_alignment else 1
+        )
+        self.need_mamba_block_aligned_split = self.mamba_prefill_alignment > 1
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
             # TODO: support spec decoding
@@ -339,7 +388,7 @@ class Scheduler(SchedulerInterface):
         # can only be registered by a step ending exactly at the prompt's last
         # hash boundary, so the split adds that stop.
         self.mamba_partial_cache_hit = (
-            self.need_mamba_block_aligned_split
+            needs_mamba_cache_alignment
             and self.hash_block_size < self.block_size
             and self.kv_cache_manager.coordinator.enable_partial_hash_hits
         )
@@ -389,13 +438,13 @@ class Scheduler(SchedulerInterface):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        """Clip a prefill chunk so it ends where Mamba state must be cached.
+        """Clip recurrent prefill at required arithmetic or cache boundaries.
 
-        In "align" cache mode reusable SSM states are materialized at block
-        boundaries, plus mandatory early stops (the prompt's partial-tail hash
-        boundary, a detected shared-prefix junction). If a block is larger
-        than the configured prefill chunk limit, intermediate chunks keep
-        private running state until they reach the next cacheable position.
+        XPU Qwen GDN uses a fixed arithmetic grid for non-final chunks. In
+        "align" cache mode, reusable SSM states are also materialized at block
+        boundaries and mandatory early stops. If a cache block is larger than
+        the configured prefill limit, intermediate chunks keep private state
+        until they reach the next cacheable position.
         """
         start = (
             request.num_computed_tokens
@@ -408,20 +457,26 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
-        # The last block-aligned position whose state can be cached. With
-        # Eagle, FullAttn prunes the last matching block, so back off one
-        # block to avoid a Mamba cache miss.
-        last_cache_position = request.num_tokens - request.num_tokens % block_size
+        block_size = self.mamba_prefill_alignment
+        # The last position on the required grid. With Eagle, FullAttn prunes
+        # the last matching block, so back off one block to avoid a Mamba
+        # cache miss.
+        last_aligned_position = request.num_tokens - request.num_tokens % block_size
         if self.use_eagle:
-            last_cache_position = max(last_cache_position - block_size, 0)
+            last_aligned_position = max(last_aligned_position - block_size, 0)
 
         end = start + num_new_tokens
+        # Internal checkpoint blocks make intermediate cache-aligned stops
+        # unnecessary, but they do not make a backend's arithmetic partition
+        # invariant unnecessary. In particular, XPU GDN still has to stay on
+        # its 64-token grid in mamba_cache_mode="none".
         use_internal_checkpoint = (
-            self.mamba_has_prefill_checkpoint_blocks and start % block_size == 0
+            self.needs_mamba_cache_alignment
+            and self.mamba_has_prefill_checkpoint_blocks
+            and start % block_size == 0
         )
         if use_internal_checkpoint:
-            last_cache_position = 0
+            last_aligned_position = 0
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
         # tokens. State is written at chunk ends, so chunk ends must be block
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
@@ -447,11 +502,11 @@ class Scheduler(SchedulerInterface):
             # rather than running past it.
             next_block_boundary if start % block_size != 0 else 0,
             # Never run past the last cacheable block boundary mid-chunk.
-            last_cache_position,
+            last_aligned_position if self.needs_mamba_cache_alignment else 0,
             # Fine-grained hits: the prompt's partial-tail entry can only be
             # registered by a chunk ending exactly at its last hash boundary.
             tail_boundary
-            if last_cache_position < tail_boundary < request.num_prompt_tokens
+            if last_aligned_position < tail_boundary < request.num_prompt_tokens
             else 0,
             # Marconi shared-prefix junction, block-floored (a sub-block
             # junction's state is not separately cacheable): cache its state

@@ -200,7 +200,9 @@ def _gdn_attention_core_xpu_impl(
     num_accepted_tokens = attn_metadata.num_accepted_tokens
 
     num_prefills = attn_metadata.num_prefills
+    num_prefill_tokens = attn_metadata.num_prefill_tokens
     num_decodes = attn_metadata.num_decodes
+    num_decode_tokens = attn_metadata.num_decode_tokens
     num_spec_decodes = attn_metadata.num_spec_decodes
 
     has_initial_state = attn_metadata.has_initial_state
@@ -251,6 +253,16 @@ def _gdn_attention_core_xpu_impl(
     if num_accepted_tokens is not None:
         num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
 
+    split_mixed_non_spec = (
+        num_prefills > 0
+        and num_decodes > 0
+        and num_decode_tokens == num_decodes
+        and num_decode_tokens + num_prefill_tokens == num_actual_tokens
+        and num_spec_decodes == 0
+        and non_spec_token_indx is None
+        and spec_sequence_masks is None
+    )
+
     torch.ops._xpu_C.gdn_attention(
         core_attn_out,
         z,
@@ -281,6 +293,7 @@ def _gdn_attention_core_xpu_impl(
         num_actual_tokens=num_actual_tokens,  # type: ignore[attr-defined]
         tp_size=self.tp_size,
         reorder_input=not self.gqa_interleaved_layout,
+        split_mixed_non_spec=split_mixed_non_spec,
     )
 
 

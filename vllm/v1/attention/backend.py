@@ -201,6 +201,11 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
+    def get_required_prefill_chunk_size(cls) -> int | None:
+        """Return the backend's required prefill arithmetic partition."""
+        return None
+
+    @classmethod
     def supports_kv_connector(cls) -> bool:
         return True
 
