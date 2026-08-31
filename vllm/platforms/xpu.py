@@ -3,7 +3,7 @@
 
 import contextlib
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -110,6 +110,7 @@ class XPUPlatform(Platform):
     ray_device_key: str = "GPU"
     dist_backend: str = "xccl"  # xccl only
     device_control_env_var: str = "ZE_AFFINITY_MASK"
+    _kvarn_request_stable_xe2_validated = False
     supported_quantization: list[str] = [
         "awq",
         "gptq",
@@ -137,6 +138,188 @@ class XPUPlatform(Platform):
     @classmethod
     def check_runner_kv_caches_multi_layer(cls) -> None:
         pass
+
+    @classmethod
+    def set_additional_forward_context(
+        cls,
+        *,
+        attn_metadata: Any,
+        vllm_config: "VllmConfig",
+        dp_metadata: Any = None,
+        num_tokens: int | None = None,
+        num_tokens_across_dp: Any = None,
+        cudagraph_runtime_mode: Any = None,
+        ubatch_slices: Any = None,
+        is_padding: torch.Tensor | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        from vllm.model_executor.determinism.request_stable_linear import (
+            XPU_KVARN_CANONICAL_LINEAR_ROWS,
+            XPU_KVARN_REQUEST_SLICES_KEY,
+            use_xpu_kvarn_request_stable_linears,
+        )
+
+        if not use_xpu_kvarn_request_stable_linears(vllm_config):
+            return {}
+        if not cls._kvarn_request_stable_xe2_validated:
+            if not torch.ops._xpu_C.is_xe2_arch():
+                raise RuntimeError(
+                    "the frozen XPU KVarN request-stable profile requires an "
+                    "Xe2 device"
+                )
+            cls._kvarn_request_stable_xe2_validated = True
+        if attn_metadata is None or attn_metadata == {}:
+            # Profiling and warmup passes can omit attention metadata.
+            return {}
+        if (
+            getattr(cudagraph_runtime_mode, "name", None) != "NONE"
+            or dp_metadata is not None
+            or num_tokens_across_dp is not None
+            or ubatch_slices is not None
+            or is_padding is not None
+            or not isinstance(attn_metadata, dict)
+        ):
+            raise RuntimeError(
+                "the frozen XPU KVarN request-stable profile requires an eager, "
+                "unpadded, non-ubatched forward"
+            )
+
+        from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+        from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+        static_context = vllm_config.compilation_config.static_forward_context
+        qwen_gdn_names = {
+            name
+            for name, layer in static_context.items()
+            if getattr(layer, "mamba_type", None)
+            is MambaAttentionBackendEnum.QWEN_GDN_ATTN
+        }
+        if not qwen_gdn_names:
+            raise RuntimeError(
+                "the frozen XPU KVarN profile has no registered Qwen GDN layers"
+            )
+        missing_names = qwen_gdn_names.difference(attn_metadata)
+        if missing_names:
+            raise RuntimeError(
+                "the frozen XPU KVarN forward is missing Qwen GDN metadata for "
+                + ", ".join(sorted(missing_names))
+            )
+
+        if any(
+            not isinstance(attn_metadata[name], GDNAttentionMetadata)
+            for name in qwen_gdn_names
+        ):
+            raise RuntimeError(
+                "the frozen XPU KVarN profile received non-GDN Qwen metadata"
+            )
+        metadata_by_id = {
+            id(attn_metadata[name]): attn_metadata[name] for name in qwen_gdn_names
+        }
+
+        expected_slices: tuple[tuple[int, int, int, bool], ...] | None = None
+        expected_metadata_signature: tuple[int, ...] | None = None
+        for metadata in metadata_by_id.values():
+            disallowed_spec_fields = (
+                metadata.spec_query_start_loc,
+                metadata.spec_state_indices_tensor,
+                metadata.spec_sequence_masks,
+                metadata.spec_token_indx,
+                metadata.non_spec_token_indx,
+                metadata.num_accepted_tokens,
+            )
+            if (
+                metadata.num_spec_decodes != 0
+                or metadata.num_spec_decode_tokens != 0
+                or any(value is not None for value in disallowed_spec_fields)
+            ):
+                raise RuntimeError(
+                    "XPU KVarN request-stable linears require ordinary no-spec "
+                    "GDN metadata"
+                )
+
+            boundaries = metadata.non_spec_query_start_loc_cpu
+            positions = metadata.non_spec_num_computed_tokens_cpu
+            phases = metadata.non_spec_is_prefilling_cpu
+            num_requests = metadata.num_decodes + metadata.num_prefills
+            if boundaries is None or len(boundaries) != num_requests + 1:
+                raise RuntimeError(
+                    "XPU KVarN GDN metadata is missing complete CPU request boundaries"
+                )
+            if positions is None or len(positions) != num_requests:
+                raise RuntimeError(
+                    "XPU KVarN GDN metadata is missing CPU request start positions"
+                )
+            if any(position < 0 for position in positions):
+                raise RuntimeError(
+                    "XPU KVarN GDN request start positions must be non-negative"
+                )
+            if phases is None or len(phases) != num_requests:
+                raise RuntimeError(
+                    "XPU KVarN GDN metadata is missing CPU request phases"
+                )
+            if boundaries[0] != 0 or any(
+                stop <= start for start, stop in zip(boundaries, boundaries[1:])
+            ):
+                raise RuntimeError(
+                    "XPU KVarN GDN CPU request boundaries must be positive and "
+                    "contiguous from row 0"
+                )
+            if (
+                boundaries[-1] != metadata.num_actual_tokens
+                or boundaries[-1] != num_tokens
+                or metadata.num_decode_tokens + metadata.num_prefill_tokens
+                != metadata.num_actual_tokens
+            ):
+                raise RuntimeError(
+                    "XPU KVarN GDN request boundaries do not cover the model rows"
+                )
+            if (
+                boundaries[metadata.num_decodes] != metadata.num_decode_tokens
+                or boundaries[-1] - boundaries[metadata.num_decodes]
+                != metadata.num_prefill_tokens
+            ):
+                raise RuntimeError(
+                    "XPU KVarN GDN request boundaries disagree with decode/prefill "
+                    "token counts"
+                )
+
+            request_slices = tuple(
+                (start, stop, position, is_prefill)
+                for start, stop, position, is_prefill in zip(
+                    boundaries, boundaries[1:], positions, phases
+                )
+            )
+            metadata_signature = (
+                metadata.num_decodes,
+                metadata.num_prefills,
+                metadata.num_decode_tokens,
+                metadata.num_prefill_tokens,
+                metadata.num_actual_tokens,
+            )
+            for start, stop, position, is_prefill in request_slices:
+                span = stop - start
+                if (
+                    (is_prefill or span > 1)
+                    and position % XPU_KVARN_CANONICAL_LINEAR_ROWS != 0
+                ):
+                    raise RuntimeError(
+                        "XPU KVarN multi-row projection did not start on the "
+                        "canonical 64-row grid"
+                    )
+            if expected_slices is None:
+                expected_slices = request_slices
+                expected_metadata_signature = metadata_signature
+            elif metadata_signature != expected_metadata_signature:
+                raise RuntimeError(
+                    "XPU KVarN GDN layers disagree on dispatch counts"
+                )
+            elif request_slices != expected_slices:
+                raise RuntimeError(
+                    "XPU KVarN GDN layers disagree on packed request metadata"
+                )
+
+        assert expected_slices is not None
+        return {XPU_KVARN_REQUEST_SLICES_KEY: expected_slices}
 
     @classmethod
     def get_attn_backend_cls(

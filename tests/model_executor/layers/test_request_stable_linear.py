@@ -1,0 +1,507 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import vllm.model_executor.determinism.request_stable_linear as request_stable
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+
+class RecordingQuantMethod:
+    def __init__(self) -> None:
+        self.calls: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+
+    def apply(self, _layer, x: torch.Tensor, bias=None) -> torch.Tensor:
+        self.calls.append((x, bias))
+        # Deliberately shape-sensitive so request-wise and batch-wise dispatch
+        # have observably different results on CPU.
+        return x + x.shape[0]
+
+
+class LaneSensitiveQuantMethod(RecordingQuantMethod):
+    def apply(self, _layer, x: torch.Tensor, bias=None) -> torch.Tensor:
+        self.calls.append((x, bias))
+        lanes = torch.arange(x.shape[0], dtype=x.dtype).reshape(-1, 1)
+        return x + lanes
+
+
+def _set_request_slices(monkeypatch: pytest.MonkeyPatch, value) -> None:
+    context = SimpleNamespace(
+        additional_kwargs={request_stable.XPU_KVARN_REQUEST_SLICES_KEY: value}
+    )
+    monkeypatch.setattr(request_stable, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(request_stable, "get_forward_context", lambda: context)
+
+
+def test_apply_linear_by_request_preserves_order_and_bias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(
+        monkeypatch,
+        ((0, 1, 200, False), (1, 4, 0, True), (4, 8, 64, True)),
+    )
+    method = RecordingQuantMethod()
+    layer = SimpleNamespace(quant_method=method)
+    x = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+    bias = torch.arange(3, dtype=torch.float32)
+
+    actual = request_stable.apply_linear_by_request(layer, x, bias)
+
+    expected = torch.cat((x[:1] + 1, x[1:4] + 3, x[4:] + 4))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert [call_x.shape[0] for call_x, _bias in method.calls] == [1, 3, 4]
+    assert all(call_bias is bias for _call_x, call_bias in method.calls)
+
+
+def test_apply_linear_by_request_is_invariant_to_scheduler_partition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x = torch.arange(4095, dtype=torch.float32).reshape(4095, 1)
+
+    def run(value: torch.Tensor, slices) -> tuple[torch.Tensor, list[int]]:
+        _set_request_slices(monkeypatch, slices)
+        method = RecordingQuantMethod()
+        kernel = SimpleNamespace(xpu_kvarn_request_stable_m64=True)
+        actual = request_stable.apply_linear_by_request(
+            SimpleNamespace(
+                quant_method=method,
+                scheme=SimpleNamespace(kernel=kernel),
+            ),
+            value,
+            None,
+        )
+        return actual, [part.shape[0] for part, _bias in method.calls]
+
+    one_shot, one_shot_calls = run(x, ((0, 4095, 0, True),))
+    first, first_calls = run(x[:3968], ((0, 3968, 0, True),))
+    second, second_calls = run(x[3968:], ((0, 127, 3968, True),))
+
+    torch.testing.assert_close(one_shot, torch.cat((first, second)), rtol=0, atol=0)
+    assert one_shot_calls == first_calls + second_calls
+    assert one_shot_calls == [64] * 64
+
+
+def test_canonical_prefill_65023_uses_1016_fixed_row_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    num_rows = 65_023
+    _set_request_slices(monkeypatch, ((0, num_rows, 0, True),))
+    method = RecordingQuantMethod()
+    layer = SimpleNamespace(
+        quant_method=method,
+        xpu_kvarn_request_stable_m64=True,
+    )
+    x = torch.arange(num_rows, dtype=torch.float32).reshape(-1, 1)
+
+    actual = request_stable.apply_linear_by_request(layer, x, None)
+
+    torch.testing.assert_close(actual, x + 64, rtol=0, atol=0)
+    assert len(method.calls) == 1_016
+    assert all(part.shape == (64, 1) for part, _bias in method.calls)
+
+
+@pytest.mark.parametrize(
+    "x,slices",
+    [
+        (torch.ones(8, 3), None),
+        (torch.ones(8, 3), ((0, 8, 0, True),)),
+    ],
+)
+def test_apply_linear_by_request_falls_back_to_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+    x: torch.Tensor,
+    slices,
+) -> None:
+    if slices is None:
+        monkeypatch.setattr(
+            request_stable, "is_forward_context_available", lambda: False
+        )
+    else:
+        _set_request_slices(monkeypatch, slices)
+    method = RecordingQuantMethod()
+    layer = SimpleNamespace(quant_method=method)
+
+    request_stable.apply_linear_by_request(layer, x, None)
+
+    assert len(method.calls) == 1
+    if slices is None:
+        assert method.calls[0][0] is x
+    else:
+        torch.testing.assert_close(method.calls[0][0], x, rtol=0, atol=0)
+
+
+def test_apply_linear_by_request_rejects_active_non_packed_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(monkeypatch, ((0, 2, 0, True),))
+    layer = SimpleNamespace(quant_method=RecordingQuantMethod())
+
+    with pytest.raises(RuntimeError, match="two-dimensional"):
+        request_stable.apply_linear_by_request(layer, torch.ones(2, 4, 3), None)
+
+
+def test_canonical_w4_prefill_uses_absolute_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(monkeypatch, ((0, 2, 62, True),))
+    method = LaneSensitiveQuantMethod()
+    layer = SimpleNamespace(
+        quant_method=method,
+        scheme=SimpleNamespace(
+            kernel=SimpleNamespace(xpu_kvarn_request_stable_m64=True)
+        ),
+    )
+    x = torch.tensor([[10.0], [20.0]])
+
+    actual = request_stable.apply_linear_by_request(layer, x, None)
+
+    torch.testing.assert_close(
+        actual,
+        x + torch.tensor([[62.0], [63.0]]),
+        rtol=0,
+        atol=0,
+    )
+    padded = method.calls[0][0]
+    assert padded.shape == (64, 1)
+    torch.testing.assert_close(padded[62:64], x, rtol=0, atol=0)
+    assert torch.count_nonzero(padded[:62]) == 0
+
+
+def test_production_xpu_w4_classifier_uses_canonical_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+        MPLinearLayerConfig,
+    )
+    from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
+        XPUwNa16LinearKernel,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors as compressed_tensors_module,
+    )
+    from vllm.scalar_type import scalar_types
+
+    _set_request_slices(monkeypatch, ((0, 63, 0, True),))
+    kernel = XPUwNa16LinearKernel.__new__(XPUwNa16LinearKernel)
+    kernel.config = MPLinearLayerConfig(
+        full_weight_shape=(1, 1),
+        partition_weight_shape=(1, 1),
+        weight_type=scalar_types.uint4b8,
+        act_type=torch.bfloat16,
+        group_size=128,
+        zero_points=False,
+        has_g_idx=False,
+    )
+    calls: list[torch.Tensor] = []
+
+    def apply_weights(_layer, value: torch.Tensor, bias=None) -> torch.Tensor:
+        calls.append(value)
+        lanes = torch.arange(value.shape[0], dtype=value.dtype).reshape(-1, 1)
+        return value + lanes
+
+    scheme = SimpleNamespace(kernel=kernel, apply_weights=apply_weights)
+    layer = SimpleNamespace(
+        quant_method=compressed_tensors_module.CompressedTensorsLinearMethod(
+            SimpleNamespace()
+        ),
+        scheme=scheme,
+        prefix="model.layers.0.self_attn.q_proj",
+    )
+    x = torch.arange(63, dtype=torch.bfloat16).reshape(-1, 1)
+
+    actual = request_stable.apply_linear_by_request(layer, x, None)
+
+    torch.testing.assert_close(
+        actual,
+        x + torch.arange(63, dtype=x.dtype).reshape(-1, 1),
+        rtol=0,
+        atol=0,
+    )
+    assert [call.shape[0] for call in calls] == [64]
+
+
+def test_production_compressed_linear_classifier_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors as compressed_tensors_module,
+    )
+
+    _set_request_slices(monkeypatch, ((0, 2, 0, True),))
+    scheme = SimpleNamespace(
+        kernel=object(),
+        apply_weights=lambda _layer, value, bias=None: value,
+    )
+    layer = SimpleNamespace(
+        quant_method=compressed_tensors_module.CompressedTensorsLinearMethod(
+            SimpleNamespace()
+        ),
+        scheme=scheme,
+        prefix="model.layers.0.self_attn.q_proj",
+    )
+
+    with pytest.raises(RuntimeError, match="every compressed linear"):
+        request_stable.apply_linear_by_request(
+            layer, torch.ones(2, 1, dtype=torch.bfloat16), None
+        )
+
+
+def test_production_gdn_classifier_preserves_mixed_packed_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(
+        monkeypatch,
+        (
+            (0, 1, 200, False),
+            (1, 64, 0, True),
+            (64, 66, 64, False),
+        ),
+    )
+    calls: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+    method = UnquantizedLinearMethod()
+
+    def apply(_layer, value: torch.Tensor, bias=None) -> torch.Tensor:
+        calls.append((value, None if bias is None else bias.clone()))
+        lanes = torch.arange(value.shape[0], dtype=value.dtype).reshape(-1, 1)
+        return value + lanes + (0 if bias is None else bias)
+
+    monkeypatch.setattr(method, "apply", apply)
+    bias = torch.tensor([0.25])
+    layer = SimpleNamespace(
+        quant_method=method,
+        prefix="model.layers.0.linear_attn.out_proj",
+    )
+    x = torch.arange(66, dtype=torch.float32).reshape(-1, 1)
+
+    actual = request_stable.apply_linear_by_request(layer, x, bias)
+
+    expected = torch.cat(
+        (
+            x[:1] + bias,
+            x[1:64] + torch.arange(63).reshape(-1, 1) + bias,
+            x[64:] + torch.arange(2).reshape(-1, 1) + bias,
+        )
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert [value.shape[0] for value, _bias in calls] == [1, 64, 64]
+    assert all(
+        call_bias is not None and torch.equal(call_bias, bias)
+        for _value, call_bias in calls
+    )
+
+
+def test_apply_linear_by_request_rejects_row_count_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(
+        monkeypatch,
+        ((0, 1, 200, False), (1, 4, 0, True), (4, 8, 64, True)),
+    )
+    layer = SimpleNamespace(quant_method=RecordingQuantMethod())
+
+    with pytest.raises(RuntimeError, match="do not cover"):
+        request_stable.apply_linear_by_request(layer, torch.ones(7, 3), None)
+
+
+def test_apply_linear_by_request_rejects_inconsistent_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(monkeypatch, ((0, 2, 0, True), (2, 4, 64, True)))
+
+    class InconsistentMethod:
+        calls = 0
+
+        def apply(self, _layer, x: torch.Tensor, _bias=None) -> torch.Tensor:
+            self.calls += 1
+            width = 3 if self.calls == 1 else 4
+            return torch.empty((x.shape[0], width), dtype=x.dtype)
+
+    layer = SimpleNamespace(quant_method=InconsistentMethod())
+
+    with pytest.raises(RuntimeError, match="shape, dtype, or device"):
+        request_stable.apply_linear_by_request(layer, torch.ones(4, 3), None)
+
+
+def test_inactive_linear_fast_path_does_not_read_forward_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    method = RecordingQuantMethod()
+    layer = SimpleNamespace(
+        _xpu_kvarn_request_stable=False,
+        quant_method=method,
+    )
+    monkeypatch.setattr(
+        request_stable,
+        "get_xpu_kvarn_request_slices",
+        lambda: pytest.fail("inactive linear read the forward context"),
+    )
+    x = torch.ones(2, 3)
+
+    actual = LinearBase._apply_quant_method(layer, x, None)
+
+    torch.testing.assert_close(actual, x + 2, rtol=0, atol=0)
+    assert len(method.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "slices",
+    [
+        (),
+        ((1, 2, 0, True),),
+        ((0, 2, 0, True), (3, 4, 2, True)),
+        ((0, 2, 0, True), (1, 4, 2, True)),
+        ((0, 0, 0, True),),
+        ((0, "2", 0, True),),
+        ((0, 2, -1, True),),
+        ((0, 2, 0, "yes"),),
+    ],
+)
+def test_apply_linear_by_request_rejects_malformed_context(
+    monkeypatch: pytest.MonkeyPatch,
+    slices,
+) -> None:
+    _set_request_slices(monkeypatch, slices)
+    layer = SimpleNamespace(quant_method=RecordingQuantMethod())
+
+    with pytest.raises(ValueError, match="XPU KVarN request slice"):
+        request_stable.apply_linear_by_request(layer, torch.ones(4, 3), None)
+
+
+def _scoped_config(**overrides):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="qwen3_5_text"),
+            model=request_stable._BRUTUS_MODEL_ID,
+            revision=request_stable._BRUTUS_MODEL_REVISION,
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            dtype=torch.bfloat16,
+            quantization="compressed-tensors",
+            enforce_eager=True,
+            multimodal_config=SimpleNamespace(language_model_only=True),
+        ),
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v4_g128_compact",
+            mamba_cache_mode="none",
+            enable_prefix_caching=False,
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            enable_dbo=False,
+            ubatch_size=1,
+        ),
+        use_v2_model_runner=False,
+        speculative_config=None,
+        lora_config=None,
+        compilation_config=SimpleNamespace(
+            mode=SimpleNamespace(name="NONE"),
+            cudagraph_mode=SimpleNamespace(name="NONE"),
+        ),
+    )
+    for path, value in overrides.items():
+        target_name, field = path.split("__", 1)
+        setattr(getattr(config, target_name), field, value)
+    return config
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"cache_config__cache_dtype": "bfloat16"},
+        {"cache_config__cache_dtype": "kvarn_k4v4_g128"},
+        {"cache_config__mamba_cache_mode": "align"},
+        {"cache_config__enable_prefix_caching": True},
+        {"model_config__enforce_eager": False},
+        {"model_config__revision": "other"},
+        {"model_config__quantization": "inc"},
+        {"parallel_config__enable_dbo": True},
+        {"parallel_config__ubatch_size": 2},
+        {
+            "model_config__hf_text_config": SimpleNamespace(
+                model_type="qwen3_5_moe_text"
+            )
+        },
+        {"parallel_config__tensor_parallel_size": 2},
+        {"parallel_config__data_parallel_size": 2},
+    ],
+)
+def test_request_stable_config_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict,
+) -> None:
+    monkeypatch.setattr(
+        request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
+    )
+
+    assert not request_stable.use_xpu_kvarn_request_stable_linears(
+        _scoped_config(**overrides)
+    )
+
+
+def test_request_stable_config_accepts_frozen_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
+    )
+    assert request_stable.use_xpu_kvarn_request_stable_linears(_scoped_config())
+
+
+def test_request_stable_config_rejects_v2_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
+    )
+    config = _scoped_config()
+    config.use_v2_model_runner = True
+
+    assert not request_stable.use_xpu_kvarn_request_stable_linears(config)
+
+
+def test_logits_head_uses_one_projection_per_sample_row() -> None:
+    processor = LogitsProcessor.__new__(LogitsProcessor)
+    processor._xpu_kvarn_request_stable = True
+    processor.head_dtype = None
+    method = RecordingQuantMethod()
+    lm_head = SimpleNamespace(quant_method=method)
+    hidden_states = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    bias = torch.arange(3, dtype=torch.float32)
+
+    actual = processor._apply_head(lm_head, hidden_states, bias)
+
+    torch.testing.assert_close(actual, hidden_states + 1, rtol=0, atol=0)
+    assert [call_x.shape[0] for call_x, _bias in method.calls] == [1, 1, 1, 1]
+    assert all(call_bias is bias for _call_x, call_bias in method.calls)
+
+
+def test_logits_head_disabled_profile_preserves_batched_projection() -> None:
+    processor = LogitsProcessor.__new__(LogitsProcessor)
+    processor._xpu_kvarn_request_stable = False
+    processor.head_dtype = None
+    method = RecordingQuantMethod()
+    lm_head = SimpleNamespace(quant_method=method)
+    hidden_states = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+    actual = processor._apply_head(lm_head, hidden_states, None)
+
+    torch.testing.assert_close(actual, hidden_states + 4, rtol=0, atol=0)
+    assert len(method.calls) == 1
+    assert method.calls[0][0] is hidden_states
+
+
+def test_logits_head_active_profile_rejects_non_matrix_input() -> None:
+    processor = LogitsProcessor.__new__(LogitsProcessor)
+    processor._xpu_kvarn_request_stable = True
+    processor.head_dtype = None
+    lm_head = SimpleNamespace(quant_method=RecordingQuantMethod())
+
+    with pytest.raises(RuntimeError, match="two-dimensional"):
+        processor._apply_head(lm_head, torch.ones(1, 2, 3), None)

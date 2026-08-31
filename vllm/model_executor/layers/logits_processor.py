@@ -15,6 +15,9 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.determinism.request_stable_linear import (
+    use_xpu_kvarn_request_stable_linears,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
@@ -91,8 +94,12 @@ class LogitsProcessor(PluggableLayer):
         # Dtype of the lm_head projection. Defaults to the model dtype; an
         # fp32 head (via `--hf-overrides '{"head_dtype": "float32"}'`) is
         # required for RL training-inference consistency.
-        model_config = get_current_vllm_config().model_config
+        vllm_config = get_current_vllm_config()
+        model_config = vllm_config.model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
+        self._xpu_kvarn_request_stable = use_xpu_kvarn_request_stable_linears(
+            vllm_config
+        )
 
     def forward(
         self,
@@ -139,6 +146,31 @@ class LogitsProcessor(PluggableLayer):
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor:
         """Project hidden states through the lm_head, honoring head_dtype."""
+        if self._xpu_kvarn_request_stable:
+            if hidden_states.ndim != 2:
+                raise RuntimeError(
+                    "XPU KVarN request-stable logits require two-dimensional "
+                    "selected hidden states"
+                )
+            if hidden_states.shape[0] <= 1:
+                return self._apply_head_once(lm_head, hidden_states, embedding_bias)
+            return torch.cat(
+                [
+                    self._apply_head_once(
+                        lm_head, hidden_states[row : row + 1], embedding_bias
+                    )
+                    for row in range(hidden_states.shape[0])
+                ],
+                dim=0,
+            )
+        return self._apply_head_once(lm_head, hidden_states, embedding_bias)
+
+    def _apply_head_once(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
             return lm_head.quant_method.apply(
                 lm_head, hidden_states, bias=embedding_bias

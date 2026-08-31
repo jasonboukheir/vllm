@@ -310,3 +310,259 @@ def test_qwen_gdn_xpu_block_size_uses_64_token_kernel_grid(
 
     assert cache_config.block_size == 64
     assert cache_config.mamba_page_size_padded == 64
+
+
+def _request_stable_config():
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="qwen3_5_text"),
+            model=(
+                "jasonboukheir/"
+                "Qwen3.8-27B-AEON-Ultimate-Uncensored-BF16-W4A16-AutoRound"
+            ),
+            revision="6b0622f4354481d5d04577d48ba0db844efc1330",
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            dtype=torch.bfloat16,
+            quantization="compressed-tensors",
+            enforce_eager=True,
+            multimodal_config=SimpleNamespace(language_model_only=True),
+        ),
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v4_g128_compact",
+            mamba_cache_mode="none",
+            enable_prefix_caching=False,
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            enable_dbo=False,
+            ubatch_size=1,
+        ),
+        use_v2_model_runner=False,
+        speculative_config=None,
+        lora_config=None,
+        compilation_config=SimpleNamespace(
+            mode=SimpleNamespace(name="NONE"),
+            cudagraph_mode=SimpleNamespace(name="NONE"),
+            static_forward_context={
+                "linear_attn": SimpleNamespace(
+                    mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN
+                )
+            },
+        ),
+    )
+
+
+def _enable_xe2_request_stable_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vllm.model_executor.determinism.request_stable_linear as request_stable
+    from vllm.platforms.xpu import XPUPlatform
+
+    monkeypatch.setattr(
+        request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
+    )
+    monkeypatch.setattr(XPUPlatform, "_kvarn_request_stable_xe2_validated", False)
+    monkeypatch.setattr(torch.ops._xpu_C, "is_xe2_arch", lambda: True)
+
+
+def test_xpu_forward_context_exposes_validated_kvarn_request_slices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("vllm_xpu_kernels._xpu_C")
+
+    import vllm.model_executor.determinism.request_stable_linear as request_stable
+    from vllm.config import CUDAGraphMode
+    from vllm.platforms.xpu import XPUPlatform
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    _enable_xe2_request_stable_profile(monkeypatch)
+    metadata = GDNAttentionMetadata(
+        num_prefills=2,
+        num_prefill_tokens=6,
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=7,
+        non_spec_query_start_loc_cpu=(0, 1, 3, 7),
+        non_spec_num_computed_tokens_cpu=(200, 0, 64),
+        non_spec_is_prefilling_cpu=(False, True, True),
+    )
+
+    additional = XPUPlatform.set_additional_forward_context(
+        attn_metadata={"linear_attn": metadata},
+        vllm_config=_request_stable_config(),
+        num_tokens=7,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+
+    assert additional[request_stable.XPU_KVARN_REQUEST_SLICES_KEY] == (
+        (0, 1, 200, False),
+        (1, 3, 0, True),
+        (3, 7, 64, True),
+    )
+
+
+def test_xpu_forward_context_rejects_inconsistent_kvarn_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("vllm_xpu_kernels._xpu_C")
+
+    from vllm.config import CUDAGraphMode
+    from vllm.platforms.xpu import XPUPlatform
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    _enable_xe2_request_stable_profile(monkeypatch)
+    metadata = GDNAttentionMetadata(
+        num_prefills=1,
+        num_prefill_tokens=3,
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=4,
+        non_spec_query_start_loc_cpu=(0, 2, 4),
+        non_spec_num_computed_tokens_cpu=(200, 0),
+        non_spec_is_prefilling_cpu=(False, True),
+    )
+
+    with pytest.raises(RuntimeError, match="decode/prefill token counts"):
+        XPUPlatform.set_additional_forward_context(
+            attn_metadata={"linear_attn": metadata},
+            vllm_config=_request_stable_config(),
+            num_tokens=4,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        )
+
+
+def test_xpu_forward_context_rejects_misaligned_kvarn_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("vllm_xpu_kernels._xpu_C")
+
+    from vllm.config import CUDAGraphMode
+    from vllm.platforms.xpu import XPUPlatform
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    _enable_xe2_request_stable_profile(monkeypatch)
+    metadata = GDNAttentionMetadata(
+        num_prefills=1,
+        num_prefill_tokens=2,
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=3,
+        non_spec_query_start_loc_cpu=(0, 1, 3),
+        non_spec_num_computed_tokens_cpu=(200, 63),
+        non_spec_is_prefilling_cpu=(False, True),
+    )
+
+    with pytest.raises(RuntimeError, match="canonical 64-row grid"):
+        XPUPlatform.set_additional_forward_context(
+            attn_metadata={"linear_attn": metadata},
+            vllm_config=_request_stable_config(),
+            num_tokens=3,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        )
+
+
+def test_xpu_forward_context_rejects_any_non_gdn_qwen_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("vllm_xpu_kernels._xpu_C")
+
+    from vllm.config import CUDAGraphMode
+    from vllm.platforms.xpu import XPUPlatform
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+    _enable_xe2_request_stable_profile(monkeypatch)
+    config = _request_stable_config()
+    config.compilation_config.static_forward_context["linear_attn_2"] = (
+        SimpleNamespace(mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN)
+    )
+    metadata = GDNAttentionMetadata(
+        num_prefills=1,
+        num_prefill_tokens=3,
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=4,
+        non_spec_query_start_loc_cpu=(0, 1, 4),
+        non_spec_num_computed_tokens_cpu=(200, 0),
+        non_spec_is_prefilling_cpu=(False, True),
+    )
+
+    with pytest.raises(RuntimeError, match="non-GDN Qwen metadata"):
+        XPUPlatform.set_additional_forward_context(
+            attn_metadata={"linear_attn": metadata, "linear_attn_2": object()},
+            vllm_config=config,
+            num_tokens=4,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        )
+
+
+def test_xpu_forward_context_canonicalizes_post_prompt_multirow_recompute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("vllm_xpu_kernels._xpu_C")
+
+    import vllm.model_executor.determinism.request_stable_linear as request_stable
+    from vllm.config import CUDAGraphMode
+    from vllm.platforms.xpu import XPUPlatform
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    _enable_xe2_request_stable_profile(monkeypatch)
+    metadata = GDNAttentionMetadata(
+        num_prefills=1,
+        num_prefill_tokens=2,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=2,
+        non_spec_query_start_loc_cpu=(0, 2),
+        non_spec_num_computed_tokens_cpu=(64,),
+        non_spec_is_prefilling_cpu=(False,),
+    )
+
+    additional = XPUPlatform.set_additional_forward_context(
+        attn_metadata={"linear_attn": metadata},
+        vllm_config=_request_stable_config(),
+        num_tokens=2,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+
+    assert additional[request_stable.XPU_KVARN_REQUEST_SLICES_KEY] == (
+        (0, 2, 64, False),
+    )
+
+
+def test_xpu_forward_context_rejects_non_xe2_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("vllm_xpu_kernels._xpu_C")
+
+    import vllm.model_executor.determinism.request_stable_linear as request_stable
+    from vllm.config import CUDAGraphMode
+    from vllm.platforms.xpu import XPUPlatform
+
+    monkeypatch.setattr(
+        request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
+    )
+    monkeypatch.setattr(XPUPlatform, "_kvarn_request_stable_xe2_validated", False)
+    monkeypatch.setattr(torch.ops._xpu_C, "is_xe2_arch", lambda: False)
+
+    with pytest.raises(RuntimeError, match="requires an Xe2 device"):
+        XPUPlatform.set_additional_forward_context(
+            attn_metadata=None,
+            vllm_config=_request_stable_config(),
+            num_tokens=1,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        )
