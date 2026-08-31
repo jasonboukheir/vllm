@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Request-stable linear dispatch for the scoped XPU KVarN profile."""
+"""Request-stable operator dispatch for the scoped XPU KVarN profile."""
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -21,8 +22,7 @@ _QWEN_GDN_CANONICAL_LINEAR_SUFFIXES = (
     ".linear_attn.out_proj",
 )
 _BRUTUS_MODEL_ID = (
-    "jasonboukheir/"
-    "Qwen3.8-27B-AEON-Ultimate-Uncensored-BF16-W4A16-AutoRound"
+    "jasonboukheir/Qwen3.8-27B-AEON-Ultimate-Uncensored-BF16-W4A16-AutoRound"
 )
 _BRUTUS_MODEL_REVISION = "6b0622f4354481d5d04577d48ba0db844efc1330"
 
@@ -85,14 +85,12 @@ def use_xpu_kvarn_request_stable_linears(vllm_config: Any) -> bool:
         return False
     if getattr(parallel_config, "enable_dbo", True):
         return False
-    if getattr(parallel_config, "ubatch_size", 2) != 1:
+    if getattr(parallel_config, "ubatch_size", 2) > 1:
         return False
     compilation_config = getattr(vllm_config, "compilation_config", None)
     if (
         getattr(getattr(compilation_config, "mode", None), "name", None) != "NONE"
-        or getattr(
-            getattr(compilation_config, "cudagraph_mode", None), "name", None
-        )
+        or getattr(getattr(compilation_config, "cudagraph_mode", None), "name", None)
         != "NONE"
     ):
         return False
@@ -138,14 +136,10 @@ def _validate_request_slices(
     return tuple(result)
 
 
-def get_xpu_kvarn_request_slices() -> (
-    tuple[tuple[int, int, int, bool], ...] | None
-):
+def get_xpu_kvarn_request_slices() -> tuple[tuple[int, int, int, bool], ...] | None:
     if not is_forward_context_available():
         return None
-    value = get_forward_context().additional_kwargs.get(
-        XPU_KVARN_REQUEST_SLICES_KEY
-    )
+    value = get_forward_context().additional_kwargs.get(XPU_KVARN_REQUEST_SLICES_KEY)
     if value is None:
         return None
     return _validate_request_slices(value)
@@ -188,9 +182,7 @@ def _uses_canonical_linear_rows(layer: Any) -> bool:
     return (
         quant_method_type.__module__ == "vllm.model_executor.layers.linear"
         and quant_method_type.__name__ == "UnquantizedLinearMethod"
-        and getattr(layer, "prefix", "").endswith(
-            _QWEN_GDN_CANONICAL_LINEAR_SUFFIXES
-        )
+        and getattr(layer, "prefix", "").endswith(_QWEN_GDN_CANONICAL_LINEAR_SUFFIXES)
     )
 
 
@@ -267,3 +259,160 @@ def apply_linear_by_request(
             position += actual_rows
     assert output is not None
     return output
+
+
+def apply_rms_norm_by_request(
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    apply_once: Callable[
+        [torch.Tensor, torch.Tensor | None],
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ],
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Apply RMSNorm on canonical rows for each packed request.
+
+    The scoped XPU eager path can choose different reduction launches for a
+    packed B1 and B4 tensor. Prefills therefore use the same absolute M64 grid
+    as request-stable linears, while ordinary one-token decodes remain M1.
+    """
+    if not current_platform.is_xpu():
+        return apply_once(x, residual)
+    request_slices = get_xpu_kvarn_request_slices()
+    if request_slices is None:
+        return apply_once(x, residual)
+    if x.ndim < 2:
+        raise RuntimeError(
+            "XPU KVarN request-stable RMSNorm requires a packed leading row dimension"
+        )
+    if request_slices[-1][1] != x.shape[0]:
+        raise RuntimeError(
+            "XPU KVarN request slices do not cover this packed RMSNorm input"
+        )
+    if residual is not None:
+        if residual.shape != x.shape:
+            raise RuntimeError(
+                "XPU KVarN request-stable fused RMSNorm requires matching input "
+                "and residual shapes"
+            )
+        if residual.dtype != x.dtype or residual.device != x.device:
+            raise RuntimeError(
+                "XPU KVarN request-stable fused RMSNorm requires matching input "
+                "and residual dtype and device"
+            )
+
+    output: torch.Tensor | None = None
+    residual_output: torch.Tensor | None = None
+    for request_start, request_stop, position, is_prefill in request_slices:
+        canonical_request = is_prefill or request_stop - request_start > 1
+        start = request_start
+        while start < request_stop:
+            lane = position % XPU_KVARN_CANONICAL_LINEAR_ROWS
+            if canonical_request:
+                stop = min(
+                    start + XPU_KVARN_CANONICAL_LINEAR_ROWS - lane,
+                    request_stop,
+                )
+            else:
+                stop = request_stop
+            actual_rows = stop - start
+            part_input = x[start:stop]
+            part_residual = None if residual is None else residual[start:stop]
+            padded = canonical_request and (
+                lane != 0 or actual_rows < XPU_KVARN_CANONICAL_LINEAR_ROWS
+            )
+            if padded:
+                padded_input = x.new_zeros(
+                    (XPU_KVARN_CANONICAL_LINEAR_ROWS, *x.shape[1:])
+                )
+                padded_input[lane : lane + actual_rows].copy_(part_input)
+                part_input = padded_input
+                if part_residual is not None:
+                    padded_residual = residual.new_zeros(
+                        (XPU_KVARN_CANONICAL_LINEAR_ROWS, *residual.shape[1:])
+                    )
+                    padded_residual[lane : lane + actual_rows].copy_(part_residual)
+                    part_residual = padded_residual
+
+            result = apply_once(part_input, part_residual)
+            if residual is None:
+                if not isinstance(result, torch.Tensor):
+                    raise RuntimeError(
+                        "request-stable RMSNorm unexpectedly returned a residual"
+                    )
+                part_output = result
+                part_residual_output = None
+            else:
+                if not isinstance(result, tuple) or len(result) != 2:
+                    raise RuntimeError(
+                        "request-stable fused RMSNorm did not return output and "
+                        "residual"
+                    )
+                part_output, part_residual_output = result
+
+            if not isinstance(part_output, torch.Tensor) or (
+                part_residual_output is not None
+                and not isinstance(part_residual_output, torch.Tensor)
+            ):
+                raise RuntimeError(
+                    "request-stable RMSNorm returned a non-tensor output"
+                )
+
+            expected_part_shape = part_input.shape
+            if part_output.shape != expected_part_shape:
+                raise RuntimeError(
+                    "request-stable RMSNorm changed the packed input shape"
+                )
+            if part_residual_output is not None and (
+                part_residual_output.shape != expected_part_shape
+            ):
+                raise RuntimeError(
+                    "request-stable fused RMSNorm changed the residual shape"
+                )
+            if part_output.dtype != x.dtype or part_output.device != x.device:
+                raise RuntimeError(
+                    "request-stable RMSNorm changed output dtype or device"
+                )
+            if part_residual_output is not None and (
+                part_residual_output.dtype != x.dtype
+                or part_residual_output.device != x.device
+            ):
+                raise RuntimeError(
+                    "request-stable fused RMSNorm changed residual dtype or device"
+                )
+            result_lane = lane if padded else 0
+            part_output = part_output[result_lane : result_lane + actual_rows]
+            if part_residual_output is not None:
+                part_residual_output = part_residual_output[
+                    result_lane : result_lane + actual_rows
+                ]
+
+            if output is None:
+                output = part_output.new_empty(x.shape)
+                if residual is not None:
+                    assert part_residual_output is not None
+                    residual_output = part_residual_output.new_empty(residual.shape)
+            elif (
+                part_output.dtype != output.dtype or part_output.device != output.device
+            ):
+                raise RuntimeError(
+                    "request-stable RMSNorm changed output dtype or device"
+                )
+            output[start:stop].copy_(part_output)
+            if residual_output is not None:
+                assert part_residual_output is not None
+                if (
+                    part_residual_output.dtype != residual_output.dtype
+                    or part_residual_output.device != residual_output.device
+                ):
+                    raise RuntimeError(
+                        "request-stable fused RMSNorm changed residual dtype or device"
+                    )
+                residual_output[start:stop].copy_(part_residual_output)
+            start = stop
+            position += actual_rows
+
+    assert output is not None
+    if residual is None:
+        return output
+    assert residual_output is not None
+    return output, residual_output

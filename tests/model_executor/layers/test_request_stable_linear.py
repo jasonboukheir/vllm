@@ -35,6 +35,9 @@ def _set_request_slices(monkeypatch: pytest.MonkeyPatch, value) -> None:
     )
     monkeypatch.setattr(request_stable, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(request_stable, "get_forward_context", lambda: context)
+    monkeypatch.setattr(
+        request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
+    )
 
 
 def test_apply_linear_by_request_preserves_order_and_bias(
@@ -326,6 +329,182 @@ def test_apply_linear_by_request_rejects_inconsistent_outputs(
         request_stable.apply_linear_by_request(layer, torch.ones(4, 3), None)
 
 
+@pytest.mark.parametrize("fused", [False, True])
+def test_apply_rms_norm_by_request_is_batch_and_partition_invariant(
+    monkeypatch: pytest.MonkeyPatch,
+    fused: bool,
+) -> None:
+    x = torch.arange(13 * 2 * 3, dtype=torch.float32).reshape(13, 2, 3)
+    residual = x / 10 if fused else None
+
+    def run(value, value_residual, slices):
+        _set_request_slices(monkeypatch, slices)
+        calls = []
+
+        def shape_sensitive(part_x, part_residual):
+            calls.append(part_x.shape[0])
+            normalized = part_x + part_x.shape[0]
+            if part_residual is None:
+                return normalized
+            return normalized + part_residual, part_x + part_residual
+
+        result = request_stable.apply_rms_norm_by_request(
+            value, value_residual, shape_sensitive
+        )
+        return result, calls
+
+    one, one_calls = run(x, residual, ((0, 13, 0, True),))
+    batch_x = x.repeat(4, 1, 1)
+    batch_residual = None if residual is None else residual.repeat(4, 1, 1)
+    batch, batch_calls = run(
+        batch_x,
+        batch_residual,
+        tuple((lane * 13, (lane + 1) * 13, 0, True) for lane in range(4)),
+    )
+
+    one_outputs = one if isinstance(one, tuple) else (one,)
+    batch_outputs = batch if isinstance(batch, tuple) else (batch,)
+    assert one_calls == [64]
+    assert batch_calls == [64, 64, 64, 64]
+    for one_output, batch_output in zip(one_outputs, batch_outputs):
+        for lane in range(4):
+            torch.testing.assert_close(
+                batch_output[lane * 13 : (lane + 1) * 13],
+                one_output,
+                rtol=0,
+                atol=0,
+            )
+
+    long_x = torch.arange(127 * 3, dtype=torch.float32).reshape(127, 3)
+    long_residual = long_x / 10 if fused else None
+    one_shot, one_shot_calls = run(long_x, long_residual, ((0, 127, 0, True),))
+    first, first_calls = run(
+        long_x[:64],
+        None if long_residual is None else long_residual[:64],
+        ((0, 64, 0, True),),
+    )
+    second, second_calls = run(
+        long_x[64:],
+        None if long_residual is None else long_residual[64:],
+        ((0, 63, 64, True),),
+    )
+    one_shot_outputs = one_shot if isinstance(one_shot, tuple) else (one_shot,)
+    first_outputs = first if isinstance(first, tuple) else (first,)
+    second_outputs = second if isinstance(second, tuple) else (second,)
+    assert one_shot_calls == first_calls + second_calls == [64, 64]
+    for expected, first_part, second_part in zip(
+        one_shot_outputs, first_outputs, second_outputs
+    ):
+        torch.testing.assert_close(
+            expected, torch.cat((first_part, second_part)), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize(
+    "position,num_rows,expected_lanes,expected_calls",
+    [
+        (0, 1, [0], [1]),
+        (62, 3, [62, 63, 0], [64, 64]),
+        (63, 65, [63, *range(64)], [64, 64]),
+        (64, 64, list(range(64)), [64]),
+    ],
+)
+def test_apply_rms_norm_by_request_uses_absolute_canonical_lanes(
+    monkeypatch: pytest.MonkeyPatch,
+    position: int,
+    num_rows: int,
+    expected_lanes: list[int],
+    expected_calls: list[int],
+) -> None:
+    _set_request_slices(monkeypatch, ((0, num_rows, position, num_rows != 1),))
+    calls = []
+
+    def lane_sensitive(part_x, _part_residual):
+        calls.append(part_x.shape[0])
+        lanes = torch.arange(part_x.shape[0], dtype=part_x.dtype).reshape(-1, 1)
+        return part_x + lanes
+
+    x = torch.zeros(num_rows, 1)
+    actual = request_stable.apply_rms_norm_by_request(x, None, lane_sensitive)
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor(expected_lanes, dtype=x.dtype).reshape(-1, 1),
+        rtol=0,
+        atol=0,
+    )
+    assert calls == expected_calls
+
+
+def test_apply_rms_norm_by_request_is_inert_off_xpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: False)
+    )
+    monkeypatch.setattr(
+        request_stable,
+        "get_xpu_kvarn_request_slices",
+        lambda: pytest.fail("non-XPU RMSNorm read the forward context"),
+    )
+    x = torch.ones(2, 3)
+
+    actual = request_stable.apply_rms_norm_by_request(
+        x, None, lambda value, _residual: value + 1
+    )
+
+    torch.testing.assert_close(actual, x + 1, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("invalid_kind", ["dtype", "non_tensor"])
+def test_apply_rms_norm_by_request_rejects_invalid_first_output(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_kind: str,
+) -> None:
+    _set_request_slices(monkeypatch, ((0, 1, 0, False),))
+    x = torch.ones(1, 3)
+
+    def invalid_output(value, _residual):
+        if invalid_kind == "dtype":
+            return value.to(torch.float64)
+        return "not a tensor"
+
+    with pytest.raises(RuntimeError, match="request-stable RMSNorm"):
+        request_stable.apply_rms_norm_by_request(x, None, invalid_output)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_gemma_rms_norm_uses_request_stable_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    fused: bool,
+) -> None:
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    calls = []
+
+    def recording_dispatch(x, residual, apply_once):
+        calls.append((x, residual))
+        return apply_once(x, residual)
+
+    monkeypatch.setattr(request_stable, "apply_rms_norm_by_request", recording_dispatch)
+    layer = SimpleNamespace(
+        weight=torch.nn.Parameter(torch.zeros(4)),
+        variance_epsilon=1e-6,
+    )
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    residual = torch.ones_like(x) if fused else None
+
+    result = GemmaRMSNorm.forward_native(layer, x, residual)
+
+    assert len(calls) == 1
+    assert calls[0][0] is x
+    assert calls[0][1] is residual
+    if fused:
+        assert isinstance(result, tuple)
+    else:
+        assert isinstance(result, torch.Tensor)
+
+
 def test_inactive_linear_fast_path_does_not_read_forward_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -395,7 +574,7 @@ def _scoped_config(**overrides):
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
             enable_dbo=False,
-            ubatch_size=1,
+            ubatch_size=0,
         ),
         use_v2_model_runner=False,
         speculative_config=None,
@@ -452,6 +631,18 @@ def test_request_stable_config_accepts_frozen_profile(
         request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
     )
     assert request_stable.use_xpu_kvarn_request_stable_linears(_scoped_config())
+
+
+def test_request_stable_config_accepts_explicit_single_row_ubatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
+    )
+    config = _scoped_config()
+    config.parallel_config.ubatch_size = 1
+
+    assert request_stable.use_xpu_kvarn_request_stable_linears(config)
 
 
 def test_request_stable_config_rejects_v2_runner(

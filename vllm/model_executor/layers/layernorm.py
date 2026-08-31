@@ -155,9 +155,22 @@ class GemmaRMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
         weight = self.weight.float() + 1.0
-        if residual is None:
-            return ir.ops.rms_norm(x, weight, self.variance_epsilon)
-        return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
+
+        def apply_once(
+            part_x: torch.Tensor,
+            part_residual: torch.Tensor | None,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            if part_residual is None:
+                return ir.ops.rms_norm(part_x, weight, self.variance_epsilon)
+            return ir.ops.fused_add_rms_norm(
+                part_x, part_residual, weight, self.variance_epsilon
+            )
+
+        from vllm.model_executor.determinism.request_stable_linear import (
+            apply_rms_norm_by_request,
+        )
+
+        return apply_rms_norm_by_request(x, residual, apply_once)
 
     def forward_cuda(
         self,
