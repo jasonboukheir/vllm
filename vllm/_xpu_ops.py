@@ -43,6 +43,7 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode"):
         output: torch.Tensor,
         max_seq_len: int,
         softmax_scale: float,
+        unrotate_output: bool = False,
     ) -> None:
         return
 
@@ -64,6 +65,7 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch"):
         output: torch.Tensor,
         max_seq_len: int,
         softmax_scale: float,
+        unrotate_output: bool = False,
     ) -> None:
         return
 
@@ -82,6 +84,31 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_materialize_packed_kv"):
         key_output: torch.Tensor,
         value_output: torch.Tensor,
         max_seq_len: int,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_scatter"):
+
+    @register_fake("_vllm_fa2_C::kvarn_hadamard_scatter")
+    def _kvarn_hadamard_scatter_fake(
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        group: int,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard"):
+
+    @register_fake("_vllm_fa2_C::kvarn_hadamard")
+    def _kvarn_hadamard_fake(
+        input: torch.Tensor,
+        output: torch.Tensor,
     ) -> None:
         return
 

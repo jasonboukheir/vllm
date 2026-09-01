@@ -16,6 +16,7 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.determinism.request_stable_linear import (
+    is_xpu_kvarn_packed_ordinary_decode,
     use_xpu_kvarn_request_stable_linears,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -152,7 +153,9 @@ class LogitsProcessor(PluggableLayer):
                     "XPU KVarN request-stable logits require two-dimensional "
                     "selected hidden states"
                 )
-            if hidden_states.shape[0] <= 1:
+            if hidden_states.shape[0] <= 1 or is_xpu_kvarn_packed_ordinary_decode(
+                hidden_states.shape[0]
+            ):
                 return self._apply_head_once(lm_head, hidden_states, embedding_bias)
             return torch.cat(
                 [

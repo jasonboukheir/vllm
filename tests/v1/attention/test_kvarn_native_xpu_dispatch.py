@@ -1,17 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+import vllm.v1.attention.ops.triton_kvarn_decode as kvarn_decode
 from vllm.v1.attention.ops.triton_kvarn_decode import (
+    _kvarn_dpas_layout_for_problem,
+    _kvarn_native_output_hadamard_enabled,
+    _kvarn_op_supports_argument,
+    _require_kvarn_dpas_reader,
+    kvarn_dpas_layout_requested,
     kvarn_native_feature_enabled,
     kvarn_native_layer_selected,
     kvarn_native_problem_supported,
     kvarn_native_split_count,
+    kvarn_native_store_supported,
 )
 
 
@@ -39,7 +47,12 @@ def test_native_feature_master_and_subfeature_toggles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("KVARN_NATIVE_XPU", raising=False)
+    monkeypatch.setattr(kvarn_decode.current_platform, "is_xpu", lambda: False)
     assert not kvarn_native_feature_enabled("DECODE")
+
+    monkeypatch.setattr(kvarn_decode.current_platform, "is_xpu", lambda: True)
+    assert kvarn_native_feature_enabled("DECODE")
+    assert kvarn_native_feature_enabled("MATERIALIZE")
 
     monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
     assert kvarn_native_feature_enabled("DECODE")
@@ -48,6 +61,67 @@ def test_native_feature_master_and_subfeature_toggles(
     monkeypatch.setenv("KVARN_NATIVE_XPU_DECODE", "0")
     assert not kvarn_native_feature_enabled("DECODE")
     assert kvarn_native_feature_enabled("MATERIALIZE")
+
+
+def _native_store(**overrides) -> dict:
+    problem = dict(
+        device_type="xpu",
+        num_tokens=4,
+        num_query_heads=24,
+        num_kv_heads=4,
+        head_dim=256,
+        group=128,
+        key_bits=4,
+        value_bits=4,
+        record_bytes=35_072,
+        sliding_window=0,
+        key_dtype=torch.bfloat16,
+        value_dtype=torch.bfloat16,
+        has_lookup=True,
+        has_tail_pool=True,
+        is_capturing=False,
+        op_available=True,
+    )
+    problem.update(overrides)
+    return problem
+
+
+def test_native_store_follows_decode_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU", raising=False)
+    assert not kvarn_native_store_supported(**_native_store())
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
+    assert kvarn_native_store_supported(**_native_store())
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_DECODE", "0")
+    assert not kvarn_native_store_supported(**_native_store())
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"num_tokens": 0},
+        {"num_tokens": 13},
+        {"num_query_heads": 32},
+        {"num_kv_heads": 8},
+        {"head_dim": 128},
+        {"group": 64},
+        {"value_bits": 2},
+        {"record_bytes": 35_071},
+        {"sliding_window": 1024},
+        {"key_dtype": torch.float32, "value_dtype": torch.float32},
+        {"value_dtype": torch.float16},
+        {"has_lookup": False},
+        {"has_tail_pool": False},
+        {"is_capturing": True},
+        {"op_available": False},
+    ],
+)
+def test_native_store_rejects_unsupported_dispatch(
+    monkeypatch: pytest.MonkeyPatch, override: dict
+) -> None:
+    monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
+    assert not kvarn_native_store_supported(**_native_store(**override))
 
 
 @pytest.mark.parametrize("record_bytes", [35_072, 65_536])
@@ -73,14 +147,47 @@ def test_native_problem_rejects_unsupported_abi(override: dict) -> None:
     assert not kvarn_native_problem_supported(**_native_problem(**override))
 
 
-def test_native_problem_rejects_unported_dpas_layout(
+def test_native_problem_accepts_matching_dpas_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    assert kvarn_native_problem_supported(**_native_problem())
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
+    assert kvarn_dpas_layout_requested()
+    assert kvarn_native_problem_supported(**_native_problem())
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "0")
+    assert not kvarn_dpas_layout_requested()
+    assert kvarn_native_problem_supported(**_native_problem())
+
+
+def test_dpas_layout_refuses_natural_reader_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
-    assert not kvarn_native_problem_supported(**_native_problem())
+    _require_kvarn_dpas_reader(True, "test reader")
+    with pytest.raises(RuntimeError, match="refusing the natural-layout"):
+        _require_kvarn_dpas_reader(False, "test reader")
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "0")
+    _require_kvarn_dpas_reader(False, "test reader")
+
+
+def test_dpas_layout_problem_validation_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    assert not _kvarn_dpas_layout_for_problem(128, 64, 2, 2)
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
+    assert _kvarn_dpas_layout_for_problem(256, 128, 4, 4)
+    with pytest.raises(RuntimeError, match="requires D256/G128/K4V4"):
+        _kvarn_dpas_layout_for_problem(256, 128, 4, 2)
 
 
 def test_native_layer_filter_matches_components() -> None:
+    kvarn_native_layer_selected.cache_clear()
     name = "model.layers.17.self_attn.attn"
     assert kvarn_native_layer_selected(name, "")
     assert kvarn_native_layer_selected(name, "layers.17")
@@ -88,17 +195,80 @@ def test_native_layer_filter_matches_components() -> None:
     assert not kvarn_native_layer_selected(name, "layers.1")
     assert not kvarn_native_layer_selected(name, "layers.170")
 
+    before = kvarn_native_layer_selected.cache_info()
+    assert kvarn_native_layer_selected(name, "layers.17")
+    after = kvarn_native_layer_selected.cache_info()
+    assert after.hits == before.hits + 1
+
 
 def test_native_split_count_matches_cpp_short_context_rule(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    kvarn_decode._kvarn_native_split_count_cached.cache_clear()
     monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "32")
     assert kvarn_native_split_count(4096) == 32
+    assert kvarn_native_split_count(4096) == 32
+    assert kvarn_decode._kvarn_native_split_count_cached.cache_info().hits == 1
     assert kvarn_native_split_count(1024) == 1
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
+    assert kvarn_native_split_count(4096) == 16
 
     monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "3")
     with pytest.raises(ValueError, match="must be one of"):
         kvarn_native_split_count(4096)
+
+
+def test_native_split_count_defaults_to_validated_multisplit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kvarn_decode._kvarn_native_split_count_cached.cache_clear()
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
+
+    assert kvarn_native_split_count(4096) == 16
+    assert os.environ["KVARN_NATIVE_XPU_SPLITS"] == "16"
+    assert kvarn_native_split_count(512) == 1
+
+
+def test_native_output_hadamard_schema_detection_is_backward_compatible() -> None:
+    old_op = SimpleNamespace(
+        default=SimpleNamespace(
+            _schema=SimpleNamespace(arguments=[SimpleNamespace(name="softmax_scale")])
+        )
+    )
+    new_op = SimpleNamespace(
+        default=SimpleNamespace(
+            _schema=SimpleNamespace(
+                arguments=[
+                    SimpleNamespace(name="softmax_scale"),
+                    SimpleNamespace(name="unrotate_output"),
+                ]
+            )
+        )
+    )
+
+    assert not _kvarn_op_supports_argument(old_op, "unrotate_output")
+    assert _kvarn_op_supports_argument(new_op, "unrotate_output")
+    assert not _kvarn_op_supports_argument(SimpleNamespace(), "unrotate_output")
+
+
+def test_native_output_hadamard_requires_multisplit_and_matching_op_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[bool] = []
+
+    def supported(with_scratch: bool) -> bool:
+        seen.append(with_scratch)
+        return with_scratch
+
+    monkeypatch.setattr(
+        kvarn_decode, "kvarn_native_output_hadamard_supported", supported
+    )
+    assert not _kvarn_native_output_hadamard_enabled(1, True)
+    assert not seen
+    assert _kvarn_native_output_hadamard_enabled(16, True)
+    assert not _kvarn_native_output_hadamard_enabled(16, False)
+    assert seen == [True, False]
 
 
 def test_native_xpu_schemas_have_fake_dispatch() -> None:
@@ -116,6 +286,8 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
         "kvarn_decode",
         "kvarn_decode_with_scratch",
         "kvarn_materialize_packed_kv",
+        "kvarn_hadamard_scatter",
+        "kvarn_hadamard",
     )
     for name in operator_names:
         qualified_name = f"_vllm_fa2_C::{name}"
@@ -147,6 +319,25 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
         )
         is None
     )
+    if _kvarn_op_supports_argument(
+        torch.ops._vllm_fa2_C.kvarn_decode, "unrotate_output"
+    ):
+        assert (
+            torch.ops._vllm_fa2_C.kvarn_decode(
+                query,
+                cache,
+                block_table,
+                seq_lens,
+                block_to_slot,
+                tail_key,
+                tail_value,
+                output,
+                128,
+                0.0625,
+                True,
+            )
+            is None
+        )
 
     temp_output = torch.empty((1, 24, 256), dtype=torch.float16, device="meta")
     exp_sums = torch.empty((1, 24, 1), dtype=torch.float32, device="meta")
@@ -169,6 +360,28 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
         )
         is None
     )
+    if _kvarn_op_supports_argument(
+        torch.ops._vllm_fa2_C.kvarn_decode_with_scratch, "unrotate_output"
+    ):
+        assert (
+            torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+                query,
+                cache,
+                block_table,
+                seq_lens,
+                block_to_slot,
+                tail_key,
+                tail_value,
+                temp_output,
+                exp_sums,
+                max_logits,
+                output,
+                128,
+                0.0625,
+                True,
+            )
+            is None
+        )
 
     materialized_key = torch.empty((128, 4, 256), dtype=torch.float16, device="meta")
     materialized_value = torch.empty_like(materialized_key)
@@ -186,6 +399,23 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
             128,
         )
         is None
+    )
+
+    assert (
+        torch.ops._vllm_fa2_C.kvarn_hadamard_scatter(
+            query[:, :4],
+            query[:, :4],
+            torch.empty((1,), dtype=torch.int64, device="meta"),
+            block_to_slot,
+            tail_key,
+            tail_value,
+            128,
+        )
+        is None
+    )
+    transformed = torch.empty((24, 256), dtype=torch.float16, device="meta")
+    assert (
+        torch.ops._vllm_fa2_C.kvarn_hadamard(query.view(24, 256), transformed) is None
     )
 
 
@@ -483,8 +713,8 @@ def test_xpu_forward_context_rejects_any_non_gdn_qwen_metadata(
 
     _enable_xe2_request_stable_profile(monkeypatch)
     config = _request_stable_config()
-    config.compilation_config.static_forward_context["linear_attn_2"] = (
-        SimpleNamespace(mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN)
+    config.compilation_config.static_forward_context["linear_attn_2"] = SimpleNamespace(
+        mamba_type=MambaAttentionBackendEnum.QWEN_GDN_ATTN
     )
     metadata = GDNAttentionMetadata(
         num_prefills=1,

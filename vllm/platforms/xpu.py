@@ -156,6 +156,7 @@ class XPUPlatform(Platform):
         from vllm.model_executor.determinism.request_stable_linear import (
             XPU_KVARN_CANONICAL_LINEAR_ROWS,
             XPU_KVARN_REQUEST_SLICES_KEY,
+            XPUKvarnRequestSlices,
             use_xpu_kvarn_request_stable_linears,
         )
 
@@ -164,8 +165,7 @@ class XPUPlatform(Platform):
         if not cls._kvarn_request_stable_xe2_validated:
             if not torch.ops._xpu_C.is_xe2_arch():
                 raise RuntimeError(
-                    "the frozen XPU KVarN request-stable profile requires an "
-                    "Xe2 device"
+                    "the frozen XPU KVarN request-stable profile requires an Xe2 device"
                 )
             cls._kvarn_request_stable_xe2_validated = True
         if attn_metadata is None or attn_metadata == {}:
@@ -299,20 +299,17 @@ class XPUPlatform(Platform):
             for start, stop, position, is_prefill in request_slices:
                 span = stop - start
                 if (
-                    (is_prefill or span > 1)
-                    and position % XPU_KVARN_CANONICAL_LINEAR_ROWS != 0
-                ):
+                    is_prefill or span > 1
+                ) and position % XPU_KVARN_CANONICAL_LINEAR_ROWS != 0:
                     raise RuntimeError(
                         "XPU KVarN multi-row projection did not start on the "
                         "canonical 64-row grid"
                     )
             if expected_slices is None:
-                expected_slices = request_slices
+                expected_slices = XPUKvarnRequestSlices(request_slices)
                 expected_metadata_signature = metadata_signature
             elif metadata_signature != expected_metadata_signature:
-                raise RuntimeError(
-                    "XPU KVarN GDN layers disagree on dispatch counts"
-                )
+                raise RuntimeError("XPU KVarN GDN layers disagree on dispatch counts")
             elif request_slices != expected_slices:
                 raise RuntimeError(
                     "XPU KVarN GDN layers disagree on packed request metadata"

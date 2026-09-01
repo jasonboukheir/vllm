@@ -35,7 +35,7 @@ from __future__ import annotations
 import functools
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import ClassVar, Protocol
 
@@ -43,6 +43,10 @@ import torch
 import torch.nn.functional as F
 
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.kvarn.config import (
+    kvarn_prefill_fp16_window_blocks,
+)
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.backend import (
@@ -69,7 +73,14 @@ from vllm.v1.attention.ops.kvarn_store import (
     kvarn_store_tile_k_batch_from_sinkhorn,
     kvarn_store_tile_v_batch_from_sinkhorn,
 )
-from vllm.v1.attention.ops.triton_kvarn_decode import kvarn_decode_attention
+from vllm.v1.attention.ops.triton_kvarn_decode import (
+    _kvarn_scatter_store_kernel,
+    _require_kvarn_dpas_reader,
+    kvarn_decode_attention,
+    kvarn_dpas_layout_requested,
+    kvarn_native_layer_selected,
+    kvarn_native_store_supported,
+)
 from vllm.v1.attention.ops.triton_kvarn_sinkhorn import kvarn_sinkhorn_triton
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
@@ -77,10 +88,68 @@ _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
+logger = init_logger(__name__)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Hadamard cache (one D×D matrix per (head_dim, device))
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def _cast_kvarn_activations(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    query_only: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cast activations still consumed by the fp16 fallback paths.
+
+    Pure qlen=1 decode can feed bf16 Q/K/V directly to the native H256
+    transforms, which write their persistent fp16 scratch themselves.  Keep
+    those inputs untouched here; the decode driver performs a local Q cast if
+    it ultimately has to fall back to the dense fp16 transform.
+    """
+    if query_only:
+        return query, key, value
+    if query.dtype == torch.float16:
+        return query, key, value
+    query = query.to(torch.float16)
+    key = key.to(torch.float16)
+    value = value.to(torch.float16)
+    return query, key, value
+
+
+def _is_pure_kvarn_decode_step(attn_metadata, num_tokens: int) -> bool:
+    """Return whether a cache update belongs to pure qlen=1 decode."""
+    return (
+        attn_metadata is not None
+        and not getattr(attn_metadata, "is_prefill", True)
+        and getattr(attn_metadata, "max_query_len", 0) <= 1
+        and getattr(attn_metadata, "num_decodes", 0) > 0
+        and getattr(attn_metadata, "num_decode_tokens", -1) == num_tokens
+        and getattr(attn_metadata, "num_actual_tokens", -1) == num_tokens
+    )
+
+
+def _active_kvarn_metadata(layer: torch.nn.Module):
+    """Look up this layer's metadata from the active forward context."""
+    try:
+        from vllm.forward_context import get_forward_context
+
+        raw_metadata = get_forward_context().attn_metadata
+    except Exception:
+        return None
+
+    layer_name = getattr(layer, "layer_name", "")
+    if isinstance(raw_metadata, dict):
+        return raw_metadata.get(layer_name)
+    if isinstance(raw_metadata, list):
+        for entry in raw_metadata:
+            if isinstance(entry, dict) and layer_name in entry:
+                return entry[layer_name]
+        return None
+    return raw_metadata
 
 
 @functools.cache
@@ -96,6 +165,37 @@ def _build_hadamard(d: int, device: torch.device) -> torch.Tensor:
     return _hadamard_cached(d, str(torch.device(device)))
 
 
+def _kvarn_dpas_layout_for_config(cfg) -> bool:
+    if not kvarn_dpas_layout_requested():
+        return False
+    actual = (cfg.head_dim, cfg.group, cfg.key_bits, cfg.value_bits)
+    if actual != (256, 128, 4, 4):
+        raise RuntimeError(
+            "KVARN_NATIVE_XPU_DPAS_LAYOUT=1 requires D256/G128/K4V4; "
+            f"got D{actual[0]}/G{actual[1]}/K{actual[2]}V{actual[3]}"
+        )
+    return True
+
+
+def _use_kvarn_fused_verify(
+    *,
+    max_query_len: int,
+    max_seq_len: int,
+    group: int,
+    batch_size: int,
+    dpas_layout: bool,
+) -> bool:
+    """Route only natural-layout cached queries to the fused verify reader."""
+    return (
+        os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"
+        and not dpas_layout
+        and max_query_len <= int(os.environ.get("KVARN_FUSED_VERIFY_MAXQ", "8"))
+        and (max_seq_len + group - 1) // group
+        >= int(os.environ.get("KVARN_FUSED_VERIFY_MIN_BLOCKS", "64"))
+        and batch_size > 0
+    )
+
+
 def _sinkhorn_pack_kv(K_tiles, V_tiles, cfg):
     """Sinkhorn-balance + pack a batch of K and V tiles into int4 stores.
 
@@ -106,6 +206,7 @@ def _sinkhorn_pack_kv(K_tiles, V_tiles, cfg):
     [R, C] — kvarn_sinkhorn_triton takes R, C as per-launch constexpr — so K and V
     must be balanced in SEPARATE launches. (A single torch.cat here assumed square
     and broke at head_dim=256.)"""
+    dpas_layout = _kvarn_dpas_layout_for_config(cfg)
     if K_tiles.shape[1:] == V_tiles.shape[1:]:
         nk = K_tiles.shape[0]
         bal, sc, sr = kvarn_sinkhorn_triton(
@@ -113,19 +214,35 @@ def _sinkhorn_pack_kv(K_tiles, V_tiles, cfg):
             iterations=cfg.sinkhorn_iters,
         )
         K_out = kvarn_store_tile_k_batch_from_sinkhorn(
-            bal[:nk], sc[:nk], sr[:nk], bits=cfg.key_bits
+            bal[:nk],
+            sc[:nk],
+            sr[:nk],
+            bits=cfg.key_bits,
+            dpas_layout=dpas_layout,
         )
         V_out = kvarn_store_tile_v_batch_from_sinkhorn(
-            bal[nk:], sc[nk:], sr[nk:], bits=cfg.value_bits
+            bal[nk:],
+            sc[nk:],
+            sr[nk:],
+            bits=cfg.value_bits,
+            dpas_layout=dpas_layout,
         )
     else:
         kbal, ksc, ksr = kvarn_sinkhorn_triton(K_tiles, iterations=cfg.sinkhorn_iters)
         vbal, vsc, vsr = kvarn_sinkhorn_triton(V_tiles, iterations=cfg.sinkhorn_iters)
         K_out = kvarn_store_tile_k_batch_from_sinkhorn(
-            kbal, ksc, ksr, bits=cfg.key_bits
+            kbal,
+            ksc,
+            ksr,
+            bits=cfg.key_bits,
+            dpas_layout=dpas_layout,
         )
         V_out = kvarn_store_tile_v_batch_from_sinkhorn(
-            vbal, vsc, vsr, bits=cfg.value_bits
+            vbal,
+            vsc,
+            vsr,
+            bits=cfg.value_bits,
+            dpas_layout=dpas_layout,
         )
     return K_out, V_out
 
@@ -145,6 +262,126 @@ def _reconcile_kvarn_sink_ownership(
         sinks.discard(bid)
         if bid < is_sink_t.shape[0]:
             is_sink_t[bid] = False
+
+
+def _defer_kvarn_prefill_history_blocks(
+    row: Sequence[int],
+    *,
+    q_len: int,
+    committed_len: int,
+    group: int,
+    bt_cols: int,
+    resident_blocks: dict[int, int],
+    blocks_needed: set[int],
+    deferred_blocks: set[int] | None = None,
+) -> bool:
+    """Retain resident full history for a diagnostic continuation ablation.
+
+    Returning ``True`` tells the caller to skip this row's normal walk-back
+    flush. Adding each resident, fully committed history block to
+    ``blocks_needed`` also keeps it out of reclaim. Blocks already materialized
+    in int4 are deliberately ignored: allocating an empty fp16 slot for one
+    would corrupt a prefix-cache hit.
+
+    This is intentionally not a memory-scalable policy. It exists only to
+    isolate continuation-boundary flushing as a correctness/performance cause.
+    """
+    if (
+        os.environ.get("VLLM_KVARN_DEFER_PREFILL_FLUSH", "0") != "1"
+        or q_len <= 1
+        or committed_len <= 0
+    ):
+        return False
+
+    for k in range(min(committed_len // group, bt_cols)):
+        bid = int(row[k])
+        if bid >= 0 and bid in resident_blocks:
+            blocks_needed.add(bid)
+            if deferred_blocks is not None:
+                deferred_blocks.add(bid)
+    return True
+
+
+def _kvarn_prefill_fp16_window_blocks() -> int:
+    """Return the bounded continuation-history fp16 window size."""
+    return kvarn_prefill_fp16_window_blocks()
+
+
+def _protect_kvarn_prefill_window_blocks(
+    row: Sequence[int],
+    *,
+    q_len: int,
+    committed_len: int,
+    group: int,
+    bt_cols: int,
+    window: int,
+    resident_blocks: dict[int, int],
+    blocks_needed: set[int],
+    protected_blocks: set[int],
+) -> bool:
+    """Protect the newest resident full history blocks for one continuation.
+
+    Block-table column zero is the fp16 sink and is protected independently by
+    the production sink policy, so it does not consume the bounded history
+    window. Already-materialized int4 blocks are ignored rather than assigned
+    empty fp16 slots.
+    """
+    if window <= 0 or q_len <= 1 or committed_len <= 0:
+        return False
+
+    full_blocks = min(committed_len // group, bt_cols)
+    first = max(1, full_blocks - window)
+    for k in range(first, full_blocks):
+        bid = int(row[k])
+        if bid >= 0 and bid in resident_blocks:
+            blocks_needed.add(bid)
+            protected_blocks.add(bid)
+    return True
+
+
+def _kvarn_walk_back_flush_blocks(
+    row: Sequence[int],
+    *,
+    committed_len: int,
+    group: int,
+    bt_cols: int,
+    resident_blocks: dict[int, int],
+    sinks: set[int],
+    flush_seen: set[int],
+    defer: bool,
+    deferred_blocks: set[int] | None = None,
+) -> list[int]:
+    """Return this row's normal ordered walk-back flush candidates."""
+    if defer:
+        return []
+    result: list[int] = []
+    k = min(committed_len // group - 1, bt_cols - 1)
+    while k >= 1:
+        bid = int(row[k])
+        if deferred_blocks is not None and bid in deferred_blocks:
+            # A bounded protected suffix must not terminate the walk: older
+            # resident history still has to flush to keep memory bounded.
+            k -= 1
+            continue
+        if bid < 0 or bid in flush_seen or bid in sinks or bid not in resident_blocks:
+            break
+        flush_seen.add(bid)
+        result.append(bid)
+        k -= 1
+    return result
+
+
+def _kvarn_reclaimable_block_ids(
+    resident_blocks: dict[int, int],
+    blocks_needed: set[int],
+    flush_seen: set[int],
+) -> list[int]:
+    """Return resident blocks not protected by the active step or walk-back."""
+    return [
+        bid
+        for bid in resident_blocks
+        if bid not in blocks_needed and bid not in flush_seen
+    ]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -622,6 +859,57 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             free_slots = KVarNAttentionImpl._free_slots[gk]
             sinks = KVarNAttentionImpl._global_sink_blocks[gk]
 
+            # Full defer is an unbounded diagnostic ablation. The bounded beta
+            # policy retains only the newest W non-sink history blocks while
+            # walk-back skips past them to flush older resident history. Adding
+            # retained blocks to blocks_needed also protects them from reclaim.
+            # Fresh prefill and qlen=1 decode are unchanged.
+            prefill_window = _kvarn_prefill_fp16_window_blocks()
+            deferred_prefill_rows: set[int] = set()
+            deferred_prefill_blocks: set[int] = set()
+            window_prefill_rows: set[int] = set()
+            window_prefill_blocks: set[int] = set()
+            for b in range(B):
+                if b >= bt_rows or bt_cols == 0:
+                    break
+                sl = seq_lens_cpu[b]
+                if sl <= 0:
+                    continue
+                q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+                committed_len = max(sl - q_len, 0)
+                if _defer_kvarn_prefill_history_blocks(
+                    block_table_np[b],
+                    q_len=q_len,
+                    committed_len=committed_len,
+                    group=GROUP,
+                    bt_cols=bt_cols,
+                    resident_blocks=dict_map,
+                    blocks_needed=blocks_needed,
+                    deferred_blocks=deferred_prefill_blocks,
+                ):
+                    deferred_prefill_rows.add(b)
+                elif _protect_kvarn_prefill_window_blocks(
+                    block_table_np[b],
+                    q_len=q_len,
+                    committed_len=committed_len,
+                    group=GROUP,
+                    bt_cols=bt_cols,
+                    window=prefill_window,
+                    resident_blocks=dict_map,
+                    blocks_needed=blocks_needed,
+                    protected_blocks=window_prefill_blocks,
+                ):
+                    window_prefill_rows.add(b)
+            deferred_block_count = len(deferred_prefill_blocks)
+            if deferred_block_count:
+                logger.warning_once(
+                    "VLLM_KVARN_DEFER_PREFILL_FLUSH=1 retained %d resident "
+                    "full history block(s) across %d continuation row(s); "
+                    "this diagnostic ablation is not memory-scalable.",
+                    deferred_block_count,
+                    len(deferred_prefill_rows),
+                )
+
             # ORDER MATTERS: mark sinks → FLUSH (frees just-completed blocks'
             # slots) → ALLOCATE (the new tails, reusing the freed slots). Doing
             # the flush before allocation caps the live-slot peak at 2·B
@@ -703,6 +991,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             # and stops — no per-request state to collide.
             flush_block_ids: list[int] = []
             flush_seen: set[int] = set()
+            window_flush_ids: set[int] = set()
+            protected_prefill_blocks = deferred_prefill_blocks | window_prefill_blocks
             for b in range(B):
                 if b >= bt_rows or bt_cols == 0:
                     break
@@ -712,19 +1002,31 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     continue
                 q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
                 committed_len = max(sl - q_len, 0)  # tokens already in pool & accepted
-                k = min(committed_len // GROUP - 1, bt_cols - 1)
-                while k >= 1:
-                    bid = int(row[k])
-                    if (
-                        bid < 0
-                        or bid in flush_seen
-                        or bid in sinks
-                        or bid not in dict_map
-                    ):
-                        break
-                    flush_seen.add(bid)
-                    flush_block_ids.append(bid)
-                    k -= 1
+                row_flush_ids = _kvarn_walk_back_flush_blocks(
+                    row,
+                    committed_len=committed_len,
+                    group=GROUP,
+                    bt_cols=bt_cols,
+                    resident_blocks=dict_map,
+                    sinks=sinks,
+                    flush_seen=flush_seen,
+                    defer=b in deferred_prefill_rows,
+                    deferred_blocks=protected_prefill_blocks,
+                )
+                flush_block_ids.extend(row_flush_ids)
+                if b in window_prefill_rows:
+                    window_flush_ids.update(row_flush_ids)
+
+            if window_prefill_blocks:
+                logger.info_once(
+                    "KVARN_PREFILL_FP16_WINDOW_BLOCKS=%d protected %d recent "
+                    "resident full history block(s) and queued %d older block(s) "
+                    "for flush across %d continuation row(s).",
+                    prefill_window,
+                    len(window_prefill_blocks),
+                    len(window_flush_ids),
+                    len(window_prefill_rows),
+                )
 
             # (2b) Reclaim slot-holding blocks neither written this step nor
             # queued above: they belong to finished (or preempted) requests.
@@ -737,9 +1039,9 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             # (the old discard left stale tile bytes). A PARTIAL block is
             # discarded: vLLM never prefix-caches partial blocks.
             discard_ids: list[int] = []
-            for bid in [
-                b for b in dict_map if b not in blocks_needed and b not in flush_seen
-            ]:
+            for bid in _kvarn_reclaimable_block_ids(
+                dict_map, blocks_needed, flush_seen
+            ):
                 full = self._block_fill.get(bid, 0) >= GROUP
                 if full and bid in sinks:
                     self._retired_sinks[bid] = None  # idempotent re-insert
@@ -1001,6 +1303,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _shared_out_rot_fp32_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _shared_output_fp32_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _shared_fused_out_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    _shared_native_output_fp16_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
     # Optional native Xe2 split-K scratch. The class-level owner keeps the
     # allocations alive across asynchronous layer launches and lets every
     # KVarN layer on the device reuse the same stream-ordered buffers.
@@ -1056,6 +1359,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls._shared_out_rot_fp32_buf.clear()
         cls._shared_output_fp32_buf.clear()
         cls._shared_fused_out_buf.clear()
+        cls._shared_native_output_fp16_buf.clear()
         cls._shared_native_decode_scratch.clear()
         cls._shared_mid_o_buf.clear()
         cls._shared_mid_lse_buf.clear()
@@ -1080,7 +1384,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         head_dim: int,
         device: torch.device,
     ) -> None:
-        """Create or atomically grow the six shared Q/output buffers."""
+        """Create or atomically grow the shared Q/output buffers."""
         existing = (
             cls._shared_q_fp32_buf.get(bkey),
             cls._shared_q_rot_fp32_buf.get(bkey),
@@ -1088,6 +1392,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cls._shared_out_rot_fp32_buf.get(bkey),
             cls._shared_output_fp32_buf.get(bkey),
             cls._shared_fused_out_buf.get(bkey),
+            cls._shared_native_output_fp16_buf.get(bkey),
         )
         if all(buf is not None and buf.shape[0] >= q_rows for buf in existing):
             return
@@ -1101,6 +1406,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             torch.empty(q_rows, head_dim, dtype=torch.float32, device=device),
             torch.empty(q_rows, head_dim, dtype=torch.float32, device=device),
             torch.empty(q_rows, head_dim, dtype=torch.float16, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float16, device=device),
         )
         (
             cls._shared_q_fp32_buf[bkey],
@@ -1109,6 +1415,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cls._shared_out_rot_fp32_buf[bkey],
             cls._shared_output_fp32_buf[bkey],
             cls._shared_fused_out_buf[bkey],
+            cls._shared_native_output_fp16_buf[bkey],
         ) = replacements
 
     @classmethod
@@ -1217,6 +1524,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._out_rot_fp32_buf: torch.Tensor | None = None
         self._output_fp32_buf: torch.Tensor | None = None
         self._fused_out_buf: torch.Tensor | None = None
+        self._native_output_fp16_buf: torch.Tensor | None = None
         self._native_decode_scratch: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
@@ -1455,7 +1763,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             and cfg.record_bytes >= 35_072
             and cfg.record_bytes % 4 == 0
             and int(getattr(self, "sliding_window", 0) or 0) == 0
-            and os.environ.get("KVARN_NATIVE_XPU_DPAS_LAYOUT", "0") != "1"
             and hasattr(torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch")
         )
         native_key = None
@@ -1539,6 +1846,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._out_rot_fp32_buf = cls._shared_out_rot_fp32_buf[bkey]
         self._output_fp32_buf = cls._shared_output_fp32_buf[bkey]
         self._fused_out_buf = cls._shared_fused_out_buf[bkey]
+        self._native_output_fp16_buf = cls._shared_native_output_fp16_buf[bkey]
         self._native_decode_scratch = (
             cls._shared_native_decode_scratch[native_key]
             if native_key is not None
@@ -1816,6 +2124,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             V_S_COL_OFFSET=cfg.v_s_col_offset,
             V_S_ROW_OFFSET=cfg.v_s_row_offset,
             V_ZP_OFFSET=cfg.v_zp_offset,
+            DPAS_LAYOUT=kvarn_dpas_layout_requested(),
             num_warps=4,
             num_stages=2,
         )
@@ -1936,6 +2245,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             K: [group, num_kv_heads, head_dim] fp16
             V: [group, num_kv_heads, head_dim] fp16
         """
+        _require_kvarn_dpas_reader(False, "Python dequantizer")
         cfg = self.kvarn_config
         group = cfg.group
         D = cfg.head_dim
@@ -2265,14 +2575,65 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         Hk = self.num_kv_heads
         D = self.head_size
 
-        # bf16 boundary-cast (see forward): KVarN store/rotation is fp16.
-        if key.dtype != torch.float16:
-            key = key.to(torch.float16)
-            value = value.to(torch.float16)
-
         # Ensure pool + lookup tensors + rotation scratch exist (no-op during
         # capture; first call before capture sizes pool to kv_cache num_blocks).
         self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
+
+        is_capturing = device.type == "xpu" and torch.xpu.is_current_stream_capturing()
+        use_native_store = (
+            _is_pure_kvarn_decode_step(_active_kvarn_metadata(layer), N)
+            and kvarn_native_store_supported(
+                device_type=device.type,
+                num_tokens=N,
+                num_query_heads=self.num_heads,
+                num_kv_heads=Hk,
+                head_dim=D,
+                group=cfg.group,
+                key_bits=cfg.key_bits,
+                value_bits=cfg.value_bits,
+                record_bytes=cfg.record_bytes,
+                sliding_window=int(getattr(self, "sliding_window", 0) or 0),
+                key_dtype=key.dtype,
+                value_dtype=value.dtype,
+                has_lookup=self._block_to_slot_t is not None,
+                has_tail_pool=(
+                    self._tail_K_pool is not None and self._tail_V_pool is not None
+                ),
+                is_capturing=is_capturing,
+                op_available=(
+                    hasattr(torch.ops._vllm_fa2_C, "kvarn_decode")
+                    and hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_scatter")
+                ),
+            )
+            and (
+                kvarn_native_layer_selected(
+                    getattr(self, "layer_name", ""),
+                    os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
+                )
+                and key.stride(-1) == 1
+                and value.stride(-1) == 1
+                and slot_mapping.dtype == torch.int64
+                and self._block_to_slot_t.dtype == torch.int32
+                and self._tail_K_pool.dtype == torch.float16
+                and self._tail_V_pool.dtype == torch.float16
+            )
+        )
+        if use_native_store:
+            torch.ops._vllm_fa2_C.kvarn_hadamard_scatter(
+                key[:N].view(N, Hk, D),
+                value[:N].view(N, Hk, D),
+                slot_mapping[:N],
+                self._block_to_slot_t,
+                self._tail_K_pool,
+                self._tail_V_pool,
+                cfg.group,
+            )
+            return
+
+        # The established fallback rotates and stores fp16 activations.
+        if key.dtype != torch.float16:
+            key = key.to(torch.float16)
+            value = value.to(torch.float16)
 
         # Reshape to (N, Hk, D) — view, no copy (key/value already fp16).
         k_view = key[:N].view(N, Hk, D)
@@ -2292,10 +2653,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # Scatter via the sparse pool indirection. Slot lookup (block_id →
         # pool slot) is done inside the kernel against the GPU
         # _block_to_slot_t tensor (mutated only by the metadata builder).
-        from vllm.v1.attention.ops.triton_kvarn_decode import (
-            _kvarn_scatter_store_kernel,
-        )
-
         _kvarn_scatter_store_kernel[(N, Hk)](
             k_rot,
             v_rot,
@@ -2375,16 +2732,16 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # Flush is now triggered from KVarNMetadataBuilder.build() between
         # captured graph replays — nothing to do here at the top of forward.
 
-        # bf16 boundary-cast: KVarN's compute (rotation matmul, scratch buffers,
-        # Triton stores) is fp16 internally. Cast bf16 activations to fp16 at this
-        # entry point; the output write below casts back to output.dtype. fp16 is
-        # untouched (byte-identical), and the cast is lossless for KVarN (fp16
-        # mantissa > bf16, and the cache is 4-bit). Without this, bf16 q mixing
-        # with fp16 KV buffers trips "Expected out BFloat16, got Half".
-        if query.dtype != torch.float16:
-            query = query.to(torch.float16)
-            key = key.to(torch.float16)
-            value = value.to(torch.float16)
+        # KVarN compute is fp16 internally. Pure one-token decode reads K/V from
+        # the cache after its update, so only Q remains live on this path.
+        query, key, value = _cast_kvarn_activations(
+            query,
+            key,
+            value,
+            query_only=(
+                not attn_metadata.is_prefill and attn_metadata.max_query_len <= 1
+            ),
+        )
 
         q = query[:N].view(N, self.num_heads, self.head_size)
 
@@ -2425,9 +2782,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             )
 
         if output.ndim == 3:
-            output[:N] = attn_out.to(output.dtype)
+            output[:N].copy_(attn_out)
         else:
-            output[:N] = attn_out.reshape(N, -1).to(output.dtype)
+            output[:N].copy_(attn_out.reshape(N, -1))
         return output
 
     # ── attention sub-paths ──────────────────────────────────────────────────
@@ -2810,21 +3167,24 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # continuations), where one materialization amortizes over thousands
         # of query tokens. KVARN_FUSED_VERIFY=0 forces materialize always.
         _group = self.kvarn_config.group
-        if (
-            os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"
-            and md.max_query_len <= int(os.environ.get("KVARN_FUSED_VERIFY_MAXQ", "8"))
-            and (int(md.max_seq_len) + _group - 1) // _group
-            >= int(os.environ.get("KVARN_FUSED_VERIFY_MIN_BLOCKS", "64"))
-            and B > 0
+        dpas_layout = _kvarn_dpas_layout_for_config(self.kvarn_config)
+        if _use_kvarn_fused_verify(
+            max_query_len=md.max_query_len,
+            max_seq_len=int(md.max_seq_len),
+            group=_group,
+            batch_size=B,
+            dpas_layout=dpas_layout,
         ):
             return self._fused_verify_path(q, kv_cache, md)
         if not _HAS_FLASH_ATTN or self.head_size > 256 or self._fa_K_buf is None:
+            _require_kvarn_dpas_reader(False, "slow multi-query decode")
             return self._decode_path_slow(q, kv_cache, md)
 
         seq_lens = md.seq_lens[:B].to(torch.int32)
         cu_k = F.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0))
         total_k = int(cu_k[-1].item())
         if total_k <= 0 or total_k > self._fa_K_buf.shape[0]:
+            _require_kvarn_dpas_reader(False, "slow multi-query decode")
             return self._decode_path_slow(q, kv_cache, md)
 
         cfg = self.kvarn_config
@@ -2835,12 +3195,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         max_blocks = min((max_k + group - 1) // group, md.block_table.shape[1])
         max_blocks = max(max_blocks, 1)
 
+        K_packed = self._fa_K_buf
+        V_packed = self._fa_V_buf
         from vllm.v1.attention.ops.triton_kvarn_decode import (
             _kvarn_build_packed_kv_kernel,
         )
 
-        K_packed = self._fa_K_buf
-        V_packed = self._fa_V_buf
         _kvarn_build_packed_kv_kernel[(B * max_blocks, Hk)](
             md.block_table,
             seq_lens,
@@ -2873,6 +3233,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             V_S_COL_OFFSET=cfg.v_s_col_offset,
             V_S_ROW_OFFSET=cfg.v_s_row_offset,
             V_ZP_OFFSET=cfg.v_zp_offset,
+            DPAS_LAYOUT=dpas_layout,
             num_warps=4,
             num_stages=2,
         )

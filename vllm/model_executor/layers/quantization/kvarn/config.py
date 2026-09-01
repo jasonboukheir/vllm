@@ -31,6 +31,32 @@ KVARN_PRESETS: dict[str, dict] = {
     "kvarn_k4v4_g64": {"key_bits": 4, "value_bits": 4, "group": 64},
 }
 
+# KVarN's quantized history is accurate enough for ordinary decode, but using
+# it while constructing a later chunk of the prompt can move this model onto a
+# different greedy trajectory. Keep a bounded recent-history window in fp16 for
+# continuation prefill. Unlike the diagnostic full-defer mode, this has a
+# context-independent memory bound and is included in tail-pool accounting.
+KVARN_PREFILL_FP16_WINDOW_BLOCKS_DEFAULT = 16
+
+
+def kvarn_prefill_fp16_window_blocks() -> int:
+    """Return the bounded continuation-prefill fp16 history window."""
+    raw = os.environ.get(
+        "KVARN_PREFILL_FP16_WINDOW_BLOCKS",
+        str(KVARN_PREFILL_FP16_WINDOW_BLOCKS_DEFAULT),
+    )
+    try:
+        window = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "KVARN_PREFILL_FP16_WINDOW_BLOCKS must be a non-negative integer"
+        ) from exc
+    if window < 0:
+        raise ValueError(
+            "KVARN_PREFILL_FP16_WINDOW_BLOCKS must be a non-negative integer"
+        )
+    return window
+
 
 @dataclass(frozen=True)
 class KVarNConfig:
@@ -211,14 +237,16 @@ class KVarNConfig:
     def pool_slots(self, max_num_seqs: int, max_num_batched_tokens: int) -> int:
         """Structural peak of fp16 pool slots needed in a single step:
         sink + in-progress tail per active request (2·max_num_seqs), plus the
-        full blocks a chunked prefill can touch before flushing, plus headroom.
-        With concurrency capped (see max_supported_seqs) this fits the budget."""
+        bounded recent-history window for each request, plus the full blocks a
+        chunked prefill can touch before flushing and headroom. With concurrency
+        capped (see max_supported_seqs) this fits the budget."""
         prefill_blocks = (max_num_batched_tokens + self.group - 1) // self.group
+        slots_per_seq = 2 + kvarn_prefill_fp16_window_blocks()
         # Floor/headroom kept small: at large head_dim·heads·layers (e.g. Gemma-4
         # 512·16·60 => ~251 MB/slot/layer) a big floor like 64 reserves tens of GB
         # and leaves no room for the KV cache. The real peak is sink+tail per seq
         # (2·S) plus the blocks an in-flight prefill touches before it flushes.
-        return max(2 * max_num_seqs + prefill_blocks + 8, 8)
+        return max(slots_per_seq * max_num_seqs + prefill_blocks + 8, 8)
 
     def pool_budget_bytes(
         self,
@@ -259,9 +287,10 @@ class KVarNConfig:
         """Largest max_num_seqs whose pool fits the pool budget.
 
         Inverts `pool_slots`: max_slots = budget / (slot_bytes · layers), then
-        solve 2·S + prefill + 8 ≤ max_slots for S. Always ≥ 1. The budget is
-        weight-aware when `weight_bytes`/`gpu_memory_utilization` are supplied
-        (see `pool_budget_bytes`); `frac`, if given, forces the legacy
+        solve ``(2 + fp16_window)·S + prefill + 8 ≤ max_slots`` for S.
+        Always ≥ 1. The budget is weight-aware when
+        `weight_bytes`/`gpu_memory_utilization` are supplied (see
+        `pool_budget_bytes`); `frac`, if given, forces the legacy
         fraction-of-total path."""
         if frac is not None:
             budget = int(total_gpu_bytes * frac)
@@ -272,7 +301,8 @@ class KVarNConfig:
         slot_bytes = self._slot_bytes_per_layer(num_kv_heads) * max(num_layers, 1)
         max_slots = int(budget / slot_bytes)
         prefill_blocks = (max_num_batched_tokens + self.group - 1) // self.group
-        return max(1, (max_slots - prefill_blocks - 8) // 2)
+        slots_per_seq = 2 + kvarn_prefill_fp16_window_blocks()
+        return max(1, (max_slots - prefill_blocks - 8) // slots_per_seq)
 
     def pool_bytes(
         self,
