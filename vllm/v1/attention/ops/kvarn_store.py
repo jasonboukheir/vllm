@@ -79,7 +79,9 @@ def _pack_4bit(q: torch.Tensor) -> torch.Tensor:
     q = q.to(torch.uint8) & 0xF
     lo = q[..., 0::2]
     hi = q[..., 1::2]
-    return (lo | (hi << 4)).to(torch.uint8)
+    packed = torch.empty(lo.shape, dtype=torch.uint8, device=q.device)
+    torch.bitwise_or(lo, hi << 4, out=packed)
+    return packed
 
 
 def _pack_lowbit(q: torch.Tensor, bits: int) -> torch.Tensor:
@@ -97,6 +99,24 @@ def _pack_lowbit(q: torch.Tensor, bits: int) -> torch.Tensor:
     for j in range(1, pack):
         out = out | (q[..., j] << (j * bits))
     return out.to(torch.uint8)
+
+
+def _pack_dpas_k4(q: torch.Tensor) -> torch.Tensor:
+    """Pack logical ``[N, 256, 128]`` K values in Xe2 DPAS fragment order."""
+    if q.ndim != 3 or q.shape[1:] != (256, 128):
+        raise ValueError("DPAS K packing requires [N, 256, 128] input")
+    n = q.shape[0]
+    slots = q.reshape(n, 4, 32, 2, 2, 4, 2, 8).permute(0, 4, 1, 5, 7, 3, 2, 6)
+    return _pack_4bit(slots).reshape(n, 256, 64)
+
+
+def _pack_dpas_v4(q: torch.Tensor) -> torch.Tensor:
+    """Pack logical ``[N, 128, 256]`` V values in Xe2 DPAS fragment order."""
+    if q.ndim != 3 or q.shape[1:] != (128, 256):
+        raise ValueError("DPAS V packing requires [N, 128, 256] input")
+    n = q.shape[0]
+    slots = q.reshape(n, 2, 4, 8, 2, 8, 2, 2, 8).permute(0, 1, 5, 2, 8, 4, 6, 3, 7)
+    return _pack_4bit(slots).reshape(n, 128, 128)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -165,6 +185,8 @@ def kvarn_store_tile_k_batch_from_sinkhorn(
     s_col: torch.Tensor,
     s_row: torch.Tensor,
     bits: int,
+    *,
+    dpas_layout: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Batched K-path RTN + scale absorption + 4-bit packing.
 
@@ -175,6 +197,7 @@ def kvarn_store_tile_k_batch_from_sinkhorn(
         s_col    : ``[N, group]`` fp32 — per-token sinkhorn scale (axis-1).
         s_row    : ``[N, D]``     fp32 — per-channel sinkhorn scale (axis-0).
         bits     : key bit-width (4).
+        dpas_layout: pack the D256/G128/K4 payload in Xe2 fragment order.
 
     Returns dict of per-tile (N-batched) tensors:
         q_packed_uint8 : ``[N, D, group/2]`` uint8
@@ -191,7 +214,12 @@ def kvarn_store_tile_k_batch_from_sinkhorn(
     s_col_K = (s_row * scale.squeeze(-1)).to(torch.float16)  # [N, R=D]
     zp_K = (s_row * zp.squeeze(-1)).to(torch.float16)
     s_row_K = s_col.to(torch.float16)  # [N, C=group]
-    q_packed = _pack_lowbit(q, bits)  # [N, R, C/pack]
+    if dpas_layout:
+        if bits != 4:
+            raise ValueError("DPAS K packing requires 4-bit values")
+        q_packed = _pack_dpas_k4(q)
+    else:
+        q_packed = _pack_lowbit(q, bits)  # [N, R, C/pack]
     return {
         "q_packed_uint8": q_packed,
         "s_col_K": s_col_K,
@@ -205,6 +233,8 @@ def kvarn_store_tile_v_batch_from_sinkhorn(
     s_col: torch.Tensor,
     s_row: torch.Tensor,
     bits: int,
+    *,
+    dpas_layout: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Batched V-path RTN + scale absorption + 4-bit packing.
 
@@ -213,6 +243,7 @@ def kvarn_store_tile_v_batch_from_sinkhorn(
         s_col    : ``[N, D]``     fp32 — per-channel sinkhorn scale (axis-1).
         s_row    : ``[N, group]`` fp32 — per-token-in-tile sinkhorn scale (axis-0).
         bits     : value bit-width (4).
+        dpas_layout: pack the D256/G128/K4 payload in Xe2 fragment order.
 
     Returns dict of per-tile (N-batched) tensors mirroring `kvarn_store_tile_v`.
     """
@@ -225,7 +256,12 @@ def kvarn_store_tile_v_batch_from_sinkhorn(
     s_row_V = (s_row * scale.squeeze(-1)).to(torch.float16)  # [N, R=group]
     zp_V = (s_row * zp.squeeze(-1)).to(torch.float16)
     s_col_V = s_col.to(torch.float16)  # [N, C=D]
-    q_packed = _pack_lowbit(q, bits)  # [N, R, C/pack]
+    if dpas_layout:
+        if bits != 4:
+            raise ValueError("DPAS V packing requires 4-bit values")
+        q_packed = _pack_dpas_v4(q)
+    else:
+        q_packed = _pack_lowbit(q, bits)  # [N, R, C/pack]
     return {
         "q_packed_uint8": q_packed,
         "s_col_V": s_col_V,

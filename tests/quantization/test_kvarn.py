@@ -10,17 +10,33 @@ import torch
 from vllm.model_executor.layers.quantization.kvarn.config import (
     KVARN_PRESETS,
     KVarNConfig,
+    kvarn_prefill_fp16_window_blocks,
 )
 from vllm.platforms.xpu import XPUPlatform
 from vllm.v1.attention.backends.kvarn_attn import (
     KVarNAttentionBackend,
     KVarNAttentionImpl,
+    _cast_kvarn_activations,
+    _defer_kvarn_prefill_history_blocks,
+    _is_pure_kvarn_decode_step,
+    _kvarn_dpas_layout_for_config,
+    _kvarn_prefill_fp16_window_blocks,
+    _kvarn_reclaimable_block_ids,
+    _kvarn_walk_back_flush_blocks,
     _KVarNMetadataStageRing,
+    _protect_kvarn_prefill_window_blocks,
     _reconcile_kvarn_sink_ownership,
     _rotate_kvarn_kv_into_scratch,
+    _use_kvarn_fused_verify,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.turboquant_attn import TurboQuantAttentionBackend
+from vllm.v1.attention.ops.kvarn_store import (
+    _pack_dpas_k4,
+    _pack_dpas_v4,
+    kvarn_store_tile_k_batch_from_sinkhorn,
+    kvarn_store_tile_v_batch_from_sinkhorn,
+)
 from vllm.v1.attention.selector import AttentionSelectorConfig
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import (
@@ -43,6 +59,185 @@ def _shared_q_output_maps():
         KVarNAttentionImpl._shared_out_rot_fp32_buf,
         KVarNAttentionImpl._shared_output_fp32_buf,
         KVarNAttentionImpl._shared_fused_out_buf,
+        KVarNAttentionImpl._shared_native_output_fp16_buf,
+    )
+
+
+def test_pure_decode_preserves_native_transform_inputs():
+    query, key, value = (torch.randn(2, 3, dtype=torch.bfloat16) for _ in range(3))
+
+    cast_query, cast_key, cast_value = _cast_kvarn_activations(
+        query, key, value, query_only=True
+    )
+
+    assert cast_query is query
+    assert cast_key is key
+    assert cast_value is value
+
+
+def test_kvarn_activation_cast_preserves_fp16_tensor_identity():
+    tensors = tuple(torch.randn(2, 3, dtype=torch.float16) for _ in range(3))
+
+    cast = _cast_kvarn_activations(*tensors, query_only=False)
+
+    assert all(result is original for result, original in zip(cast, tensors))
+
+
+def test_non_decode_kvarn_casts_every_activation():
+    tensors = tuple(torch.randn(2, 3, dtype=torch.bfloat16) for _ in range(3))
+
+    cast = _cast_kvarn_activations(*tensors, query_only=False)
+
+    assert all(tensor.dtype == torch.float16 for tensor in cast)
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({}, True),
+        ({"is_prefill": True}, False),
+        ({"max_query_len": 2}, False),
+        ({"num_decodes": 0}, False),
+        ({"num_decode_tokens": 3}, False),
+        ({"num_actual_tokens": 3}, False),
+    ],
+)
+def test_native_store_requires_a_pure_qlen1_decode(override, expected):
+    values = dict(
+        is_prefill=False,
+        max_query_len=1,
+        num_decodes=4,
+        num_decode_tokens=4,
+        num_actual_tokens=4,
+    )
+    values.update(override)
+
+    assert _is_pure_kvarn_decode_step(SimpleNamespace(**values), 4) is expected
+
+
+def test_dpas_pack_matches_frozen_xe2_fragment_coordinates():
+    dims = torch.arange(256, dtype=torch.int32)[:, None]
+    tokens = torch.arange(128, dtype=torch.int32)[None, :]
+    q_k = ((3 * dims + 5 * tokens + dims // 16 + tokens // 16) & 15).unsqueeze(0)
+    q_v = (7 * tokens.T + 11 * dims.T + tokens.T // 8 + dims.T // 32) & 15
+    q_v = q_v.unsqueeze(0)
+
+    expected_k = torch.empty((2, 4, 4, 16, 32), dtype=torch.uint8)
+    expected_v = torch.empty((2, 8, 4, 16, 16), dtype=torch.uint8)
+    for half in range(2):
+        for tile in range(4):
+            for subgroup in range(4):
+                for lane in range(16):
+                    for byte in range(32):
+                        values = []
+                        for nibble in range(2):
+                            slot = 2 * byte + nibble
+                            token = lane // 2 + 8 * (slot % 2)
+                            dim = 2 * (slot // 2) + lane % 2
+                            values.append(
+                                q_k[
+                                    0,
+                                    tile * 64 + dim,
+                                    half * 64 + subgroup * 16 + token,
+                                ]
+                            )
+                        expected_k[half, tile, subgroup, lane, byte] = values[0] | (
+                            values[1] << 4
+                        )
+        for tile in range(8):
+            for subgroup in range(4):
+                for lane in range(16):
+                    for byte in range(16):
+                        values = []
+                        for nibble in range(2):
+                            slot = 2 * byte + nibble
+                            inner = slot % 16
+                            dim = lane // 2 + 8 * (inner % 2) + 16 * (slot // 16)
+                            token = 2 * (inner // 2) + lane % 2
+                            values.append(
+                                q_v[
+                                    0,
+                                    half * 64 + subgroup * 16 + token,
+                                    tile * 32 + dim,
+                                ]
+                            )
+                        expected_v[half, tile, subgroup, lane, byte] = values[0] | (
+                            values[1] << 4
+                        )
+
+    torch.testing.assert_close(
+        _pack_dpas_k4(q_k).flatten(), expected_k.flatten(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        _pack_dpas_v4(q_v).flatten(), expected_v.flatten(), rtol=0, atol=0
+    )
+
+
+def test_dpas_store_preserves_metadata_and_fails_closed_on_wrong_shape():
+    balanced_k = torch.randn(2, 256, 128)
+    balanced_v = torch.randn(2, 128, 256)
+    k_s_col = torch.rand(2, 128)
+    k_s_row = torch.rand(2, 256)
+    v_s_col = torch.rand(2, 256)
+    v_s_row = torch.rand(2, 128)
+
+    natural_k = kvarn_store_tile_k_batch_from_sinkhorn(balanced_k, k_s_col, k_s_row, 4)
+    dpas_k = kvarn_store_tile_k_batch_from_sinkhorn(
+        balanced_k, k_s_col, k_s_row, 4, dpas_layout=True
+    )
+    natural_v = kvarn_store_tile_v_batch_from_sinkhorn(balanced_v, v_s_col, v_s_row, 4)
+    dpas_v = kvarn_store_tile_v_batch_from_sinkhorn(
+        balanced_v, v_s_col, v_s_row, 4, dpas_layout=True
+    )
+
+    for field in ("s_col_K", "zp_K", "s_row_K"):
+        torch.testing.assert_close(dpas_k[field], natural_k[field], rtol=0, atol=0)
+    for field in ("s_col_V", "s_row_V", "zp_V"):
+        torch.testing.assert_close(dpas_v[field], natural_v[field], rtol=0, atol=0)
+    assert dpas_k["q_packed_uint8"].shape == natural_k["q_packed_uint8"].shape
+    assert dpas_v["q_packed_uint8"].shape == natural_v["q_packed_uint8"].shape
+    assert not torch.equal(dpas_k["q_packed_uint8"], natural_k["q_packed_uint8"])
+    assert not torch.equal(dpas_v["q_packed_uint8"], natural_v["q_packed_uint8"])
+
+    with pytest.raises(ValueError, match="requires 4-bit"):
+        kvarn_store_tile_k_batch_from_sinkhorn(
+            balanced_k, k_s_col, k_s_row, 2, dpas_layout=True
+        )
+    with pytest.raises(ValueError, match=r"requires \[N, 128, 256\]"):
+        _pack_dpas_v4(torch.zeros(1, 64, 256, dtype=torch.int32))
+
+
+def test_dpas_layout_dispatch_requires_exact_cache_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cfg = SimpleNamespace(head_dim=256, group=128, key_bits=4, value_bits=4)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    assert not _kvarn_dpas_layout_for_config(cfg)
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
+    assert _kvarn_dpas_layout_for_config(cfg)
+    cfg.value_bits = 2
+    with pytest.raises(RuntimeError, match="requires D256/G128/K4V4"):
+        _kvarn_dpas_layout_for_config(cfg)
+
+
+def test_dpas_layout_bypasses_natural_fused_verify_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_FUSED_VERIFY", raising=False)
+    assert _use_kvarn_fused_verify(
+        max_query_len=1,
+        max_seq_len=8192,
+        group=128,
+        batch_size=4,
+        dpas_layout=False,
+    )
+    assert not _use_kvarn_fused_verify(
+        max_query_len=1,
+        max_seq_len=8192,
+        group=128,
+        batch_size=4,
+        dpas_layout=True,
     )
 
 
@@ -112,6 +307,15 @@ def test_shared_q_output_scratch_grows_as_one_complete_set():
         KVarNAttentionImpl._ensure_shared_q_output_scratch(bkey, 8, 8, device)
         grown = tuple(mapping[bkey] for mapping in _shared_q_output_maps())
         assert all(buffer.shape == (8, 8) for buffer in grown)
+        assert tuple(buffer.dtype for buffer in grown) == (
+            torch.float32,
+            torch.float32,
+            torch.float16,
+            torch.float32,
+            torch.float32,
+            torch.float16,
+            torch.float16,
+        )
         assert all(new is not old for new, old in zip(grown, first, strict=True))
 
         real_empty = torch.empty
@@ -232,6 +436,36 @@ def test_compact_d256_k4v4_record_has_no_power_of_two_padding():
     assert spec.state_content_size_bytes == 35_072
 
 
+def test_pool_accounts_for_default_bounded_prefill_window(monkeypatch):
+    monkeypatch.delenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", raising=False)
+    config = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128_compact", head_dim=256)
+
+    # B1/MNBT=2048: sink + tail + 16 recent blocks + 16 current blocks +
+    # eight slots of allocator headroom.
+    assert kvarn_prefill_fp16_window_blocks() == 16
+    assert config.pool_slots(1, 2048) == 42
+
+
+def test_pool_and_concurrency_use_the_same_prefill_window(monkeypatch):
+    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "4")
+    config = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128_compact", head_dim=256)
+    slot_bytes = config._slot_bytes_per_layer(num_kv_heads=4)
+    num_layers = 16
+    max_slots = 100
+
+    assert config.pool_slots(4, 2048) == 48
+    assert (
+        config.max_supported_seqs(
+            total_gpu_bytes=max_slots * slot_bytes * num_layers,
+            num_kv_heads=4,
+            num_layers=num_layers,
+            max_num_batched_tokens=2048,
+            frac=1.0,
+        )
+        == 12
+    )
+
+
 class _ModelConfig:
     def __init__(self, attention_layers, total_layers=64):
         self.attention_layers = attention_layers
@@ -346,6 +580,46 @@ def test_kvarn_forward_profiles_with_empty_cache_sentinel():
     assert not hasattr(impl, "_kv_cache_ref")
 
 
+@pytest.mark.parametrize("output_ndim", [2, 3])
+def test_kvarn_forward_copies_into_provided_output(output_ndim):
+    impl = object.__new__(KVarNAttentionImpl)
+    impl.kvarn_config = SimpleNamespace(record_bytes=35072)
+    impl.num_heads = 2
+    impl.num_kv_heads = 1
+    impl.head_size = 4
+    impl._ensure_pool = lambda device, num_blocks_hint: None
+    attention = torch.arange(16, dtype=torch.float16).view(2, 2, 4) / 8
+    impl._prefill_first_chunk = lambda q, k, v, metadata, cache: attention
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        is_prefill=True,
+        num_decodes=0,
+        num_decode_tokens=0,
+        has_cached_multiquery=False,
+        vq_seqlen=None,
+    )
+    query = torch.zeros(3, 8, dtype=torch.bfloat16)
+    key = torch.zeros(3, 4, dtype=torch.bfloat16)
+    value = torch.zeros_like(key)
+    output_shape = (3, 2, 4) if output_ndim == 3 else (3, 8)
+    output = torch.full(output_shape, -123, dtype=torch.bfloat16)
+
+    result = impl.forward(
+        None,
+        query,
+        key,
+        value,
+        torch.empty(0, dtype=torch.uint8),
+        metadata,
+        output=output,
+    )
+
+    expected = attention if output_ndim == 3 else attention.reshape(2, 8)
+    assert result is output
+    assert torch.equal(output[:2], expected.to(torch.bfloat16))
+    assert torch.equal(output[2], torch.full_like(output[2], -123))
+
+
 def test_immediately_recycled_sink_is_delabeled_outside_new_row_zero():
     """LIFO reuse must not carry a finished request's sink role into history."""
     old_sink = 5
@@ -367,6 +641,260 @@ def test_immediately_recycled_sink_is_delabeled_outside_new_row_zero():
     assert sinks == {new_sink}
     assert not is_sink_t[old_sink]
     assert is_sink_t[new_sink]
+
+
+def test_deferred_prefill_flush_retains_committed_history(monkeypatch):
+    monkeypatch.setenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", "1")
+    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "1")
+    row = [10, 11, 12, 13]
+    resident = {10: 0, 11: 1, 12: 2, 99: 3}
+    blocks_needed = {13}
+    deferred_blocks: set[int] = set()
+
+    defer = _defer_kvarn_prefill_history_blocks(
+        row,
+        q_len=256,
+        committed_len=384,
+        group=128,
+        bt_cols=len(row),
+        resident_blocks=resident,
+        blocks_needed=blocks_needed,
+        deferred_blocks=deferred_blocks,
+    )
+    flush_seen: set[int] = set()
+    walk_back = _kvarn_walk_back_flush_blocks(
+        row,
+        committed_len=384,
+        group=128,
+        bt_cols=len(row),
+        resident_blocks=resident,
+        sinks={10},
+        flush_seen=flush_seen,
+        defer=defer,
+        deferred_blocks=deferred_blocks,
+    )
+    shared_owner_walk_back = _kvarn_walk_back_flush_blocks(
+        row,
+        committed_len=384,
+        group=128,
+        bt_cols=len(row),
+        resident_blocks=resident,
+        sinks={10},
+        flush_seen=flush_seen,
+        defer=False,
+        deferred_blocks=deferred_blocks,
+    )
+    reclaim = _kvarn_reclaimable_block_ids(resident, blocks_needed, flush_seen)
+
+    assert defer
+    assert blocks_needed == {10, 11, 12, 13}
+    assert deferred_blocks == {10, 11, 12}
+    assert walk_back == []
+    assert shared_owner_walk_back == []
+    assert flush_seen == set()
+    assert reclaim == [99]
+
+
+@pytest.mark.parametrize(
+    ("flag", "q_len", "committed_len"),
+    [
+        (None, 256, 384),  # default continuation behavior
+        ("1", 1, 384),  # decode remains on the production policy
+        ("1", 256, 0),  # fresh prefill has no committed history
+    ],
+)
+def test_deferred_prefill_flush_does_not_change_other_steps(
+    monkeypatch, flag, q_len, committed_len
+):
+    if flag is None:
+        monkeypatch.delenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", flag)
+    row = [10, 11, 12, 13]
+    resident = {10: 0, 11: 1, 12: 2, 99: 3}
+    blocks_needed = {13}
+
+    defer = _defer_kvarn_prefill_history_blocks(
+        row,
+        q_len=q_len,
+        committed_len=committed_len,
+        group=128,
+        bt_cols=len(row),
+        resident_blocks=resident,
+        blocks_needed=blocks_needed,
+    )
+    flush_seen: set[int] = set()
+    walk_back = _kvarn_walk_back_flush_blocks(
+        row,
+        committed_len=committed_len,
+        group=128,
+        bt_cols=len(row),
+        resident_blocks=resident,
+        sinks={10},
+        flush_seen=flush_seen,
+        defer=defer,
+    )
+    reclaim = _kvarn_reclaimable_block_ids(resident, blocks_needed, flush_seen)
+
+    assert not defer
+    assert blocks_needed == {13}
+    if committed_len:
+        assert walk_back == [12, 11]
+        assert flush_seen == {11, 12}
+        assert reclaim == [10, 99]
+    else:
+        assert walk_back == []
+        assert flush_seen == set()
+        assert reclaim == [10, 11, 12, 99]
+
+
+def test_prefill_fp16_window_chunk2_retains_available_recent_history(monkeypatch):
+    monkeypatch.delenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", raising=False)
+    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
+    row = list(range(32))
+    resident = {bid: bid for bid in range(16)}
+    blocks_needed = {0, *range(16, 32)}
+    protected: set[int] = set()
+
+    active = _protect_kvarn_prefill_window_blocks(
+        row,
+        q_len=2048,
+        committed_len=2048,
+        group=128,
+        bt_cols=len(row),
+        window=_kvarn_prefill_fp16_window_blocks(),
+        resident_blocks=resident,
+        blocks_needed=blocks_needed,
+        protected_blocks=protected,
+    )
+    flush_seen: set[int] = set()
+    walk_back = _kvarn_walk_back_flush_blocks(
+        row,
+        committed_len=2048,
+        group=128,
+        bt_cols=len(row),
+        resident_blocks=resident,
+        sinks={0},
+        flush_seen=flush_seen,
+        defer=False,
+        deferred_blocks=protected,
+    )
+    reclaim = _kvarn_reclaimable_block_ids(resident, blocks_needed, flush_seen)
+
+    assert active
+    # Chunk 1 contains only 15 non-sink history blocks, so W=16 retains all
+    # available history without counting the independently protected sink.
+    assert protected == set(range(1, 16))
+    assert walk_back == []
+    assert reclaim == []
+    assert len(blocks_needed) == 32
+
+
+def test_prefill_fp16_window_chunk3_flushes_older_than_bounded_suffix(monkeypatch):
+    monkeypatch.delenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", raising=False)
+    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
+    row = list(range(48))
+    resident = {bid: bid for bid in range(32)}
+    blocks_needed = {0, *range(32, 48)}
+    protected: set[int] = set()
+
+    active = _protect_kvarn_prefill_window_blocks(
+        row,
+        q_len=2048,
+        committed_len=4096,
+        group=128,
+        bt_cols=len(row),
+        window=_kvarn_prefill_fp16_window_blocks(),
+        resident_blocks=resident,
+        blocks_needed=blocks_needed,
+        protected_blocks=protected,
+    )
+    flush_seen: set[int] = set()
+    walk_back = _kvarn_walk_back_flush_blocks(
+        row,
+        committed_len=4096,
+        group=128,
+        bt_cols=len(row),
+        resident_blocks=resident,
+        sinks={0},
+        flush_seen=flush_seen,
+        defer=False,
+        deferred_blocks=protected,
+    )
+    reclaim = _kvarn_reclaimable_block_ids(resident, blocks_needed, flush_seen)
+
+    assert active
+    assert protected == set(range(16, 32))
+    # Walk-back skips the protected suffix and continues through all older
+    # resident non-sink history instead of stopping at block 31.
+    assert walk_back == list(range(15, 0, -1))
+    assert flush_seen == set(range(1, 16))
+    assert reclaim == []
+    remaining_after_flush = (set(resident) - flush_seen) | set(range(32, 48))
+    assert remaining_after_flush == {0, *range(16, 48)}
+    assert len(remaining_after_flush) == 33
+
+
+@pytest.mark.parametrize(
+    ("window", "q_len", "committed_len"),
+    [
+        (0, 256, 384),  # default continuation behavior
+        (16, 1, 384),  # decode remains on the production policy
+        (16, 256, 0),  # fresh prefill has no committed history
+    ],
+)
+def test_prefill_fp16_window_does_not_change_other_steps(
+    monkeypatch, window, q_len, committed_len
+):
+    monkeypatch.delenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", raising=False)
+    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", str(window))
+    row = [10, 11, 12, 13]
+    resident = {10: 0, 11: 1, 12: 2, 99: 3}
+    blocks_needed = {13}
+    protected: set[int] = set()
+
+    active = _protect_kvarn_prefill_window_blocks(
+        row,
+        q_len=q_len,
+        committed_len=committed_len,
+        group=128,
+        bt_cols=len(row),
+        window=_kvarn_prefill_fp16_window_blocks(),
+        resident_blocks=resident,
+        blocks_needed=blocks_needed,
+        protected_blocks=protected,
+    )
+    flush_seen: set[int] = set()
+    walk_back = _kvarn_walk_back_flush_blocks(
+        row,
+        committed_len=committed_len,
+        group=128,
+        bt_cols=len(row),
+        resident_blocks=resident,
+        sinks={10},
+        flush_seen=flush_seen,
+        defer=False,
+        deferred_blocks=protected,
+    )
+
+    assert not active
+    assert protected == set()
+    assert blocks_needed == {13}
+    assert walk_back == ([12, 11] if committed_len else [])
+
+
+@pytest.mark.parametrize("value", ["-1", "not-an-integer"])
+def test_prefill_fp16_window_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", value)
+
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        _kvarn_prefill_fp16_window_blocks()
+
+
+def test_prefill_fp16_window_defaults_to_beta_guardrail(monkeypatch):
+    monkeypatch.delenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", raising=False)
+
+    assert _kvarn_prefill_fp16_window_blocks() == 16
 
 
 def test_kvarn_rotation_uses_2d_gemm_and_preserves_scratch_canary(monkeypatch):

@@ -166,11 +166,27 @@ class GemmaRMSNorm(CustomOp):
                 part_x, part_residual, weight, self.variance_epsilon
             )
 
+        def request_invariant_apply_once(
+            part_x: torch.Tensor,
+            part_residual: torch.Tensor | None,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            return rms_norm_batch_invariant(
+                part_x,
+                weight,
+                self.variance_epsilon,
+                residual=part_residual,
+            )
+
         from vllm.model_executor.determinism.request_stable_linear import (
             apply_rms_norm_by_request,
         )
 
-        return apply_rms_norm_by_request(x, residual, apply_once)
+        return apply_rms_norm_by_request(
+            x,
+            residual,
+            apply_once,
+            request_invariant_apply_once,
+        )
 
     def forward_cuda(
         self,

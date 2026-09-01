@@ -40,6 +40,36 @@ def _set_request_slices(monkeypatch: pytest.MonkeyPatch, value) -> None:
     )
 
 
+def _production_xpu_w4_layer(monkeypatch: pytest.MonkeyPatch, apply):
+    from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+        MPLinearLayerConfig,
+    )
+    from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
+        XPUwNa16LinearKernel,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors as compressed_tensors_module,
+    )
+
+    kernel = XPUwNa16LinearKernel.__new__(XPUwNa16LinearKernel)
+    kernel.config = MPLinearLayerConfig(
+        full_weight_shape=(1, 1),
+        partition_weight_shape=(1, 1),
+        weight_type=request_stable.scalar_types.uint4b8,
+        act_type=torch.bfloat16,
+        group_size=128,
+        zero_points=False,
+        has_g_idx=False,
+    )
+    method = compressed_tensors_module.CompressedTensorsLinearMethod(SimpleNamespace())
+    monkeypatch.setattr(method, "apply", apply)
+    return SimpleNamespace(
+        quant_method=method,
+        scheme=SimpleNamespace(kernel=kernel),
+        prefix="model.layers.0.self_attn.q_proj",
+    )
+
+
 def test_apply_linear_by_request_preserves_order_and_bias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -137,6 +167,83 @@ def test_apply_linear_by_request_falls_back_to_one_call(
         torch.testing.assert_close(method.calls[0][0], x, rtol=0, atol=0)
 
 
+def test_apply_linear_b1_returns_validated_method_result_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(monkeypatch, ((0, 1, 200, False),))
+    x = torch.arange(3, dtype=torch.float32).reshape(1, 3)
+    bias = torch.arange(3, dtype=torch.float32)
+    expected = x * 2 + bias
+    calls = []
+
+    class ReturningMethod:
+        def apply(self, layer, value, actual_bias):
+            calls.append((layer, value, actual_bias))
+            return expected
+
+    layer = SimpleNamespace(quant_method=ReturningMethod())
+
+    actual = request_stable.apply_linear_by_request(layer, x, bias)
+
+    assert actual is expected
+    assert len(calls) == 1
+    assert calls[0][0] is layer
+    assert calls[0][1] is x
+    assert calls[0][2] is bias
+    torch.testing.assert_close(actual, x * 2 + bias, rtol=0, atol=0)
+
+
+def test_apply_linear_b1_skips_kernel_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(monkeypatch, ((0, 1, 200, False),))
+    monkeypatch.setattr(
+        request_stable,
+        "_is_production_xpu_w4a16_linear",
+        lambda _layer: pytest.fail("B1 decode must not classify the linear kernel"),
+    )
+    x = torch.ones(1, 3)
+    method = RecordingQuantMethod()
+
+    actual = request_stable.apply_linear_by_request(
+        SimpleNamespace(quant_method=method), x, None
+    )
+
+    assert len(method.calls) == 1
+    torch.testing.assert_close(actual, x + 1)
+
+
+def test_validated_request_slices_skip_revalidation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slices = request_stable.XPUKvarnRequestSlices(((0, 1, 200, False),))
+    _set_request_slices(monkeypatch, slices)
+    monkeypatch.setattr(
+        request_stable,
+        "_validate_request_slices",
+        lambda _value: pytest.fail("trusted slices must not be revalidated"),
+    )
+
+    assert request_stable.get_xpu_kvarn_request_slices() is slices
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [torch.tensor(1.0), torch.ones(2, 3)],
+)
+def test_apply_linear_b1_fast_path_validates_underlying_row_count(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid: torch.Tensor,
+) -> None:
+    _set_request_slices(monkeypatch, ((0, 1, 200, False),))
+    layer = SimpleNamespace(
+        quant_method=SimpleNamespace(apply=lambda _layer, _x, _bias: invalid)
+    )
+
+    with pytest.raises(RuntimeError, match="changed the packed row dimension"):
+        request_stable.apply_linear_by_request(layer, torch.ones(1, 3), None)
+
+
 def test_apply_linear_by_request_rejects_active_non_packed_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -225,6 +332,223 @@ def test_production_xpu_w4_classifier_uses_canonical_rows(
         atol=0,
     )
     assert [call.shape[0] for call in calls] == [64]
+
+
+def test_production_xpu_w4_packed_b4_uses_one_direct_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(
+        monkeypatch,
+        tuple((row, row + 1, 200 + row, False) for row in range(4)),
+    )
+    calls = []
+    results = []
+
+    def apply(_layer, value: torch.Tensor, bias=None) -> torch.Tensor:
+        calls.append((value, bias))
+        result = value + 7
+        results.append(result)
+        return result
+
+    layer = _production_xpu_w4_layer(monkeypatch, apply)
+    x = torch.arange(12, dtype=torch.bfloat16).reshape(4, 3)
+    bias = torch.arange(3, dtype=torch.bfloat16)
+
+    actual = request_stable.apply_linear_by_request(layer, x, bias)
+
+    assert len(calls) == 1
+    assert calls[0][0] is x
+    assert calls[0][1] is bias
+    assert actual is results[0]
+    torch.testing.assert_close(actual, x + 7, rtol=0, atol=0)
+
+
+def test_non_w4_packed_b4_remains_request_sliced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(
+        monkeypatch,
+        tuple((row, row + 1, 200 + row, False) for row in range(4)),
+    )
+    method = RecordingQuantMethod()
+    x = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+    actual = request_stable.apply_linear_by_request(
+        SimpleNamespace(quant_method=method), x, None
+    )
+
+    assert [part.shape[0] for part, _bias in method.calls] == [1, 1, 1, 1]
+    torch.testing.assert_close(actual, x + 1, rtol=0, atol=0)
+
+
+def test_unquantized_gdn_packed_b4_uses_one_direct_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(
+        monkeypatch,
+        tuple((row, row + 1, 200 + row, False) for row in range(4)),
+    )
+    calls = []
+    method = UnquantizedLinearMethod()
+
+    def apply(_layer, value: torch.Tensor, bias=None) -> torch.Tensor:
+        calls.append(value)
+        return value + 1
+
+    monkeypatch.setattr(method, "apply", apply)
+    layer = SimpleNamespace(
+        quant_method=method,
+        prefix="model.layers.0.linear_attn.out_proj",
+    )
+    x = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+    actual = request_stable.apply_linear_by_request(layer, x, None)
+
+    assert len(calls) == 1
+    assert calls[0] is x
+    torch.testing.assert_close(actual, x + 1, rtol=0, atol=0)
+
+
+def test_unquantized_non_gdn_packed_b4_remains_request_sliced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(
+        monkeypatch,
+        tuple((row, row + 1, 200 + row, False) for row in range(4)),
+    )
+    calls = []
+    method = UnquantizedLinearMethod()
+
+    def apply(_layer, value: torch.Tensor, bias=None) -> torch.Tensor:
+        calls.append(value)
+        return value + 1
+
+    monkeypatch.setattr(method, "apply", apply)
+    layer = SimpleNamespace(
+        quant_method=method,
+        prefix="model.layers.0.self_attn.unscoped_projection",
+    )
+    x = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+    actual = request_stable.apply_linear_by_request(layer, x, None)
+
+    assert [part.shape[0] for part in calls] == [1, 1, 1, 1]
+    torch.testing.assert_close(actual, x + 1, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("slices", "expected_call_rows"),
+    [
+        (
+            tuple((row, row + 1, row, True) for row in range(4)),
+            [64, 64, 64, 64],
+        ),
+        (((0, 4, 200, False),), [64]),
+    ],
+)
+def test_production_xpu_w4_non_decode_b4_keeps_canonical_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    slices,
+    expected_call_rows: list[int],
+) -> None:
+    _set_request_slices(monkeypatch, slices)
+    calls = []
+
+    def apply(_layer, value: torch.Tensor, bias=None) -> torch.Tensor:
+        calls.append(value)
+        return value
+
+    layer = _production_xpu_w4_layer(monkeypatch, apply)
+    x = torch.arange(12, dtype=torch.bfloat16).reshape(4, 3)
+
+    actual = request_stable.apply_linear_by_request(layer, x, None)
+
+    assert [part.shape[0] for part in calls] == expected_call_rows
+    torch.testing.assert_close(actual, x, rtol=0, atol=0)
+
+
+def test_production_xpu_w4_packed_b4_validates_direct_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(
+        monkeypatch,
+        tuple((row, row + 1, 200 + row, False) for row in range(4)),
+    )
+    layer = _production_xpu_w4_layer(
+        monkeypatch,
+        lambda _layer, value, bias=None: value.new_empty(5, value.shape[1]),
+    )
+
+    with pytest.raises(RuntimeError, match="changed the packed row dimension"):
+        request_stable.apply_linear_by_request(
+            layer, torch.ones(4, 3, dtype=torch.bfloat16), None
+        )
+
+
+def test_xpu_w4_lookalike_type_cannot_enable_packed_b4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+        MPLinearLayerConfig,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors as compressed_tensors_module,
+    )
+
+    lookalike_type = type("XPUwNa16LinearKernel", (), {})
+    lookalike_type.__module__ = "vllm.model_executor.kernels.linear.mixed_precision.xpu"
+    kernel = lookalike_type()
+    kernel.config = MPLinearLayerConfig(
+        full_weight_shape=(1, 1),
+        partition_weight_shape=(1, 1),
+        weight_type=request_stable.scalar_types.uint4b8,
+        act_type=torch.bfloat16,
+        group_size=128,
+        zero_points=False,
+        has_g_idx=False,
+    )
+    calls = []
+    method = compressed_tensors_module.CompressedTensorsLinearMethod(SimpleNamespace())
+    monkeypatch.setattr(
+        method,
+        "apply",
+        lambda _layer, value, bias=None: calls.append(value) or value,
+    )
+    layer = SimpleNamespace(
+        quant_method=method,
+        scheme=SimpleNamespace(kernel=kernel),
+        prefix="model.layers.0.self_attn.q_proj",
+    )
+    _set_request_slices(
+        monkeypatch,
+        tuple((row, row + 1, 200 + row, False) for row in range(4)),
+    )
+
+    with pytest.raises(RuntimeError, match="every compressed linear"):
+        request_stable.apply_linear_by_request(
+            layer, torch.ones(4, 3, dtype=torch.bfloat16), None
+        )
+    assert not calls
+
+
+def test_production_xpu_w4_packed_b4_rejects_malformed_slices_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(
+        monkeypatch,
+        ((0, 1, 200, False), (2, 3, 201, False)),
+    )
+    calls = []
+    layer = _production_xpu_w4_layer(
+        monkeypatch,
+        lambda _layer, value, bias=None: calls.append(value) or value,
+    )
+
+    with pytest.raises(ValueError, match="positive and contiguous"):
+        request_stable.apply_linear_by_request(
+            layer, torch.ones(3, 2, dtype=torch.bfloat16), None
+        )
+    assert not calls
 
 
 def test_production_compressed_linear_classifier_fails_closed(
@@ -456,6 +780,105 @@ def test_apply_rms_norm_by_request_is_inert_off_xpu(
     torch.testing.assert_close(actual, x + 1, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("fused", [False, True])
+def test_apply_rms_norm_uses_one_request_invariant_call(
+    monkeypatch: pytest.MonkeyPatch,
+    fused: bool,
+) -> None:
+    _set_request_slices(
+        monkeypatch,
+        tuple((row, row + 1, 200 + row, False) for row in range(4)),
+    )
+    x = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    residual = torch.ones_like(x) if fused else None
+    calls = []
+
+    def request_invariant(value, actual_residual):
+        calls.append((value, actual_residual))
+        output = value + 1
+        if actual_residual is None:
+            return output
+        return output, value + actual_residual
+
+    actual = request_stable.apply_rms_norm_by_request(
+        x,
+        residual,
+        lambda *_args: pytest.fail("request-sliced RMSNorm was called"),
+        request_invariant,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] is x
+    assert calls[0][1] is residual
+    actual_outputs = actual if isinstance(actual, tuple) else (actual,)
+    assert len(actual_outputs) == (2 if fused else 1)
+    torch.testing.assert_close(actual_outputs[0], x + 1, rtol=0, atol=0)
+    if fused:
+        torch.testing.assert_close(actual_outputs[1], x + residual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_apply_rms_norm_b1_returns_validated_result_directly(
+    monkeypatch: pytest.MonkeyPatch,
+    fused: bool,
+) -> None:
+    _set_request_slices(monkeypatch, ((0, 1, 200, False),))
+    x = torch.arange(3, dtype=torch.float32).reshape(1, 3)
+    residual = torch.ones_like(x) if fused else None
+    output = x + 1
+    returned = (output, x + residual) if residual is not None else output
+    calls = []
+
+    def apply_once(value, actual_residual):
+        calls.append((value, actual_residual))
+        return returned
+
+    actual = request_stable.apply_rms_norm_by_request(x, residual, apply_once)
+
+    assert actual is returned
+    assert len(calls) == 1
+    assert calls[0][0] is x
+    assert calls[0][1] is residual
+    actual_outputs = actual if isinstance(actual, tuple) else (actual,)
+    expected_outputs = returned if isinstance(returned, tuple) else (returned,)
+    for actual_output, expected_output in zip(actual_outputs, expected_outputs):
+        torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("invalid_kind", "message"),
+    [
+        ("not_tuple", "did not return output and residual"),
+        ("output_shape", "changed the packed input shape"),
+        ("residual_shape", "changed the residual shape"),
+        ("residual_non_tensor", "returned a non-tensor output"),
+        ("residual_dtype", "changed residual dtype or device"),
+    ],
+)
+def test_apply_rms_norm_b1_fused_fast_path_validates_underlying_result(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_kind: str,
+    message: str,
+) -> None:
+    _set_request_slices(monkeypatch, ((0, 1, 200, False),))
+    x = torch.ones(1, 3)
+    residual = torch.ones_like(x)
+
+    def invalid_output(value, actual_residual):
+        if invalid_kind == "not_tuple":
+            return value
+        if invalid_kind == "output_shape":
+            return value[:, :2], actual_residual
+        if invalid_kind == "residual_shape":
+            return value, actual_residual[:, :2]
+        if invalid_kind == "residual_non_tensor":
+            return value, "not a tensor"
+        return value, actual_residual.to(torch.float64)
+
+    with pytest.raises(RuntimeError, match=message):
+        request_stable.apply_rms_norm_by_request(x, residual, invalid_output)
+
+
 @pytest.mark.parametrize("invalid_kind", ["dtype", "non_tensor"])
 def test_apply_rms_norm_by_request_rejects_invalid_first_output(
     monkeypatch: pytest.MonkeyPatch,
@@ -482,8 +905,8 @@ def test_gemma_rms_norm_uses_request_stable_dispatch(
 
     calls = []
 
-    def recording_dispatch(x, residual, apply_once):
-        calls.append((x, residual))
+    def recording_dispatch(x, residual, apply_once, request_invariant_apply_once):
+        calls.append((x, residual, request_invariant_apply_once))
         return apply_once(x, residual)
 
     monkeypatch.setattr(request_stable, "apply_rms_norm_by_request", recording_dispatch)
@@ -499,6 +922,7 @@ def test_gemma_rms_norm_uses_request_stable_dispatch(
     assert len(calls) == 1
     assert calls[0][0] is x
     assert calls[0][1] is residual
+    assert callable(calls[0][2])
     if fused:
         assert isinstance(result, tuple)
     else:
@@ -657,7 +1081,13 @@ def test_request_stable_config_rejects_v2_runner(
     assert not request_stable.use_xpu_kvarn_request_stable_linears(config)
 
 
-def test_logits_head_uses_one_projection_per_sample_row() -> None:
+def test_logits_head_packed_b4_uses_one_direct_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(
+        monkeypatch,
+        tuple((row, row + 1, 200 + row, False) for row in range(4)),
+    )
     processor = LogitsProcessor.__new__(LogitsProcessor)
     processor._xpu_kvarn_request_stable = True
     processor.head_dtype = None
@@ -668,9 +1098,27 @@ def test_logits_head_uses_one_projection_per_sample_row() -> None:
 
     actual = processor._apply_head(lm_head, hidden_states, bias)
 
+    torch.testing.assert_close(actual, hidden_states + 4, rtol=0, atol=0)
+    assert len(method.calls) == 1
+    assert method.calls[0][0] is hidden_states
+    assert method.calls[0][1] is bias
+
+
+def test_logits_head_non_decode_batch_remains_request_sliced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_request_slices(monkeypatch, ((0, 4, 200, True),))
+    processor = LogitsProcessor.__new__(LogitsProcessor)
+    processor._xpu_kvarn_request_stable = True
+    processor.head_dtype = None
+    method = RecordingQuantMethod()
+    lm_head = SimpleNamespace(quant_method=method)
+    hidden_states = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+    actual = processor._apply_head(lm_head, hidden_states, None)
+
     torch.testing.assert_close(actual, hidden_states + 1, rtol=0, atol=0)
     assert [call_x.shape[0] for call_x, _bias in method.calls] == [1, 1, 1, 1]
-    assert all(call_bias is bias for _call_x, call_bias in method.calls)
 
 
 def test_logits_head_disabled_profile_preserves_batched_projection() -> None:
