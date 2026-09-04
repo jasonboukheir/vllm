@@ -180,6 +180,7 @@ def _fused_frontend_impl() -> KVarNAttentionImpl:
     impl._kvarn_frontend_variant = "qkv_scatter"
     impl._kvarn_frontend_bound = True
     impl.use_fused_qkv_cache_update = True
+    impl.use_inline_qkv_cache_update = False
     impl._pending_fused_qkv_signature = None
     impl.num_heads = 24
     impl.num_kv_heads = 4
@@ -1049,6 +1050,91 @@ def test_unified_qkv_cache_update_is_cudagraph_unsafe_and_has_fake_dispatch():
     assert dependency.dtype == key.dtype
 
 
+def test_inline_qkv_attention_uses_one_context_and_update_before_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.attention.attention as attention_module
+    import vllm.model_executor.layers.attention.kv_transfer_utils as kv_transfer_utils
+
+    class NoDummyTensor:
+        def new_empty(self, *_args, **_kwargs):
+            raise AssertionError("inline route allocated a dummy dependency")
+
+    calls = []
+    impl = SimpleNamespace(
+        use_inline_qkv_cache_update=True,
+        do_qkv_cache_update=Mock(side_effect=lambda *_args: calls.append("update")),
+        forward=Mock(side_effect=lambda *_args, **_kwargs: calls.append("forward")),
+    )
+    layer = SimpleNamespace(impl=impl)
+    cache = object()
+    metadata = object()
+    slots = object()
+    context = Mock(return_value=(metadata, layer, cache, slots))
+    monkeypatch.setattr(attention_module, "get_attention_context", context)
+    monkeypatch.setattr(kv_transfer_utils, "has_kv_transfer_group", lambda: False)
+    query = NoDummyTensor()
+    key = NoDummyTensor()
+    value = NoDummyTensor()
+    output = NoDummyTensor()
+
+    result = attention_module.unified_qkv_attention_with_output(
+        query,
+        key,
+        value,
+        output,
+        "model.layers.0.self_attn",
+    )
+
+    assert result is None
+    context.assert_called_once_with("model.layers.0.self_attn")
+    assert calls == ["update", "forward"]
+    impl.do_qkv_cache_update.assert_called_once_with(
+        layer, query, key, value, cache, slots
+    )
+    assert impl.forward.call_args.args == (
+        layer,
+        query,
+        key,
+        value,
+        cache,
+        metadata,
+    )
+    assert impl.forward.call_args.kwargs["output"] is output
+
+
+@pytest.mark.parametrize(
+    ("direct_call", "backend_name"),
+    [(False, "KVARN"), (True, "FLASH_ATTN")],
+)
+def test_inline_qkv_attention_fails_closed_at_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+    direct_call: bool,
+    backend_name: str,
+) -> None:
+    import vllm.model_executor.layers.attention.attention as attention_module
+
+    monkeypatch.setattr(attention_module.current_platform, "is_xpu", lambda: True)
+
+    with pytest.raises(RuntimeError, match="XPU direct-call KVarN"):
+        attention_module._validate_inline_qkv_cache_update(
+            True, direct_call, backend_name
+        )
+
+
+def test_inline_qkv_attention_requires_xpu_at_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.attention.attention as attention_module
+
+    monkeypatch.setattr(attention_module.current_platform, "is_xpu", lambda: False)
+
+    with pytest.raises(RuntimeError, match="XPU direct-call KVarN"):
+        attention_module._validate_inline_qkv_cache_update(True, True, "KVARN")
+
+    attention_module._validate_inline_qkv_cache_update(False, False, "FLASH_ATTN")
+
+
 def test_reference_frontend_skips_fused_signature_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1083,6 +1169,7 @@ def test_attention_routes_selected_frontend_through_qkv_update(
     attention.head_size_v = 256
     attention.impl = SimpleNamespace()
     attention.use_fused_qkv_cache_update = True
+    attention.use_inline_qkv_cache_update = False
     attention.use_direct_call = True
     attention.attn_backend = SimpleNamespace(forward_includes_kv_cache_update=False)
     attention.kv_sharing_target_layer_name = None
@@ -1093,6 +1180,11 @@ def test_attention_routes_selected_frontend_through_qkv_update(
     attention_forward = Mock()
     monkeypatch.setattr(attention_module, "unified_qkv_cache_update", fused_update)
     monkeypatch.setattr(attention_module, "unified_kv_cache_update", reference_update)
+    monkeypatch.setattr(
+        attention_module,
+        "unified_qkv_attention_with_output",
+        Mock(side_effect=AssertionError("inline route selected")),
+    )
     monkeypatch.setattr(
         attention_module, "unified_attention_with_output", attention_forward
     )
@@ -1110,6 +1202,90 @@ def test_attention_routes_selected_frontend_through_qkv_update(
     assert layer_name == attention.layer_name
     reference_update.assert_not_called()
     assert attention_forward.call_args.kwargs["kv_cache_dummy_dep"] is dependency
+
+
+def test_attention_routes_inline_frontend_without_dummy_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.attention.attention as attention_module
+
+    attention = object.__new__(attention_module.Attention)
+    torch.nn.Module.__init__(attention)
+    attention.query_quant = None
+    attention.num_heads = 24
+    attention.num_kv_heads = 4
+    attention.head_size = 256
+    attention.head_size_v = 256
+    attention.impl = SimpleNamespace()
+    attention.use_fused_qkv_cache_update = True
+    attention.use_inline_qkv_cache_update = True
+    attention.use_direct_call = True
+    attention.attn_backend = SimpleNamespace(forward_includes_kv_cache_update=False)
+    attention.kv_sharing_target_layer_name = None
+    attention.layer_name = "model.layers.0.self_attn"
+    inline = Mock()
+    monkeypatch.setattr(attention_module, "unified_qkv_attention_with_output", inline)
+    monkeypatch.setattr(
+        attention_module,
+        "unified_qkv_cache_update",
+        Mock(side_effect=AssertionError("dummy update route selected")),
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "unified_kv_cache_update",
+        Mock(side_effect=AssertionError("reference update selected")),
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "unified_attention_with_output",
+        Mock(side_effect=AssertionError("separate attention route selected")),
+    )
+    query = torch.empty(2, 24 * 256, dtype=torch.bfloat16)
+    key = torch.empty(2, 4 * 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+
+    result = attention.forward(query, key, value)
+
+    assert result.shape == query.shape
+    q_arg, k_arg, v_arg, output_arg, layer_name = inline.call_args.args
+    assert q_arg.shape == (2, 24, 256)
+    assert k_arg.shape == v_arg.shape == (2, 4, 256)
+    assert output_arg.shape == (2, 24, 256)
+    assert layer_name == attention.layer_name
+
+
+def test_inline_frontend_keeps_shared_kv_on_ordinary_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.attention.attention as attention_module
+
+    attention = object.__new__(attention_module.Attention)
+    torch.nn.Module.__init__(attention)
+    attention.query_quant = None
+    attention.num_heads = 24
+    attention.num_kv_heads = 4
+    attention.head_size = 256
+    attention.head_size_v = 256
+    attention.impl = SimpleNamespace()
+    attention.use_fused_qkv_cache_update = True
+    attention.use_inline_qkv_cache_update = True
+    attention.use_direct_call = True
+    attention.attn_backend = SimpleNamespace(forward_includes_kv_cache_update=False)
+    attention.kv_sharing_target_layer_name = "model.layers.0.self_attn"
+    attention.layer_name = "model.layers.1.self_attn"
+    ordinary = Mock()
+    inline = Mock(side_effect=AssertionError("inline cache update selected"))
+    monkeypatch.setattr(attention_module, "unified_qkv_attention_with_output", inline)
+    monkeypatch.setattr(attention_module, "unified_attention_with_output", ordinary)
+    query = torch.empty(2, 24 * 256, dtype=torch.bfloat16)
+    key = torch.empty(2, 4 * 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+
+    attention.forward(query, key, value)
+
+    inline.assert_not_called()
+    ordinary.assert_called_once()
+    assert ordinary.call_args.kwargs["kv_cache_dummy_dep"] is None
 
 
 @pytest.mark.parametrize(
@@ -1556,6 +1732,53 @@ def test_fused_qkv_frontend_is_frozen_and_reported(
         assert impl.use_fused_qkv_cache_update
         with pytest.raises(RuntimeError, match="layer binding is immutable"):
             impl.configure_fused_qkv_cache_update("model.layers.1.self_attn")
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_inline_qkv_frontend_is_frozen_and_reports_single_context_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
+    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter_inline")
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        with (
+            patch(
+                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
+                return_value=2,
+            ),
+            patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as marker,
+        ):
+            impl = KVarNAttentionImpl(
+                num_heads=24,
+                head_size=256,
+                scale=1.0 / 16.0,
+                num_kv_heads=4,
+                kv_cache_dtype="kvarn_k4v4_g128",
+            )
+            selected = impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
+
+        assert selected
+        assert impl.use_fused_qkv_cache_update
+        assert impl.use_inline_qkv_cache_update
+        marker.assert_any_call(
+            "[KVARN_FRONTEND_INLINE] configured=%s; layer=%s; "
+            "route=single_attention_context; "
+            "native_op=kvarn_hadamard_qkv_scatter; "
+            "immutable for engine lifetime",
+            "qkv_scatter_inline",
+            "model.layers.0.self_attn",
+        )
+
+        monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "reference")
+        assert impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
+        assert impl._kvarn_frontend_variant == "qkv_scatter_inline"
+        assert impl.use_inline_qkv_cache_update
     finally:
         KVarNAttentionImpl.reset_process_state()
 

@@ -45,6 +45,9 @@ def test_fused_qkv_frontend_requires_explicit_valid_selection(
     monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter")
     assert kvarn_frontend_variant_requested() == "qkv_scatter"
 
+    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter_inline")
+    assert kvarn_frontend_variant_requested() == "qkv_scatter_inline"
+
     monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "automatic")
     with pytest.raises(ValueError, match="KVARN_NATIVE_XPU_FRONTEND"):
         kvarn_frontend_variant_requested()
