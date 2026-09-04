@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only contracts for KVarN configuration and cache accounting."""
 
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -16,9 +18,13 @@ from vllm.platforms.xpu import XPUPlatform
 from vllm.v1.attention.backends.kvarn_attn import (
     KVarNAttentionBackend,
     KVarNAttentionImpl,
+    KVarNMetadataBuilder,
+    _can_elide_fa_cu_seqlens,
     _cast_kvarn_activations,
     _defer_kvarn_prefill_history_blocks,
     _is_pure_kvarn_decode_step,
+    _is_pure_qlen1_batch,
+    _kvarn_block_table_numpy,
     _kvarn_dpas_layout_for_config,
     _kvarn_prefill_fp16_window_blocks,
     _kvarn_reclaimable_block_ids,
@@ -113,6 +119,251 @@ def test_native_store_requires_a_pure_qlen1_decode(override, expected):
     values.update(override)
 
     assert _is_pure_kvarn_decode_step(SimpleNamespace(**values), 4) is expected
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({}, True),
+        ({"num_decodes": 0}, False),
+        ({"num_prefills": 1}, False),
+        ({"num_decode_tokens": 3}, False),
+        ({"num_actual_tokens": 3}, False),
+        ({"max_query_len": 2}, False),
+    ],
+)
+def test_pure_qlen1_batch_requires_only_single_token_decodes(override, expected):
+    values = dict(
+        num_decodes=4,
+        num_prefills=0,
+        num_decode_tokens=4,
+        num_actual_tokens=4,
+        max_query_len=1,
+    )
+    values.update(override)
+    assert _is_pure_qlen1_batch(**values) is expected
+
+
+def test_kvarn_block_table_prefers_runner_cpu_mirror():
+    class DeviceTable:
+        def cpu(self):
+            raise AssertionError("device block table must not be copied to CPU")
+
+    mirror = torch.tensor([[3, 5], [7, 11]], dtype=torch.int32)
+    result = _kvarn_block_table_numpy(
+        SimpleNamespace(block_table_cpu=mirror, block_table_tensor=DeviceTable())
+    )
+
+    assert result.tolist() == [[3, 5], [7, 11]]
+
+
+def test_runner_cpu_block_table_view_excludes_stale_padded_rows():
+    from vllm.v1.worker.gpu_model_runner import _block_table_cpu_view
+
+    table = SimpleNamespace(
+        get_numpy_array=lambda: np.array(
+            [[3, 5], [7, 11], [101, 103], [107, 109]], dtype=np.int32
+        )
+    )
+
+    result = _block_table_cpu_view(table, num_reqs=2)
+
+    assert result.tolist() == [[3, 5], [7, 11]]
+
+
+@pytest.mark.parametrize("proposer_name", ["step3p5", "gemma4"])
+def test_per_group_block_table_swap_clears_primary_cpu_mirror(proposer_name):
+    class MetadataBuilder:
+        def build_for_drafting(self, common_attn_metadata, draft_index):
+            return common_attn_metadata
+
+    group = SimpleNamespace(
+        kv_cache_group_id=1,
+        layer_names=["model.layers.0.self_attn"],
+        get_metadata_builder=lambda: MetadataBuilder(),
+    )
+    primary_mirror = np.array([[3], [5]], dtype=np.int32)
+    common = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=2,
+        block_table_tensor=torch.tensor([[3], [5]], dtype=torch.int32),
+        block_table_cpu=primary_mirror,
+        batch_size=lambda: 2,
+    )
+
+    if proposer_name == "step3p5":
+        from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
+
+        proposer = object.__new__(Step3p5MTPProposer)
+        proposer._per_group_slot_mappings = {}
+        method = Step3p5MTPProposer.build_per_group_and_layer_attn_metadata
+    else:
+        from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+
+        proposer = object.__new__(Gemma4Proposer)
+        method = Gemma4Proposer.build_per_group_and_layer_attn_metadata
+    proposer.draft_attn_groups = [group]
+    proposer._per_group_block_tables = {
+        1: torch.tensor([[11], [13]], dtype=torch.int32)
+    }
+
+    per_group, _ = method(proposer, common)
+
+    assert per_group[0].block_table_cpu is None
+    assert common.block_table_cpu is primary_mirror
+
+
+def test_static_sink_table_replacement_clears_cpu_mirror():
+    from vllm.model_executor.layers.attention.static_sink_attention import (
+        create_static_sink_attention_backend,
+    )
+
+    class MetadataBuilder:
+        def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+            pass
+
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            return common_attn_metadata
+
+    class AttentionBackend:
+        @staticmethod
+        def get_builder_cls():
+            return MetadataBuilder
+
+    backend = create_static_sink_attention_backend(AttentionBackend, sink_len=16)
+    builder = backend.get_builder_cls()(
+        None,
+        [],
+        SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=32),
+            scheduler_config=SimpleNamespace(max_num_seqs=2),
+            cache_config=SimpleNamespace(block_size=16),
+        ),
+        torch.device("cpu"),
+    )
+    primary_mirror = np.array([[3, 5], [7, 11]], dtype=np.int32)
+    common = SimpleNamespace(
+        seq_lens=torch.tensor([16, 16], dtype=torch.int32),
+        max_seq_len=16,
+        num_reqs=2,
+        block_table_tensor=torch.tensor([[3, 5], [7, 11]], dtype=torch.int32),
+        block_table_cpu=primary_mirror,
+    )
+
+    result = builder.build(0, common)
+
+    assert result.block_table_cpu is None
+
+
+def test_fa_metadata_elision_requires_fused_eager_without_capture_history():
+    kwargs = dict(
+        pure_qlen1=True,
+        has_built_cudagraph_metadata=False,
+    )
+    with patch.dict(os.environ, {"KVARN_FUSED_DECODE": "0"}):
+        # Capture stages the persistent buffers, and the later ordinary build
+        # must keep refreshing them for materializer graph replay.
+        assert not _can_elide_fa_cu_seqlens(for_cudagraph_capture=True, **kwargs)
+        assert not _can_elide_fa_cu_seqlens(for_cudagraph_capture=False, **kwargs)
+    with patch.dict(os.environ, {"KVARN_FUSED_DECODE": "1"}):
+        assert _can_elide_fa_cu_seqlens(for_cudagraph_capture=False, **kwargs)
+        assert not _can_elide_fa_cu_seqlens(
+            pure_qlen1=False,
+            for_cudagraph_capture=False,
+            has_built_cudagraph_metadata=False,
+        )
+        assert not _can_elide_fa_cu_seqlens(
+            pure_qlen1=True,
+            for_cudagraph_capture=False,
+            has_built_cudagraph_metadata=True,
+        )
+
+
+def test_cudagraph_builder_forces_persistent_fa_metadata_staging():
+    builder = object.__new__(KVarNMetadataBuilder)
+    builder._has_built_cudagraph_metadata = False
+    common = object()
+    sentinel = object()
+
+    with patch.object(builder, "build", return_value=sentinel) as build:
+        assert builder.build_for_cudagraph_capture(common) is sentinel
+
+    build.assert_called_once_with(0, common, _for_cudagraph_capture=True)
+    assert builder._has_built_cudagraph_metadata
+    with patch.dict(os.environ, {"KVARN_FUSED_DECODE": "1"}):
+        assert not _can_elide_fa_cu_seqlens(
+            pure_qlen1=True,
+            for_cudagraph_capture=False,
+            has_built_cudagraph_metadata=builder._has_built_cudagraph_metadata,
+        )
+
+
+def test_pure_qlen1_builder_skips_fa_staging_and_slot_mapping_d2h():
+    class NoStageRing:
+        def acquire(self):
+            raise AssertionError("pure qlen=1 must not acquire a metadata stage")
+
+    class SlotMapping(torch.Tensor):
+        def tolist(self):
+            raise AssertionError("slot mapping must not be copied to CPU")
+
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        builder = object.__new__(KVarNMetadataBuilder)
+        builder.reorder_batch_threshold = 1
+        builder._group = 128
+        builder._group_key = ("model.layers.0.self_attn",)
+        builder._layer_names_set = set(builder._group_key)
+        builder._retired_sinks = {}
+        builder._block_fill = {}
+        builder._max_model_len = 65536
+        builder._metadata_stages = NoStageRing()
+        builder._cu_seqlens_q_buf = None
+        builder._cu_seqlens_k_buf = None
+        builder._cu_seqlens_q_host = None
+        builder._cu_seqlens_k_host = None
+        builder._vq_req_buf = None
+        builder._vq_seqlen_buf = None
+        builder._vq_req_host = None
+        builder._vq_seqlen_host = None
+
+        seq_lens_cpu = torch.tensor([4096, 4097], dtype=torch.int32)
+        query_start_loc_cpu = torch.tensor([0, 1, 2], dtype=torch.int32)
+        block_table_cpu = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+        slot_mapping = torch.tensor([128, 385], dtype=torch.int64).as_subclass(
+            SlotMapping
+        )
+        cam = SimpleNamespace(
+            seq_lens=seq_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            query_start_loc=query_start_loc_cpu,
+            query_start_loc_cpu=query_start_loc_cpu,
+            block_table_tensor=block_table_cpu,
+            block_table_cpu=block_table_cpu,
+            slot_mapping=slot_mapping,
+            num_actual_tokens=2,
+            max_query_len=1,
+            max_seq_len=4097,
+            causal=True,
+        )
+
+        with (
+            patch(
+                "vllm.v1.attention.backends.kvarn_attn.split_decodes_and_prefills",
+                return_value=(2, 0, 2, 0),
+            ),
+            patch(
+                "vllm.v1.attention.backends.kvarn_attn._can_elide_fa_cu_seqlens",
+                return_value=True,
+            ),
+        ):
+            metadata = builder.build(0, cam)
+
+        assert metadata.fa_cu_seqlens_q is None
+        assert metadata.fa_cu_seqlens_k is None
+        assert metadata.slot_mapping_cpu is None
+    finally:
+        KVarNAttentionImpl.reset_process_state()
 
 
 def test_dpas_pack_matches_frozen_xe2_fragment_coordinates():
@@ -345,6 +596,73 @@ def test_shared_q_output_scratch_grows_as_one_complete_set():
             current is previous
             for current, previous in zip(retained, grown, strict=True)
         )
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_pool_initialized_fast_path_is_group_capacity_and_binding_safe():
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        impl = object.__new__(KVarNAttentionImpl)
+        device = torch.device("cpu")
+        group_key = ("model.layers.0.self_attn",)
+        mirror_key = (device, group_key)
+        scratch_key = (device, 8, 2)
+        impl._group_key = group_key
+        impl.kvarn_config = SimpleNamespace(head_dim=8)
+        impl.num_kv_heads = 2
+        impl._tail_K_pool = torch.empty(1)
+        impl._tail_V_pool = torch.empty(1)
+        impl._H_fp16 = torch.empty(1)
+        impl._k_rot_scratch = torch.empty(1)
+        impl._v_rot_scratch = torch.empty(1)
+        impl._pool_ready_key = mirror_key
+        impl._pool_ready_native_key = None
+        impl._pool_ready_env = (
+            os.environ.get("KVARN_NATIVE_XPU"),
+            os.environ.get("KVARN_NATIVE_XPU_PERSISTENT_SCRATCH"),
+            os.environ.get("KVARN_NATIVE_XPU_SPLITS"),
+        )
+        impl._native_decode_scratch = None
+
+        block_to_slot = torch.empty(2048)
+        is_sink = torch.empty(2048)
+        KVarNAttentionImpl._block_to_slot_t_per_device[mirror_key] = block_to_slot
+        KVarNAttentionImpl._is_sink_t_per_device[mirror_key] = is_sink
+        impl._block_to_slot_t = block_to_slot
+        impl._is_sink_t = is_sink
+        impl._block_lookup_size = 2048
+
+        attr_maps = (
+            ("_q_fp32_buf", KVarNAttentionImpl._shared_q_fp32_buf),
+            ("_q_rot_fp32_buf", KVarNAttentionImpl._shared_q_rot_fp32_buf),
+            ("_q_rot_fp16_buf", KVarNAttentionImpl._shared_q_rot_fp16_buf),
+            ("_out_rot_fp32_buf", KVarNAttentionImpl._shared_out_rot_fp32_buf),
+            ("_output_fp32_buf", KVarNAttentionImpl._shared_output_fp32_buf),
+            ("_fused_out_buf", KVarNAttentionImpl._shared_fused_out_buf),
+            (
+                "_native_output_fp16_buf",
+                KVarNAttentionImpl._shared_native_output_fp16_buf,
+            ),
+            ("_mid_o_buf", KVarNAttentionImpl._shared_mid_o_buf),
+            ("_mid_lse_buf", KVarNAttentionImpl._shared_mid_lse_buf),
+            ("_fa_K_buf", KVarNAttentionImpl._shared_fa_K_buf),
+            ("_fa_V_buf", KVarNAttentionImpl._shared_fa_V_buf),
+        )
+        for attr, mapping in attr_maps:
+            tensor = torch.empty(1)
+            mapping[scratch_key] = tensor
+            setattr(impl, attr, tensor)
+
+        assert impl._pool_is_initialized_for(device, 2048)
+        assert not impl._pool_is_initialized_for(device, 2049)
+
+        impl._group_key = ("model.layers.1.self_attn",)
+        assert not impl._pool_is_initialized_for(device, 1)
+        impl._group_key = group_key
+
+        KVarNAttentionImpl._shared_fused_out_buf[scratch_key] = torch.empty(1)
+        assert not impl._pool_is_initialized_for(device, 1)
     finally:
         KVarNAttentionImpl.reset_process_state()
 

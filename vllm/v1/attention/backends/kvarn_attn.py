@@ -39,6 +39,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import ClassVar, Protocol
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -129,6 +130,51 @@ def _is_pure_kvarn_decode_step(attn_metadata, num_tokens: int) -> bool:
         and getattr(attn_metadata, "num_decodes", 0) > 0
         and getattr(attn_metadata, "num_decode_tokens", -1) == num_tokens
         and getattr(attn_metadata, "num_actual_tokens", -1) == num_tokens
+    )
+
+
+def _is_pure_qlen1_batch(
+    *,
+    num_decodes: int,
+    num_prefills: int,
+    num_decode_tokens: int,
+    num_actual_tokens: int,
+    max_query_len: int,
+) -> bool:
+    """Return whether every real token is one qlen=1 decode request."""
+    return (
+        num_decodes > 0
+        and num_prefills == 0
+        and num_decode_tokens == num_decodes
+        and num_actual_tokens == num_decode_tokens
+        and max_query_len <= 1
+    )
+
+
+def _kvarn_block_table_numpy(common_attn_metadata) -> np.ndarray:
+    """Use the runner's authoritative CPU block table without a device sync."""
+    block_table_cpu = getattr(common_attn_metadata, "block_table_cpu", None)
+    if isinstance(block_table_cpu, np.ndarray):
+        return block_table_cpu
+    if isinstance(block_table_cpu, torch.Tensor):
+        if block_table_cpu.device.type != "cpu":
+            raise ValueError("CommonAttentionMetadata.block_table_cpu must be on CPU")
+        return block_table_cpu.numpy()
+    return common_attn_metadata.block_table_tensor.cpu().numpy()
+
+
+def _can_elide_fa_cu_seqlens(
+    *,
+    pure_qlen1: bool,
+    for_cudagraph_capture: bool,
+    has_built_cudagraph_metadata: bool,
+) -> bool:
+    """Elide metadata only when every possible consumer is cu-seqlens-free."""
+    return (
+        pure_qlen1
+        and not for_cudagraph_capture
+        and not has_built_cudagraph_metadata
+        and os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
     )
 
 
@@ -726,6 +772,10 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # while this generation's non-blocking H2D copies remain in flight.
         # Rotate pinned host sources and fence each slot before CPU reuse.
         self._metadata_stages = _KVarNMetadataStageRing()
+        # Sticky once this builder has produced metadata for any captured graph.
+        # Ordinary build() calls refresh the same persistent buffers used on
+        # replay, so they must never elide cu-seqlens after this flips true.
+        self._has_built_cudagraph_metadata = False
         self._cu_seqlens_q_host: torch.Tensor = None  # type: ignore[assignment]
         self._cu_seqlens_k_host: torch.Tensor = None  # type: ignore[assignment]
         # Persistent verify-plan buffers (allocated lazily in build()).
@@ -737,9 +787,17 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> KVarNMetadata:
-        return self.build(0, common_attn_metadata)
+        self._has_built_cudagraph_metadata = True
+        return self.build(0, common_attn_metadata, _for_cudagraph_capture=True)
 
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        fast_build=False,
+        *,
+        _for_cudagraph_capture=False,
+    ):
         cam = common_attn_metadata
         assert self.reorder_batch_threshold is not None
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
@@ -767,8 +825,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # at B=256 and dominated build() once the flush was vectorized.
         # We only touch column 0 (sinks) + a few per-request entries, so numpy's
         # O(1) indexing avoids materializing ~8k Python ints every step.
-        block_table_np = cam.block_table_tensor.cpu().numpy()
-        slot_mapping_cpu = cam.slot_mapping.tolist()
+        block_table_np = _kvarn_block_table_numpy(cam)
         bt_rows = block_table_np.shape[0]
         bt_cols = block_table_np.shape[1] if block_table_np.ndim == 2 else 0
         device = cam.seq_lens.device
@@ -782,9 +839,13 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # updated in place so captured graphs see fresh values.
         B = len(seq_lens_cpu)
         GROUP = self._group  # KVarN tile size (= block size); 64 or 128
-        cu_seqlens_k_h = [0]
-        for sl in seq_lens_cpu:
-            cu_seqlens_k_h.append(cu_seqlens_k_h[-1] + sl)
+        pure_qlen1 = _is_pure_qlen1_batch(
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            num_actual_tokens=cam.num_actual_tokens,
+            max_query_len=cam.max_query_len,
+        )
 
         # ── Stage α-2: assign pool slots for every block_id touched this
         # step. The allocator state is class-level on KVarNAttentionImpl
@@ -831,10 +892,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 if bid >= 0:
                     blocks_needed.add(bid)
                     self._block_fill[bid] = min(sl, (k + 1) * GROUP) - k * GROUP
-        for s in slot_mapping_cpu:  # safety superset of the above
-            if s >= 0:
-                blocks_needed.add(s // GROUP)
-
         gk = self._group_key
         # Claim THIS group's impls by layer name (set on the impl in
         # Attention.__init__) and tag them with the true group key, so their
@@ -1130,33 +1187,46 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # ── Persistent cu_seqlens buffers (in-place updated) ─────────────
         # A captured graph bakes in tensor addresses, so cu_seqlens MUST live
         # in fixed buffers updated in place — not recreated each step.
-        cap = B + 1
-        stage = self._metadata_stages.acquire()
-        stage_depth = self._metadata_stages.depth
-        if self._cu_seqlens_q_buf is None or self._cu_seqlens_q_buf.shape[0] < cap:
-            self._metadata_stages.drain()
-            new_cap = max(cap, 257)  # default max_num_seqs headroom
-            self._cu_seqlens_q_buf = torch.empty(
-                new_cap, dtype=torch.int32, device=device
-            )
-            self._cu_seqlens_k_buf = torch.empty(
-                new_cap, dtype=torch.int32, device=device
-            )
-            self._cu_seqlens_q_host = torch.empty(
-                (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
-            )
-            self._cu_seqlens_k_host = torch.empty(
-                (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
-            )
-        q_host = self._cu_seqlens_q_host[stage]
-        k_host = self._cu_seqlens_k_host[stage]
-        for i in range(B + 1):
-            q_host[i] = i
-            k_host[i] = cu_seqlens_k_h[i]
-        fa_cu_seqlens_q = self._cu_seqlens_q_buf[: B + 1]
-        fa_cu_seqlens_k = self._cu_seqlens_k_buf[: B + 1]
-        fa_cu_seqlens_q.copy_(q_host[: B + 1], non_blocking=True)
-        fa_cu_seqlens_k.copy_(k_host[: B + 1], non_blocking=True)
+        elide_fa_cu_seqlens = _can_elide_fa_cu_seqlens(
+            pure_qlen1=pure_qlen1,
+            for_cudagraph_capture=_for_cudagraph_capture,
+            has_built_cudagraph_metadata=getattr(
+                self, "_has_built_cudagraph_metadata", False
+            ),
+        )
+        stage = None
+        fa_cu_seqlens_q = fa_cu_seqlens_k = None
+        if not elide_fa_cu_seqlens:
+            cu_seqlens_k_h = [0]
+            for sl in seq_lens_cpu:
+                cu_seqlens_k_h.append(cu_seqlens_k_h[-1] + sl)
+            cap = B + 1
+            stage = self._metadata_stages.acquire()
+            stage_depth = self._metadata_stages.depth
+            if self._cu_seqlens_q_buf is None or self._cu_seqlens_q_buf.shape[0] < cap:
+                self._metadata_stages.drain()
+                new_cap = max(cap, 257)  # default max_num_seqs headroom
+                self._cu_seqlens_q_buf = torch.empty(
+                    new_cap, dtype=torch.int32, device=device
+                )
+                self._cu_seqlens_k_buf = torch.empty(
+                    new_cap, dtype=torch.int32, device=device
+                )
+                self._cu_seqlens_q_host = torch.empty(
+                    (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
+                )
+                self._cu_seqlens_k_host = torch.empty(
+                    (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
+                )
+            q_host = self._cu_seqlens_q_host[stage]
+            k_host = self._cu_seqlens_k_host[stage]
+            for i in range(B + 1):
+                q_host[i] = i
+                k_host[i] = cu_seqlens_k_h[i]
+            fa_cu_seqlens_q = self._cu_seqlens_q_buf[: B + 1]
+            fa_cu_seqlens_k = self._cu_seqlens_k_buf[: B + 1]
+            fa_cu_seqlens_q.copy_(q_host[: B + 1], non_blocking=True)
+            fa_cu_seqlens_k.copy_(k_host[: B + 1], non_blocking=True)
 
         # ── Verify (spec-as-decode) plan ─────────────────────────────────
         # When the decode portion carries multi-token queries (an MTP verify
@@ -1218,7 +1288,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # stream. The corresponding host slot cannot be refilled until acquire()
         # observes completion. This is required even when MTP is disabled because
         # cu_seqlens are copied on every generation.
-        self._metadata_stages.release(stage, torch.xpu.Event)
+        if stage is not None:
+            self._metadata_stages.release(stage, torch.xpu.Event)
 
         max_blocks_per_req = (self._max_model_len + GROUP - 1) // GROUP
 
@@ -1248,7 +1319,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             seq_lens_cpu=seq_lens_cpu,
             # not consumed downstream; build() uses block_table_np
             block_table_cpu=None,
-            slot_mapping_cpu=slot_mapping_cpu,
+            slot_mapping_cpu=None,
             fa_cu_seqlens_q=fa_cu_seqlens_q,
             fa_cu_seqlens_k=fa_cu_seqlens_k,
             fa_max_blocks_per_req=max_blocks_per_req,
@@ -1528,6 +1599,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._native_decode_scratch: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
+        self._pool_ready_key: tuple[torch.device, tuple] | None = None
+        self._pool_ready_native_key: tuple | None = None
+        self._pool_ready_env: tuple[str | None, ...] | None = None
         self._mid_o_buf: torch.Tensor | None = None
         self._mid_lse_buf: torch.Tensor | None = None
         self._fa_K_buf: torch.Tensor = None  # type: ignore[assignment]
@@ -1561,6 +1635,71 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
+    def _pool_is_initialized_for(
+        self, device: torch.device, num_blocks_hint: int
+    ) -> bool:
+        """Check the fully initialized hot-path state without touching XPU."""
+        cls = type(self)
+        mkey = (device, self._group_key)
+        native_env = (
+            os.environ.get("KVARN_NATIVE_XPU"),
+            os.environ.get("KVARN_NATIVE_XPU_PERSISTENT_SCRATCH"),
+            os.environ.get("KVARN_NATIVE_XPU_SPLITS"),
+        )
+        required_blocks = max(
+            num_blocks_hint,
+            cls._max_known_block_id.get(self._group_key, 0) + 1,
+            1024,
+        )
+        block_to_slot = cls._block_to_slot_t_per_device.get(mkey)
+        is_sink = cls._is_sink_t_per_device.get(mkey)
+        if (
+            self._pool_ready_key != mkey
+            or self._pool_ready_env != native_env
+            or block_to_slot is None
+            or is_sink is None
+            or self._block_to_slot_t is not block_to_slot
+            or self._is_sink_t is not is_sink
+            or self._block_lookup_size < required_blocks
+        ):
+            return False
+
+        bkey = (device, self.kvarn_config.head_dim, self.num_kv_heads)
+        shared_bindings = (
+            (self._q_fp32_buf, cls._shared_q_fp32_buf),
+            (self._q_rot_fp32_buf, cls._shared_q_rot_fp32_buf),
+            (self._q_rot_fp16_buf, cls._shared_q_rot_fp16_buf),
+            (self._out_rot_fp32_buf, cls._shared_out_rot_fp32_buf),
+            (self._output_fp32_buf, cls._shared_output_fp32_buf),
+            (self._fused_out_buf, cls._shared_fused_out_buf),
+            (self._native_output_fp16_buf, cls._shared_native_output_fp16_buf),
+            (self._mid_o_buf, cls._shared_mid_o_buf),
+            (self._mid_lse_buf, cls._shared_mid_lse_buf),
+            (self._fa_K_buf, cls._shared_fa_K_buf),
+            (self._fa_V_buf, cls._shared_fa_V_buf),
+        )
+        if any(
+            bound is None or bound is not mapping.get(bkey)
+            for bound, mapping in shared_bindings
+        ):
+            return False
+        if (
+            self._pool_ready_native_key is not None
+            and self._native_decode_scratch
+            is not cls._shared_native_decode_scratch.get(self._pool_ready_native_key)
+        ):
+            return False
+        return all(
+            tensor is not None
+            for tensor in (
+                self._tail_K_pool,
+                self._tail_V_pool,
+                self._H_fp16,
+                self._k_rot_scratch,
+                self._v_rot_scratch,
+            )
+        )
+
     def _ensure_pool(self, device: torch.device, num_blocks_hint: int = 0) -> None:
         """Lazy-allocate the GPU tail pool + lookup tensors + decode scratch.
 
@@ -1573,6 +1712,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         All allocation happens BEFORE the captured forward, so
         do_kv_cache_update can be pure tensor ops.
         """
+        if self._pool_is_initialized_for(device, num_blocks_hint):
+            return
         if current_platform.is_xpu():
             is_capturing = torch.xpu.is_current_stream_capturing()
         else:
@@ -1856,6 +1997,13 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._mid_lse_buf = cls._shared_mid_lse_buf[bkey]
         self._fa_K_buf = cls._shared_fa_K_buf[bkey]
         self._fa_V_buf = cls._shared_fa_V_buf[bkey]
+        self._pool_ready_key = mkey
+        self._pool_ready_native_key = native_key
+        self._pool_ready_env = (
+            os.environ.get("KVARN_NATIVE_XPU"),
+            os.environ.get("KVARN_NATIVE_XPU_PERSISTENT_SCRATCH"),
+            os.environ.get("KVARN_NATIVE_XPU_SPLITS"),
+        )
 
     def _warm_decode_kernels(self, device: torch.device) -> None:
         """Compile + autotune every decode-path Triton kernel on tiny synthetic

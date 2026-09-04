@@ -398,6 +398,8 @@ class CommonAttentionMetadata:
 
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
+    block_table_cpu: np.ndarray | None = None
+    """CPU-owned block-table mirror, when the runner already maintains one."""
 
     causal: bool | torch.Tensor = True
 
@@ -550,6 +552,9 @@ class CommonAttentionMetadata:
             max_seq_len=self.max_seq_len,
             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
             slot_mapping=self.slot_mapping[:num_actual_tokens],
+            block_table_cpu=self.block_table_cpu[:num_actual_reqs]
+            if self.block_table_cpu is not None
+            else None,
             causal=self.causal[:num_actual_reqs]
             if isinstance(self.causal, torch.Tensor)
             else self.causal,

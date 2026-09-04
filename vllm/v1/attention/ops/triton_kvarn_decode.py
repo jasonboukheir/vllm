@@ -1382,6 +1382,19 @@ def kvarn_decode_attention(
     else:
         K_packed = impl._fa_K_buf
         V_packed = impl._fa_V_buf
+        fa_cu_seqlens_q = md.fa_cu_seqlens_q
+        fa_cu_seqlens_k = md.fa_cu_seqlens_k
+        if fa_cu_seqlens_q is None or fa_cu_seqlens_k is None:
+            # Pure qlen=1 direct decode deliberately skips the builder's pinned
+            # CPU staging. Preserve the forced-materializer fallback by deriving
+            # its prefix sums on device only when that diagnostic path is used.
+            seq_lens_i32 = md.seq_lens[:B].to(torch.int32)
+            fa_cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seq_lens_i32, dim=0, dtype=torch.int32), (1, 0)
+            )
+            fa_cu_seqlens_q = torch.arange(
+                B + 1, dtype=torch.int32, device=query.device
+            )
         with torch.profiler.record_function("kvarn_build_packed_kv"):
             use_native_materializer = (
                 kvarn_native_feature_enabled("MATERIALIZE")
@@ -1399,7 +1412,7 @@ def kvarn_decode_attention(
                 and kv_cache.is_contiguous()
                 and md.block_table[:B].is_contiguous()
                 and md.seq_lens[:B].is_contiguous()
-                and md.fa_cu_seqlens_k[: B + 1].is_contiguous()
+                and fa_cu_seqlens_k[: B + 1].is_contiguous()
                 and impl._block_to_slot_t.is_contiguous()
                 and impl._tail_K_pool.is_contiguous()
                 and impl._tail_V_pool.is_contiguous()
@@ -1417,7 +1430,7 @@ def kvarn_decode_attention(
                     kv_cache,
                     md.block_table[:B],
                     md.seq_lens[:B],
-                    md.fa_cu_seqlens_k[: B + 1],
+                    fa_cu_seqlens_k[: B + 1],
                     impl._block_to_slot_t,
                     impl._tail_K_pool,
                     impl._tail_V_pool,
@@ -1429,7 +1442,7 @@ def kvarn_decode_attention(
                 _kvarn_build_packed_kv_kernel[(B * max_blocks_per_req, Hk)](
                     md.block_table,
                     md.seq_lens,
-                    md.fa_cu_seqlens_k,
+                    fa_cu_seqlens_k,
                     impl._block_to_slot_t,
                     kv_cache,
                     impl._tail_K_pool,
@@ -1467,8 +1480,8 @@ def kvarn_decode_attention(
                 q=q_rot_fp16.view(B, Hq, D),
                 k=K_packed,
                 v=V_packed,
-                cu_seqlens_q=md.fa_cu_seqlens_q,
-                cu_seqlens_k=md.fa_cu_seqlens_k,
+                cu_seqlens_q=fa_cu_seqlens_q,
+                cu_seqlens_k=fa_cu_seqlens_k,
                 max_seqlen_q=1,
                 max_seqlen_k=md.fa_max_seqlen_k_fixed,
                 softmax_scale=scale,

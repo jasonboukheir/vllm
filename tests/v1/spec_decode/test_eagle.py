@@ -220,6 +220,10 @@ def test_prepare_inputs():
         block_size=BLOCK_SIZE,
         device=device,
     )
+    block_table_cpu = np.zeros(
+        common_attn_metadata.block_table_tensor.shape, dtype=np.int32
+    )
+    common_attn_metadata.block_table_cpu = block_table_cpu
 
     # If there are `k` sampled tokens, then `k-1` tokens are draft tokens
     # from the previous iteration, and the last token is the bonus token sampled
@@ -281,6 +285,7 @@ def test_prepare_inputs():
     )
 
     assert torch.equal(updated_metadata.query_start_loc, expected_cu_num_tokens)
+    assert updated_metadata.block_table_cpu is block_table_cpu
     assert token_indices.shape[0] == expected_cu_num_tokens[-1].item()
     assert torch.equal(token_indices, expected_token_indices)
 
@@ -315,6 +320,10 @@ def test_prepare_inputs_padded():
         block_size=BLOCK_SIZE,
         device=device,
     )
+    block_table_cpu = np.zeros(
+        common_attn_metadata.block_table_tensor.shape, dtype=np.int32
+    )
+    common_attn_metadata.block_table_cpu = block_table_cpu
 
     # Needed for cu_num_draft_tokens, which is expected to be [3, 6, 9]
     expected_query_start_loc = torch.tensor(
@@ -345,6 +354,7 @@ def test_prepare_inputs_padded():
     assert torch.equal(num_rejected_tokens_gpu, expected_num_rejected)
 
     assert output_metadata.max_query_len == 3
+    assert output_metadata.block_table_cpu is block_table_cpu
     assert torch.equal(output_metadata.query_start_loc, expected_query_start_loc)
     assert torch.equal(token_indices_to_sample, expected_token_indices_to_sample)
 
@@ -1155,6 +1165,10 @@ def test_set_inputs_first_pass_dflash():
         device=device,
         arange_block_indices=True,
     )
+    block_table_cpu = np.zeros(
+        common_attn_metadata.block_table_tensor.shape, dtype=np.int32
+    )
+    common_attn_metadata.block_table_cpu = block_table_cpu
 
     # Input tensors
     # Request 0: tokens [10, 11, 12] at positions [7, 8, 9]
@@ -1229,6 +1243,7 @@ def test_set_inputs_first_pass_dflash():
     assert output_cad.causal is False  # DFlash requires non-causal attention
     assert output_cad.num_actual_tokens == num_tokens  # query-only count
     assert output_cad.max_query_len == num_query_per_req
+    assert output_cad.block_table_cpu is block_table_cpu
 
     expected_query_start_loc = torch.tensor(
         [0, 4, 8, 12], dtype=torch.int32, device=device
