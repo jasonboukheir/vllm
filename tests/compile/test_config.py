@@ -331,6 +331,7 @@ def test_kvarn_fused_qkv_update_is_a_compilation_boundary():
 
     assert config.splitting_ops is not None
     assert "vllm::unified_qkv_cache_update" in config.splitting_ops
+    assert "vllm::unified_qkv_attention_with_output" in config.splitting_ops
     assert config.splitting_ops_contain_kv_cache_update()
 
 
