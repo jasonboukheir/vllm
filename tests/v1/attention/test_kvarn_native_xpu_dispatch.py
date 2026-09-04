@@ -12,8 +12,6 @@ import vllm.v1.attention.ops.triton_kvarn_decode as kvarn_decode
 from vllm.v1.attention.ops.triton_kvarn_decode import (
     _kvarn_dpas_layout_for_problem,
     _kvarn_native_output_hadamard_enabled,
-    _kvarn_native_runtime_kernel_selection,
-    _kvarn_native_scratch_call_trailer,
     _kvarn_native_scratch_views,
     _kvarn_op_supports_argument,
     _require_kvarn_dpas_reader,
@@ -24,7 +22,6 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_decode_abi_supported,
     kvarn_native_feature_enabled,
     kvarn_native_kernel_variant_requested,
-    kvarn_native_last_producer_abi_supported,
     kvarn_native_layer_selected,
     kvarn_native_layout_abi_supported,
     kvarn_native_prefill_store_supported,
@@ -319,7 +316,6 @@ def test_native_kernel_variant_selection_is_named_and_fail_closed(
         ("q6_current_half_v_prefetch", 16),
         ("q6_page_record_cursor", 17),
         ("q6_prefetch_record_cursor", 18),
-        ("q6_b1_short_last_producer", 19),
     ],
 )
 def test_native_kernel_variant_factory_ids_are_stable(
@@ -349,7 +345,6 @@ def test_native_kernel_variant_factory_ids_are_stable(
         ("q6_current_half_v_prefetch", 16),
         ("q6_page_record_cursor", 17),
         ("q6_prefetch_record_cursor", 18),
-        ("q6_b1_short_last_producer", 19),
     ],
 )
 def test_native_experimental_variants_require_dpas_cache_layout(
@@ -380,7 +375,6 @@ def test_native_experimental_variants_require_dpas_cache_layout(
         ("q6_current_half_v_prefetch", 16),
         ("q6_page_record_cursor", 17),
         ("q6_prefetch_record_cursor", 18),
-        ("q6_b1_short_last_producer", 19),
     ],
 )
 def test_b70_q6_split_policy_requires_q6_kernel(name: str, variant: int) -> None:
@@ -513,7 +507,6 @@ def test_page_pair_split_count_matches_cpp_k128_boundaries() -> None:
         kvarn_decode.KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
         kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
         kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER,
     ],
 )
 def test_k64_variants_keep_established_split_boundaries(kernel_variant: int) -> None:
@@ -883,96 +876,6 @@ def test_native_decode_requires_explicit_factory_abi(
     kvarn_native_layout_abi_supported.cache_clear()
 
 
-def test_id19_requires_explicit_completion_state_abi(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_op(*arguments: str) -> SimpleNamespace:
-        return SimpleNamespace(
-            default=SimpleNamespace(
-                _schema=SimpleNamespace(
-                    arguments=[SimpleNamespace(name=name) for name in arguments]
-                )
-            )
-        )
-
-    legacy = fake_op("num_kv_splits", "kernel_variant", "dpas_layout")
-    id19 = fake_op(
-        "num_kv_splits",
-        "kernel_variant",
-        "dpas_layout",
-        "last_producer_state_initialized",
-    )
-    fake_ops = SimpleNamespace(kvarn_decode=legacy, kvarn_decode_with_scratch=legacy)
-    monkeypatch.setattr(kvarn_decode.torch.ops, "_vllm_fa2_C", fake_ops)
-    kvarn_native_layout_abi_supported.cache_clear()
-    kvarn_native_decode_abi_supported.cache_clear()
-    kvarn_native_last_producer_abi_supported.cache_clear()
-
-    assert not kvarn_native_last_producer_abi_supported()
-
-    fake_ops.kvarn_decode_with_scratch = id19
-    kvarn_native_layout_abi_supported.cache_clear()
-    kvarn_native_decode_abi_supported.cache_clear()
-    kvarn_native_last_producer_abi_supported.cache_clear()
-    assert kvarn_native_last_producer_abi_supported()
-
-    kvarn_native_last_producer_abi_supported.cache_clear()
-    kvarn_native_decode_abi_supported.cache_clear()
-    kvarn_native_layout_abi_supported.cache_clear()
-
-
-def test_id19_runtime_selection_requires_the_complete_lifetime_contract() -> None:
-    id19 = kvarn_decode.KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER
-    common = dict(
-        requested_variant=id19,
-        batch_size=1,
-        max_seq_len=8192,
-        num_kv_splits=16,
-        fuse_output_hadamard=True,
-        use_scratch_op=True,
-        last_producer_abi_supported=True,
-        last_producer_state_ready=True,
-    )
-    assert _kvarn_native_runtime_kernel_selection(**common) == (id19, True)
-
-    for field, value in (
-        ("batch_size", 4),
-        ("max_seq_len", 8193),
-        ("num_kv_splits", 1),
-        ("fuse_output_hadamard", False),
-        ("use_scratch_op", False),
-        ("last_producer_abi_supported", False),
-        ("last_producer_state_ready", False),
-    ):
-        unsupported = {**common, field: value}
-        assert _kvarn_native_runtime_kernel_selection(**unsupported) == (
-            kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
-            False,
-        )
-
-    assert _kvarn_native_runtime_kernel_selection(
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
-        **{key: value for key, value in common.items() if key != "requested_variant"},
-    ) == (kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR, False)
-
-
-def test_id19_completion_argument_is_only_added_to_the_new_scratch_abi() -> None:
-    common = dict(
-        fuse_output_hadamard=True,
-        write_bf16_output=True,
-        num_kv_splits=16,
-        kernel_variant=kvarn_decode.KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER,
-        dpas_layout=True,
-        last_producer_state_initialized=True,
-    )
-    assert _kvarn_native_scratch_call_trailer(
-        **common, last_producer_abi_supported=True
-    ) == (True, True, 16, 19, True, True)
-    assert _kvarn_native_scratch_call_trailer(
-        **common, last_producer_abi_supported=False
-    ) == (True, True, 16, 19, True)
-
-
 @pytest.mark.parametrize(
     ("arguments", "expected"),
     [
@@ -1151,8 +1054,6 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
             assert kvarn_native_decode_abi_supported(
                 name == "kvarn_decode_with_scratch"
             )
-        if name == "kvarn_decode_with_scratch":
-            assert kvarn_native_last_producer_abi_supported()
         if name == "kvarn_sinkhorn_pack_kv":
             assert kvarn_native_sinkhorn_writer_abi_supported()
 
