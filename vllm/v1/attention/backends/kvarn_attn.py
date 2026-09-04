@@ -113,6 +113,9 @@ _KVARN_FLUSH_WRITER_ENV = "KVARN_FLUSH_WRITER"
 _KVARN_FLUSH_WRITER_REFERENCE = "reference"
 _KVARN_FLUSH_WRITER_NATIVE_XE2 = "native_xe2"
 _KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2 = "sinkhorn_pack_xe2"
+_KVARN_FORWARD_POOL_ENSURE_ENV = "KVARN_FORWARD_POOL_ENSURE"
+_KVARN_FORWARD_POOL_ENSURE_ALWAYS = "always"
+_KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF = "fused_qkv_proof"
 _KVARN_CACHED_PREFILL_MATERIALIZER_REFERENCE = "reference"
 _KVARN_CACHED_PREFILL_MATERIALIZER_NATIVE_XE2 = "native_xe2"
 _KVARN_FLUSH_INDEX_COUNTER_KEYS = (
@@ -164,6 +167,24 @@ def _kvarn_flush_writer_requested() -> tuple[str, str]:
             f"'{_KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2}', got {raw_value!r}"
         )
     return raw_value, _KVARN_FLUSH_WRITER_ENV
+
+
+def _kvarn_forward_pool_ensure_requested() -> tuple[str, str]:
+    """Resolve whether forward may consume a fused-update pool proof."""
+    raw_value = os.environ.get(_KVARN_FORWARD_POOL_ENSURE_ENV)
+    if raw_value is None:
+        return _KVARN_FORWARD_POOL_ENSURE_ALWAYS, "reference-default"
+    if raw_value not in {
+        _KVARN_FORWARD_POOL_ENSURE_ALWAYS,
+        _KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF,
+    }:
+        raise ValueError(
+            f"{_KVARN_FORWARD_POOL_ENSURE_ENV} must be exactly "
+            f"'{_KVARN_FORWARD_POOL_ENSURE_ALWAYS}' or "
+            f"'{_KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF}', got "
+            f"{raw_value!r}"
+        )
+    return raw_value, _KVARN_FORWARD_POOL_ENSURE_ENV
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1695,6 +1716,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     # them across steps would let recycled block ids observe a stale schedule.
     _flush_index_materialization: ClassVar[str | None] = None
     _flush_writer: ClassVar[str | None] = None
+    _forward_pool_ensure: ClassVar[str | None] = None
     _flush_index_counters: ClassVar[dict[str, int]] = {}
     _cached_prefill_materializer: ClassVar[str | None] = None
     _cached_prefill_materializer_counters: ClassVar[dict[str, int]] = {}
@@ -1735,6 +1757,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls._kernel_warmed.clear()
         cls._flush_index_materialization = None
         cls._flush_writer = None
+        cls._forward_pool_ensure = None
         cls._flush_index_counters.clear()
         cls._cached_prefill_materializer = None
         cls._cached_prefill_materializer_counters.clear()
@@ -1774,6 +1797,20 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 source,
             )
         return cls._flush_writer
+
+    @classmethod
+    def _select_forward_pool_ensure(cls) -> str:
+        if cls._forward_pool_ensure is None:
+            selection, source = _kvarn_forward_pool_ensure_requested()
+            cls._forward_pool_ensure = selection
+            logger.info_once(
+                "[KVARN_FACTORY] selected_forward_pool_ensure=%s; "
+                "selector_source=%s; proof=fused_qkv_signature+pool_binding; "
+                "fallback=always; immutable for engine lifetime",
+                selection,
+                source,
+            )
+        return cls._forward_pool_ensure
 
     @classmethod
     def _select_cached_prefill_materializer(cls) -> str:
@@ -1935,6 +1972,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         )
         type(self)._select_flush_index_materialization()
         self._kvarn_flush_writer = type(self)._select_flush_writer()
+        self._kvarn_forward_pool_ensure = type(self)._select_forward_pool_ensure()
         self._kvarn_cached_prefill_materializer = type(
             self
         )._select_cached_prefill_materializer()
@@ -3348,9 +3386,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         )
         return self.use_fused_qkv_cache_update
 
-    @staticmethod
-    def _fused_qkv_signature(query: torch.Tensor, attn_metadata) -> tuple:
-        """Identify the exact eager Q tensor whose rotation was produced."""
+    def _fused_qkv_signature(self, query: torch.Tensor, attn_metadata) -> tuple:
+        """Identify the exact eager Q tensor and pool binding just updated."""
         return (
             query.data_ptr(),
             tuple(query.shape),
@@ -3358,6 +3395,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             query.dtype,
             query.device,
             id(attn_metadata),
+            getattr(self, "_group_key", None),
+            getattr(self, "_pool_ready_key", None),
         )
 
     def _consume_fused_qkv_rotation(self, query: torch.Tensor, attn_metadata) -> bool:
@@ -3822,7 +3861,17 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
         # Make sure pool + block-lookup tensors exist and cover num_blocks.
         if not profiling_without_cache:
-            self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
+            may_consume_pool_proof = (
+                getattr(
+                    self,
+                    "_kvarn_forward_pool_ensure",
+                    _KVARN_FORWARD_POOL_ENSURE_ALWAYS,
+                )
+                == _KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF
+                and query_rotation_precomputed
+            )
+            if not may_consume_pool_proof:
+                self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
             # Cache the kv_cache ref so the metadata builder can drive flushes
             # into this layer's int4 cache (outside the captured region).
             self._kv_cache_ref = kv_cache
