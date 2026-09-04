@@ -904,6 +904,147 @@ def _configure_fused_forward_test(
     return pool_ensure, decode
 
 
+def _configure_native_qkv_receipt_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    impl: KVarNAttentionImpl,
+    metadata,
+    events: list[str],
+) -> tuple[Mock, Mock, Mock]:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    pool_ensure = Mock(side_effect=lambda *_args, **_kwargs: events.append("ensure"))
+    launch = Mock(side_effect=lambda *_args: events.append("launch"))
+    decode = Mock(
+        side_effect=lambda _q, _cache, _metadata, output=None, **_kwargs: (
+            events.append("decode") or output.fill_(7)
+        )
+    )
+    monkeypatch.setattr(kvarn_attn, "_active_kvarn_metadata", lambda _: metadata)
+    monkeypatch.setattr(impl, "_ensure_pool", pool_ensure)
+    monkeypatch.setattr(impl, "_native_qkv_scatter_eligible", lambda *_: True)
+    monkeypatch.setattr(impl, "_launch_native_qkv_scatter", launch)
+    monkeypatch.setattr(impl, "_decode_path", decode)
+    return pool_ensure, launch, decode
+
+
+def test_native_qkv_update_mints_pool_proof_consumed_by_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = _fused_frontend_impl()
+    impl._kvarn_forward_pool_ensure = "fused_qkv_proof"
+    metadata = _pure_decode_metadata()
+    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
+    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
+    slots = torch.tensor([0, 129], dtype=torch.int64)
+    events: list[str] = []
+    pool_ensure, launch, decode = _configure_native_qkv_receipt_lifecycle(
+        monkeypatch, impl, metadata, events
+    )
+
+    impl.do_qkv_cache_update(SimpleNamespace(), query, key, value, cache, slots)
+    assert impl._pending_fused_qkv_signature is not None
+    output = impl.forward(
+        SimpleNamespace(),
+        query,
+        key,
+        value,
+        cache,
+        metadata,
+        output=torch.empty(2, 24, 256, dtype=torch.bfloat16),
+    )
+
+    assert events == ["ensure", "launch", "decode"]
+    pool_ensure.assert_called_once_with(query.device, num_blocks_hint=cache.shape[0])
+    launch.assert_called_once_with(query, key, value, slots)
+    assert decode.call_args.kwargs["query_rotation_precomputed"] is True
+    assert impl._pending_fused_qkv_signature is None
+    assert output.eq(7).all()
+
+
+def test_inline_qkv_path_produces_and_consumes_pool_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.attention.attention as attention_module
+    import vllm.model_executor.layers.attention.kv_transfer_utils as kv_transfer_utils
+
+    impl = _fused_frontend_impl()
+    impl.use_inline_qkv_cache_update = True
+    impl._kvarn_forward_pool_ensure = "fused_qkv_proof"
+    metadata = _pure_decode_metadata()
+    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
+    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    output = torch.empty(2, 24, 256, dtype=torch.bfloat16)
+    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
+    slots = torch.tensor([0, 129], dtype=torch.int64)
+    events: list[str] = []
+    pool_ensure, launch, decode = _configure_native_qkv_receipt_lifecycle(
+        monkeypatch, impl, metadata, events
+    )
+    layer = SimpleNamespace(impl=impl)
+    context = Mock(return_value=(metadata, layer, cache, slots))
+    monkeypatch.setattr(attention_module, "get_attention_context", context)
+    monkeypatch.setattr(kv_transfer_utils, "has_kv_transfer_group", lambda: False)
+
+    attention_module.unified_qkv_attention_with_output(
+        query,
+        key,
+        value,
+        output,
+        "model.layers.0.self_attn",
+    )
+
+    context.assert_called_once_with("model.layers.0.self_attn")
+    assert events == ["ensure", "launch", "decode"]
+    pool_ensure.assert_called_once_with(query.device, num_blocks_hint=cache.shape[0])
+    launch.assert_called_once_with(query, key, value, slots)
+    assert decode.call_args.kwargs["query_rotation_precomputed"] is True
+    assert impl._pending_fused_qkv_signature is None
+    assert output.eq(7).all()
+
+
+def test_captured_native_qkv_fallback_does_not_publish_pool_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    impl = _fused_frontend_impl()
+    metadata = _pure_decode_metadata()
+    with FakeTensorMode():
+        query = torch.empty(2, 24, 256, dtype=torch.bfloat16, device="xpu")
+        key = torch.empty(2, 4, 256, dtype=torch.bfloat16, device="xpu")
+        value = torch.empty_like(key)
+        cache = torch.empty(2, 4, 35_072, dtype=torch.uint8, device="xpu")
+        slots = torch.tensor([0, 129], dtype=torch.int64, device="xpu")
+    fallback = Mock()
+    launch = Mock()
+    native_store = Mock(wraps=kvarn_attn.kvarn_native_store_supported)
+    pool_ensure = Mock()
+    monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
+    monkeypatch.setattr(kvarn_attn, "_active_kvarn_metadata", lambda _: metadata)
+    monkeypatch.setattr(kvarn_attn, "kvarn_native_decode_abi_supported", lambda _: True)
+    monkeypatch.setattr(kvarn_attn, "kvarn_native_layout_abi_supported", lambda _: True)
+    monkeypatch.setattr(kvarn_attn, "kvarn_native_store_supported", native_store)
+    monkeypatch.setattr(torch.xpu, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(impl, "_ensure_pool", pool_ensure)
+    monkeypatch.setattr(impl, "_launch_native_qkv_scatter", launch)
+    monkeypatch.setattr(impl, "do_kv_cache_update", fallback)
+    impl._pending_fused_qkv_signature = ("stale",)
+    layer = SimpleNamespace()
+
+    impl.do_qkv_cache_update(layer, query, key, value, cache, slots)
+
+    launch.assert_not_called()
+    pool_ensure.assert_called_once_with(query.device, num_blocks_hint=cache.shape[0])
+    assert native_store.call_args.kwargs["is_capturing"] is True
+    fallback.assert_called_once_with(layer, key, value, cache, slots)
+    assert impl._pending_fused_qkv_signature is None
+
+
 def test_fused_qkv_pool_proof_elides_second_forward_ensure() -> None:
     impl = _fused_frontend_impl()
     impl._kvarn_forward_pool_ensure = "fused_qkv_proof"
