@@ -110,6 +110,7 @@ _KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED = "shared"
 _KVARN_FLUSH_WRITER_ENV = "KVARN_FLUSH_WRITER"
 _KVARN_FLUSH_WRITER_REFERENCE = "reference"
 _KVARN_FLUSH_WRITER_NATIVE_XE2 = "native_xe2"
+_KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2 = "sinkhorn_pack_xe2"
 _KVARN_FLUSH_INDEX_COUNTER_KEYS = (
     "flush_calls",
     "layer_batches",
@@ -144,11 +145,13 @@ def _kvarn_flush_writer_requested() -> tuple[str, str]:
     if raw_value not in {
         _KVARN_FLUSH_WRITER_REFERENCE,
         _KVARN_FLUSH_WRITER_NATIVE_XE2,
+        _KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2,
     }:
         raise ValueError(
             f"{_KVARN_FLUSH_WRITER_ENV} must be exactly "
-            f"'{_KVARN_FLUSH_WRITER_REFERENCE}' or "
-            f"'{_KVARN_FLUSH_WRITER_NATIVE_XE2}', got {raw_value!r}"
+            f"'{_KVARN_FLUSH_WRITER_REFERENCE}', "
+            f"'{_KVARN_FLUSH_WRITER_NATIVE_XE2}', or "
+            f"'{_KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2}', got {raw_value!r}"
         )
     return raw_value, _KVARN_FLUSH_WRITER_ENV
 
@@ -403,6 +406,42 @@ def _kvarn_native_balanced_writer_supported(
     )
 
 
+def _kvarn_native_sinkhorn_writer_supported(
+    *,
+    cache_layout: str,
+    head_dim: int,
+    group: int,
+    key_bits: int,
+    value_bits: int,
+    num_kv_heads: int,
+    record_bytes: int,
+    sinkhorn_iterations: int,
+    op_available: bool,
+    rtn_quantile: float = 0.0,
+) -> bool:
+    """Pure eligibility for the raw-page Xe2 Sinkhorn/pack writer.
+
+    The fused op implements exactly the same narrow record ABI as the existing
+    balanced-tensor writer.  Keep this a separate predicate so selecting the
+    experiment can never silently route an unsupported cache through another
+    writer.
+    """
+    return (
+        _kvarn_native_balanced_writer_supported(
+            cache_layout=cache_layout,
+            head_dim=head_dim,
+            group=group,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            num_kv_heads=num_kv_heads,
+            record_bytes=record_bytes,
+            op_available=op_available,
+            rtn_quantile=rtn_quantile,
+        )
+        and 0 <= sinkhorn_iterations <= 64
+    )
+
+
 def _launch_kvarn_native_balanced_writer(
     balanced: tuple[torch.Tensor, ...],
     block_ids: torch.Tensor,
@@ -419,6 +458,26 @@ def _launch_kvarn_native_balanced_writer(
         *balanced,
         block_ids,
         packed_cache,
+        True,
+    )
+
+
+def _launch_kvarn_native_sinkhorn_writer(
+    tail_key: torch.Tensor,
+    tail_value: torch.Tensor,
+    pool_slots: torch.Tensor,
+    block_ids: torch.Tensor,
+    packed_cache: torch.Tensor,
+    sinkhorn_iterations: int,
+) -> None:
+    """Balance raw full pages and write xe2_dpas records in one native op."""
+    torch.ops._vllm_fa2_C.kvarn_sinkhorn_pack_kv(
+        tail_key,
+        tail_value,
+        pool_slots,
+        block_ids,
+        packed_cache,
+        sinkhorn_iterations,
         True,
     )
 
@@ -1769,25 +1828,48 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         )
         type(self)._select_flush_index_materialization()
         self._kvarn_flush_writer = type(self)._select_flush_writer()
-        if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_NATIVE_XE2:
-            supported = _kvarn_native_balanced_writer_supported(
-                cache_layout=self._kvarn_cache_layout,
-                head_dim=self.kvarn_config.head_dim,
-                group=self.kvarn_config.group,
-                key_bits=self.kvarn_config.key_bits,
-                value_bits=self.kvarn_config.value_bits,
-                num_kv_heads=self.num_kv_heads,
-                record_bytes=self.kvarn_config.record_bytes,
-                op_available=kvarn_native_layout_abi_supported(
-                    "kvarn_pack_balanced_kv"
-                ),
-                rtn_quantile=float(os.environ.get("KVARN_RTN_QUANTILE", "0") or 0),
+        if self._kvarn_flush_writer in {
+            _KVARN_FLUSH_WRITER_NATIVE_XE2,
+            _KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2,
+        }:
+            op_name = (
+                "kvarn_sinkhorn_pack_kv"
+                if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2
+                else "kvarn_pack_balanced_kv"
+            )
+            rtn_quantile = float(os.environ.get("KVARN_RTN_QUANTILE", "0") or 0)
+            supported = (
+                _kvarn_native_sinkhorn_writer_supported(
+                    cache_layout=self._kvarn_cache_layout,
+                    head_dim=self.kvarn_config.head_dim,
+                    group=self.kvarn_config.group,
+                    key_bits=self.kvarn_config.key_bits,
+                    value_bits=self.kvarn_config.value_bits,
+                    num_kv_heads=self.num_kv_heads,
+                    record_bytes=self.kvarn_config.record_bytes,
+                    sinkhorn_iterations=self.kvarn_config.sinkhorn_iters,
+                    op_available=kvarn_native_layout_abi_supported(op_name),
+                    rtn_quantile=rtn_quantile,
+                )
+                if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2
+                else _kvarn_native_balanced_writer_supported(
+                    cache_layout=self._kvarn_cache_layout,
+                    head_dim=self.kvarn_config.head_dim,
+                    group=self.kvarn_config.group,
+                    key_bits=self.kvarn_config.key_bits,
+                    value_bits=self.kvarn_config.value_bits,
+                    num_kv_heads=self.num_kv_heads,
+                    record_bytes=self.kvarn_config.record_bytes,
+                    op_available=kvarn_native_layout_abi_supported(op_name),
+                    rtn_quantile=rtn_quantile,
+                )
             )
             if not supported:
                 raise RuntimeError(
-                    "KVARN_FLUSH_WRITER=native_xe2 requires the xe2_dpas "
+                    f"KVARN_FLUSH_WRITER={self._kvarn_flush_writer} requires "
+                    "the xe2_dpas "
                     "D256/G128/K4V4/Hkv4 cache ABI and a matching "
-                    "kvarn_pack_balanced_kv extension; percentile RTN is "
+                    f"{op_name} extension; percentile RTN is "
                     "not supported"
                 )
 
@@ -2059,27 +2141,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             self._kvarn_flush_writer,
         )
         if warm_key not in cls._kernel_warmed:
-            warm_tiles = (
-                self.num_kv_heads
-                if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_NATIVE_XE2
-                else 1
-            )
-            k_dummy = torch.zeros(
-                warm_tiles,
-                cfg.head_dim,
-                cfg.group,
-                dtype=torch.float16,
-                device=device,
-            )
-            v_dummy = torch.zeros(
-                warm_tiles,
-                cfg.group,
-                cfg.head_dim,
-                dtype=torch.float16,
-                device=device,
-            )
-            if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_NATIVE_XE2:
-                balanced = _sinkhorn_balance_kv(k_dummy, v_dummy, cfg)
+            if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2:
                 dummy_cache = torch.zeros(
                     1,
                     self.num_kv_heads,
@@ -2087,17 +2149,56 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                     dtype=torch.uint8,
                     device=device,
                 )
+                dummy_slots = torch.zeros(1, dtype=torch.long, device=device)
                 dummy_blocks = torch.zeros(1, dtype=torch.long, device=device)
-                _launch_kvarn_native_balanced_writer(
-                    balanced, dummy_blocks, dummy_cache
+                _launch_kvarn_native_sinkhorn_writer(
+                    self._tail_K_pool,
+                    self._tail_V_pool,
+                    dummy_slots,
+                    dummy_blocks,
+                    dummy_cache,
+                    cfg.sinkhorn_iters,
                 )
             else:
-                _sinkhorn_pack_kv(
-                    k_dummy,
-                    v_dummy,
-                    cfg,
-                    cache_layout=self._kvarn_cache_layout,
+                warm_tiles = (
+                    self.num_kv_heads
+                    if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_NATIVE_XE2
+                    else 1
                 )
+                k_dummy = torch.zeros(
+                    warm_tiles,
+                    cfg.head_dim,
+                    cfg.group,
+                    dtype=torch.float16,
+                    device=device,
+                )
+                v_dummy = torch.zeros(
+                    warm_tiles,
+                    cfg.group,
+                    cfg.head_dim,
+                    dtype=torch.float16,
+                    device=device,
+                )
+                if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_NATIVE_XE2:
+                    balanced = _sinkhorn_balance_kv(k_dummy, v_dummy, cfg)
+                    dummy_cache = torch.zeros(
+                        1,
+                        self.num_kv_heads,
+                        cfg.record_bytes,
+                        dtype=torch.uint8,
+                        device=device,
+                    )
+                    dummy_blocks = torch.zeros(1, dtype=torch.long, device=device)
+                    _launch_kvarn_native_balanced_writer(
+                        balanced, dummy_blocks, dummy_cache
+                    )
+                else:
+                    _sinkhorn_pack_kv(
+                        k_dummy,
+                        v_dummy,
+                        cfg,
+                        cache_layout=self._kvarn_cache_layout,
+                    )
             cls._kernel_warmed.add(warm_key)
 
         # Decode-kernel warmup. The DECODE kernels (fused
@@ -2890,16 +2991,37 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 nB = len(bchunk)
                 slot_t = indices.pool_slots[c0 : c0 + CHUNK_BLOCKS]
                 bid_t = indices.block_ids[c0 : c0 + CHUNK_BLOCKS]
+                writer = getattr(
+                    impl, "_kvarn_flush_writer", cls._select_flush_writer()
+                )
+                if writer == _KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2:
+                    # The fused writer owns the gather, Sinkhorn state, RTN,
+                    # and record store.  Branch before index_select/.float so
+                    # no balanced fp32 page or scale tensor reaches global
+                    # memory on this path.
+                    _launch_kvarn_native_sinkhorn_writer(
+                        impl._tail_K_pool,
+                        impl._tail_V_pool,
+                        slot_t,
+                        bid_t,
+                        kvc,
+                        cfg.sinkhorn_iters,
+                    )
+                    logger.info_once(
+                        "[KVARN_FLUSH_WRITER] active=sinkhorn_pack_xe2; "
+                        "native_op=kvarn_sinkhorn_pack_kv; cache_layout=%s; "
+                        "sinkhorn_iterations=%d; fp32_intermediates=false",
+                        impl._kvarn_cache_layout,
+                        cfg.sinkhorn_iters,
+                    )
+                    continue
                 # One gather per chunk (was nB tiny .float() ops).
                 K_rot = impl._tail_K_pool.index_select(0, slot_t).float()  # [nB,G,Hk,D]
                 V_rot = impl._tail_V_pool.index_select(0, slot_t).float()
                 # Tiles: K [N, D, G] (absorb=channel), V [N, G, D] (absorb=token).
                 K_tiles = K_rot.permute(0, 2, 3, 1).reshape(nB * Hk, D, G)
                 V_tiles = V_rot.permute(0, 2, 1, 3).reshape(nB * Hk, G, D)
-                if (
-                    getattr(impl, "_kvarn_flush_writer", cls._select_flush_writer())
-                    == _KVARN_FLUSH_WRITER_NATIVE_XE2
-                ):
+                if writer == _KVARN_FLUSH_WRITER_NATIVE_XE2:
                     balanced = _sinkhorn_balance_kv(K_tiles, V_tiles, cfg)
                     _launch_kvarn_native_balanced_writer(balanced, bid_t, kvc)
                     continue
