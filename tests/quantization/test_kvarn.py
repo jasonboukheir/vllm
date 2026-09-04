@@ -1103,23 +1103,41 @@ def test_inline_qkv_attention_uses_one_context_and_update_before_forward(
     assert impl.forward.call_args.kwargs["output"] is output
 
 
-@pytest.mark.parametrize(
-    ("direct_call", "backend_name"),
-    [(False, "KVARN"), (True, "FLASH_ATTN")],
-)
-def test_inline_qkv_attention_fails_closed_at_initialization(
+def test_inline_qkv_attention_custom_op_contract() -> None:
+    import vllm.model_executor.layers.attention.attention  # noqa: F401
+
+    op = torch.ops.vllm.unified_qkv_attention_with_output.default
+    assert torch.Tag.cudagraph_unsafe in op.tags
+    arguments = {argument.name: argument for argument in op._schema.arguments}
+    assert arguments["output"].alias_info.is_write
+    assert arguments["output_block_scale"].alias_info.is_write
+
+    query = torch.empty(2, 24, 256, dtype=torch.bfloat16, device="meta")
+    key = torch.empty(2, 4, 256, dtype=torch.bfloat16, device="meta")
+    value = torch.empty_like(key)
+    output = torch.empty_like(query)
+
+    assert op(query, key, value, output, "model.layers.0.self_attn") is None
+
+
+@pytest.mark.parametrize("opaque_attention", [False, True])
+def test_inline_qkv_attention_accepts_xpu_direct_and_opaque_paths(
     monkeypatch: pytest.MonkeyPatch,
-    direct_call: bool,
-    backend_name: str,
+    opaque_attention: bool,
 ) -> None:
     import vllm.model_executor.layers.attention.attention as attention_module
 
     monkeypatch.setattr(attention_module.current_platform, "is_xpu", lambda: True)
+    monkeypatch.setattr(
+        attention_module.current_platform,
+        "opaque_attention_op",
+        lambda: opaque_attention,
+    )
 
-    with pytest.raises(RuntimeError, match="XPU direct-call KVarN"):
-        attention_module._validate_inline_qkv_cache_update(
-            True, direct_call, backend_name
-        )
+    attention_module._validate_inline_qkv_cache_update(True, "KVARN")
+    assert (not attention_module.current_platform.opaque_attention_op()) is (
+        not opaque_attention
+    )
 
 
 def test_inline_qkv_attention_requires_xpu_at_initialization(
@@ -1129,10 +1147,21 @@ def test_inline_qkv_attention_requires_xpu_at_initialization(
 
     monkeypatch.setattr(attention_module.current_platform, "is_xpu", lambda: False)
 
-    with pytest.raises(RuntimeError, match="XPU direct-call KVarN"):
-        attention_module._validate_inline_qkv_cache_update(True, True, "KVARN")
+    with pytest.raises(RuntimeError, match="XPU KVarN"):
+        attention_module._validate_inline_qkv_cache_update(True, "KVARN")
 
-    attention_module._validate_inline_qkv_cache_update(False, False, "FLASH_ATTN")
+    attention_module._validate_inline_qkv_cache_update(False, "FLASH_ATTN")
+
+
+def test_inline_qkv_attention_rejects_non_kvarn_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.attention.attention as attention_module
+
+    monkeypatch.setattr(attention_module.current_platform, "is_xpu", lambda: True)
+
+    with pytest.raises(RuntimeError, match="XPU KVarN"):
+        attention_module._validate_inline_qkv_cache_update(True, "FLASH_ATTN")
 
 
 def test_reference_frontend_skips_fused_signature_work(
@@ -1252,6 +1281,97 @@ def test_attention_routes_inline_frontend_without_dummy_dependency(
     assert k_arg.shape == v_arg.shape == (2, 4, 256)
     assert output_arg.shape == (2, 24, 256)
     assert layer_name == attention.layer_name
+
+
+def test_attention_routes_inline_frontend_through_one_opaque_xpu_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.attention.attention as attention_module
+    import vllm.model_executor.layers.attention.kv_transfer_utils as kv_transfer_utils
+
+    monkeypatch.setattr(attention_module.current_platform, "is_xpu", lambda: True)
+    monkeypatch.setattr(
+        attention_module.current_platform, "opaque_attention_op", lambda: True
+    )
+    attention_module._validate_inline_qkv_cache_update(True, "KVARN")
+
+    calls = []
+
+    def update(*_args):
+        calls.append("update")
+
+    def attention_forward(*_args, output=None, **_kwargs):
+        assert calls[-1] == "update"
+        calls.append("forward")
+        output.fill_(7)
+        return output
+
+    impl = SimpleNamespace(
+        do_qkv_cache_update=Mock(side_effect=update),
+        forward=Mock(side_effect=attention_forward),
+    )
+    attention = object.__new__(attention_module.Attention)
+    torch.nn.Module.__init__(attention)
+    attention.query_quant = None
+    attention.num_heads = 24
+    attention.num_kv_heads = 4
+    attention.head_size = 256
+    attention.head_size_v = 256
+    attention.impl = impl
+    attention.use_fused_qkv_cache_update = True
+    attention.use_inline_qkv_cache_update = True
+    attention.use_direct_call = (
+        not attention_module.current_platform.opaque_attention_op()
+    )
+    attention.attn_backend = SimpleNamespace(forward_includes_kv_cache_update=False)
+    attention.kv_sharing_target_layer_name = None
+    attention.layer_name = "model.layers.0.self_attn"
+    context = Mock(return_value=(object(), attention, object(), object()))
+    monkeypatch.setattr(attention_module, "get_attention_context", context)
+    monkeypatch.setattr(kv_transfer_utils, "has_kv_transfer_group", lambda: False)
+
+    def combined_dispatch(*args, **kwargs):
+        calls.append("combined")
+        return attention_module.unified_qkv_attention_with_output(*args, **kwargs)
+
+    combined = Mock(side_effect=combined_dispatch)
+    old_qkv_update = Mock(side_effect=AssertionError("old QKV update op selected"))
+    old_kv_update = Mock(side_effect=AssertionError("old KV update op selected"))
+    old_attention = Mock(side_effect=AssertionError("old attention op selected"))
+    monkeypatch.setattr(
+        attention_module.torch.ops.vllm,
+        "unified_qkv_attention_with_output",
+        combined,
+    )
+    monkeypatch.setattr(
+        attention_module.torch.ops.vllm,
+        "unified_qkv_cache_update",
+        old_qkv_update,
+    )
+    monkeypatch.setattr(
+        attention_module.torch.ops.vllm,
+        "unified_kv_cache_update",
+        old_kv_update,
+    )
+    monkeypatch.setattr(
+        attention_module.torch.ops.vllm,
+        "unified_attention_with_output",
+        old_attention,
+    )
+    query = torch.empty(2, 24 * 256, dtype=torch.bfloat16)
+    key = torch.empty(2, 4 * 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+
+    result = attention.forward(query, key, value)
+
+    assert attention.use_direct_call is False
+    assert calls == ["combined", "update", "forward"]
+    combined.assert_called_once()
+    old_qkv_update.assert_not_called()
+    old_kv_update.assert_not_called()
+    old_attention.assert_not_called()
+    context.assert_called_once_with(attention.layer_name)
+    assert result.eq(7).all()
 
 
 def test_inline_frontend_keeps_shared_kv_on_ordinary_attention(
