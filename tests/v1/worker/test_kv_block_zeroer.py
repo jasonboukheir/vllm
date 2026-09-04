@@ -11,7 +11,10 @@ from tests.v1.attention.utils import dense_kv_cache_views
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheLayout,
+    KVCachePoolSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.worker import utils as worker_utils
@@ -54,6 +57,7 @@ def test_attention_blocks_are_zeroed(spec):
         static_forward_context={
             layer_name: SimpleNamespace(kv_cache=storage),
         },
+        num_blocks=4,
     )
 
     zeroer.zero_block_ids([1])
@@ -62,6 +66,56 @@ def test_attention_blocks_are_zeroed(spec):
     expected = torch.ones_like(storage)
     expected[1] = 0
     assert torch.equal(storage, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_layers_in_one_group_may_use_different_kernel_pages_per_block():
+    """Derive kernel pages per block from each layer's allocation."""
+    device = torch.device("cuda")
+    num_blocks = 4
+    spec = SlidingWindowSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.int32,
+        sliding_window=2,
+    )
+    # Two kernel pages per logical block.
+    wide = torch.ones((num_blocks * 2, 3), dtype=torch.int32, device=device)
+    # One kernel page per logical block, carved out of a larger allocation so
+    # an over-strided write lands in the guard region instead of faulting or
+    # silently hitting another tensor.
+    narrow_backing = torch.ones((num_blocks * 3, 5), dtype=torch.int32, device=device)
+    narrow = narrow_backing[:num_blocks]
+
+    zeroer = KVBlockZeroer(
+        device,
+        attn_groups_iter=[
+            AttentionGroup(
+                None,
+                ["wide", "narrow"],
+                spec,
+                0,
+            )
+        ],
+        kernel_block_sizes=[1],
+        static_forward_context={
+            "wide": SimpleNamespace(kv_cache=wide),
+            "narrow": SimpleNamespace(kv_cache=narrow),
+        },
+        num_blocks=num_blocks,
+    )
+
+    zeroer.zero_block_ids([num_blocks - 1])
+    torch.accelerator.synchronize()
+
+    expected_wide = torch.ones_like(wide)
+    expected_wide[2 * (num_blocks - 1) :] = 0
+    assert torch.equal(wide, expected_wide)
+
+    expected_narrow = torch.ones_like(narrow_backing)
+    expected_narrow[num_blocks - 1] = 0
+    assert torch.equal(narrow_backing, expected_narrow)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -207,6 +261,7 @@ def test_large_dsv4_launch_geometry(monkeypatch):
             name: SimpleNamespace(kv_cache=storage)
             for name, storage in storages.items()
         },
+        num_blocks=1,
     )
 
     assert zeroer._meta is not None
@@ -233,6 +288,136 @@ def test_large_dsv4_launch_geometry(monkeypatch):
     old_max_chunks = max(page_sizes) // 4
     assert math.prod((n_blocks, n_segs, old_max_chunks)) > 2**31 - 1
     assert captured_grids == [(n_blocks, n_segs, max_chunks)]
+
+
+def test_independent_pools_use_group_local_block_counts(monkeypatch):
+    device = torch.device("cpu")
+    spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.int32,
+    )
+    pool_blocks = [5, 3]
+    storages = {
+        "attention.0": torch.ones((pool_blocks[0] * 2, 4), dtype=torch.int32),
+        "attention.1": torch.ones((pool_blocks[1] * 2, 4), dtype=torch.int32),
+    }
+    groups = [
+        AttentionGroup(None, [layer_name], spec, group_id)
+        for group_id, layer_name in enumerate(storages)
+    ]
+
+    zeroer = KVBlockZeroer(
+        device,
+        attn_groups_iter=groups,
+        kernel_block_sizes=[1, 1],
+        static_forward_context={
+            name: SimpleNamespace(kv_cache=storage)
+            for name, storage in storages.items()
+        },
+        num_blocks=pool_blocks,
+        group_pool_ids=[0, 1],
+    )
+
+    assert zeroer._meta is not None
+    _, block_strides, page_sizes, _, _, num_segments = zeroer._meta
+    assert block_strides.tolist() == [8, 8, 8, 8]
+    assert page_sizes.tolist() == [4, 4, 4, 4]
+    assert num_segments == 4
+    assert set(zeroer._meta_by_pool) == {0, 1}
+    assert all(meta[-1] == 2 for meta in zeroer._meta_by_pool.values())
+
+    launches = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append((grid, args[0].tolist()))
+
+    monkeypatch.setattr(worker_utils, "_zero_kv_blocks_kernel", FakeKernel())
+    monkeypatch.setattr(
+        worker_utils,
+        "async_tensor_h2d",
+        lambda values, **kwargs: torch.tensor(values, dtype=torch.int64),
+    )
+    zeroer.zero_block_ids_by_group([(0, [1])])
+
+    first = storages["attention.0"]
+    first_start = first.data_ptr()
+    first_end = first_start + first.numel() * first.element_size()
+    assert len(launches) == 1
+    assert launches[0][0] == (1, 2, 1)
+    assert all(first_start <= address < first_end for address in launches[0][1])
+
+
+def test_runner_only_group_does_not_require_a_scheduler_pool():
+    device = torch.device("cpu")
+    spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.int32,
+    )
+    storage = torch.ones((6, 4), dtype=torch.int32)
+    zeroer = KVBlockZeroer(
+        device,
+        attn_groups_iter=[
+            AttentionGroup(None, ["decoder"], spec, 0),
+            AttentionGroup(None, ["encoder"], spec, 1),
+        ],
+        kernel_block_sizes=[1, 1],
+        static_forward_context={
+            "decoder": SimpleNamespace(kv_cache=storage),
+            "encoder": SimpleNamespace(kv_cache=torch.ones_like(storage)),
+        },
+        num_blocks=[3],
+        group_pool_ids=[0],
+        runner_only_attn_layers={"encoder"},
+    )
+
+    assert zeroer._meta is not None
+    assert zeroer._meta[-1] == 2
+
+
+def test_cpu_zeroing_isolated_by_independent_pool():
+    from vllm.v1.worker.cpu_model_runner import CPUModelRunner
+
+    spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+    )
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attention.0"], spec),
+            KVCacheGroupSpec(["attention.1"], spec),
+        ],
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=3, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=3, group_ids=[1]),
+        ],
+    )
+    storages = {
+        name: torch.ones((3, 2, 2), dtype=torch.float32)
+        for name in ("attention.0", "attention.1")
+    }
+    runner = CPUModelRunner.__new__(CPUModelRunner)
+    runner.kv_cache_config = config
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={
+            name: SimpleNamespace(kv_cache=storage)
+            for name, storage in storages.items()
+        }
+    )
+
+    runner._zero_block_ids_by_group([(0, [1])])
+
+    assert torch.count_nonzero(storages["attention.0"][1]) == 0
+    assert torch.all(storages["attention.0"][[0, 2]] == 1)
+    assert torch.all(storages["attention.1"] == 1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -332,6 +517,7 @@ def test_zeroes_exactly_one_block_per_layer(layout: KVCacheLayout):
         attn_groups_iter=iter(groups),
         kernel_block_sizes=[spec.block_size],
         static_forward_context=ctx,
+        num_blocks=num_blocks,
     )
     zeroer.zero_block_ids([2])
     torch.accelerator.synchronize()
