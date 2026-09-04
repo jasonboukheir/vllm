@@ -74,7 +74,6 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch"):
         num_kv_splits: int = 0,
         kernel_variant: int = 0,
         dpas_layout: bool = False,
-        last_producer_state_initialized: bool = False,
     ) -> None:
         return
 

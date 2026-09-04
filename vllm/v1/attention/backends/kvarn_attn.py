@@ -78,7 +78,6 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     KVARN_CACHE_LAYOUT_NATURAL,
     KVARN_CACHE_LAYOUT_XE2_DPAS,
     KVARN_FRONTEND_QKV_SCATTER,
-    KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER,
     KVARN_PREFILL_STORE_HADAMARD_SCATTER,
     _kvarn_scatter_store_kernel,
     _require_kvarn_dpas_reader,
@@ -88,7 +87,6 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_decode_abi_supported,
     kvarn_native_feature_enabled,
     kvarn_native_kernel_variant_requested,
-    kvarn_native_last_producer_abi_supported,
     kvarn_native_layer_selected,
     kvarn_native_layout_abi_supported,
     kvarn_native_prefill_store_supported,
@@ -124,43 +122,6 @@ _KVARN_FLUSH_INDEX_COUNTER_KEYS = (
     "device_index_tensor_materializations",
     "shared_layer_reuses",
 )
-
-
-@dataclass(frozen=True)
-class _KVarNNativeLastProducerState:
-    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    owner_id: int
-    owner_stream: object
-
-    def is_ready(
-        self,
-        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
-        owner_id: int,
-        current_stream: object,
-    ) -> bool:
-        """Return whether this owner may continue the in-order epoch protocol."""
-        return (
-            self.scratch is scratch
-            and self.owner_id == owner_id
-            and self.owner_stream == current_stream
-        )
-
-
-def _initialize_kvarn_last_producer_state(max_logits: torch.Tensor) -> None:
-    """Zero the four uint64 completion words reserved in scratch."""
-    if (
-        max_logits.dtype != torch.float32
-        or not max_logits.is_contiguous()
-        or max_logits.numel() < 8
-        or max_logits.data_ptr() % 8 != 0
-    ):
-        raise ValueError(
-            "ID19 completion state requires four aligned uint64 storage words"
-        )
-    # Four uint64 words occupy exactly the first eight fp32 storage elements.
-    max_logits.view(-1)[:8].zero_()
-
-
 _KVARN_CACHED_PREFILL_MATERIALIZER_COUNTER_KEYS = (
     "calls",
     "native_launches",
@@ -1694,14 +1655,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _shared_output_fp32_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _shared_fused_out_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
     _shared_native_output_fp16_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
-    # Optional native Xe2 split-K scratch. Established variants share one
-    # stream-ordered set; ID19 gets one exclusive set per layer because its
-    # completion epoch persists in the max-logits prefix.
+    # Optional native Xe2 split-K scratch. The class-level owner keeps the
+    # allocations alive across asynchronous layer launches and lets every
+    # KVarN layer on the device reuse the same stream-ordered buffers.
     _shared_native_decode_scratch: ClassVar[
         dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
-    ] = {}
-    _shared_native_last_producer_state: ClassVar[
-        dict[tuple, _KVarNNativeLastProducerState]
     ] = {}
     _shared_mid_o_buf: ClassVar[
         dict[torch.device, torch.Tensor]
@@ -1763,7 +1721,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls._shared_fused_out_buf.clear()
         cls._shared_native_output_fp16_buf.clear()
         cls._shared_native_decode_scratch.clear()
-        cls._shared_native_last_producer_state.clear()
         cls._shared_mid_o_buf.clear()
         cls._shared_mid_lse_buf.clear()
         cls._shared_fa_K_buf.clear()
@@ -2071,8 +2028,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._kv_cache_ref: torch.Tensor | None = None
 
         # Stage 5.a Step 7 — decode scratch. These instance attrs are
-        # bound by `_ensure_pool` to class-owned tensors. ID19 is per-layer;
-        # established variants reuse one set across all attention layers.
+        # bound by `_ensure_pool` to per-device class-shared tensors so all
+        # 28 attention layers reuse a single set of buffers.
         self._q_fp32_buf: torch.Tensor | None = None
         self._q_rot_fp32_buf: torch.Tensor | None = None
         self._q_rot_fp16_buf: torch.Tensor | None = None
@@ -2083,7 +2040,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._native_decode_scratch: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
         ) = None
-        self._native_last_producer_state: _KVarNNativeLastProducerState | None = None
         self._pool_ready_key: tuple[torch.device, tuple] | None = None
         self._pool_ready_native_key: tuple | None = None
         self._pool_ready_env: tuple[str | None, ...] | None = None
@@ -2173,13 +2129,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             is not cls._shared_native_decode_scratch.get(self._pool_ready_native_key)
         ):
             return False
-        if self._pool_ready_native_key is not None and (
-            self._native_last_producer_state
-            is not cls._shared_native_last_producer_state.get(
-                self._pool_ready_native_key
-            )
-        ):
-            return False
         return all(
             tensor is not None
             for tensor in (
@@ -2190,57 +2139,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 self._v_rot_scratch,
             )
         )
-
-    def _native_last_producer_state_ready(self, device: torch.device) -> bool:
-        """Check exclusive scratch ownership on its initialization stream."""
-        state = self._native_last_producer_state
-        if state is None:
-            return False
-        current_stream = torch.xpu.current_stream(device)
-        return state.is_ready(self._native_decode_scratch, id(self), current_stream)
-
-    @classmethod
-    def _ensure_exclusive_native_decode_scratch(
-        cls,
-        native_key: tuple,
-        *,
-        native_batch: int,
-        num_query_heads: int,
-        num_kv_splits: int,
-        head_dim: int,
-        device: torch.device,
-        owner_id: int,
-        owner_stream: object | None = None,
-    ) -> None:
-        """Allocate and initialize one ID19 scratch set per attention layer."""
-        if native_key in cls._shared_native_decode_scratch:
-            state = cls._shared_native_last_producer_state.get(native_key)
-            if state is None or state.owner_id != owner_id:
-                raise RuntimeError("ID19 scratch ownership metadata is inconsistent")
-            return
-
-        if owner_stream is None:
-            owner_stream = torch.xpu.current_stream(device)
-        temp_output = torch.empty(
-            native_batch,
-            num_query_heads * num_kv_splits,
-            head_dim,
-            dtype=torch.float16,
-            device=device,
-        )
-        exp_sums = torch.empty(
-            native_batch,
-            num_query_heads,
-            num_kv_splits,
-            dtype=torch.float32,
-            device=device,
-        )
-        max_logits = torch.empty_like(exp_sums)
-        _initialize_kvarn_last_producer_state(max_logits)
-        scratch = (temp_output, exp_sums, max_logits)
-        state = _KVarNNativeLastProducerState(scratch, owner_id, owner_stream)
-        cls._shared_native_decode_scratch[native_key] = scratch
-        cls._shared_native_last_producer_state[native_key] = state
 
     def _ensure_pool(self, device: torch.device, num_blocks_hint: int = 0) -> None:
         """Lazy-allocate the GPU tail pool + lookup tensors + decode scratch.
@@ -2472,8 +2370,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # 2.1M tokens ≈ 8.6 GB) and would starve the actual KV cache. Cap it at
         # FA_SCRATCH_CAP tokens (~1 GB of fp16 K+V) — enough for typical
         # serving and for the bench (single request up to max_model_len). The
-        # scratch is per-step and allocated once. ID19 alone uses per-layer
-        # native split-K scratch for its persistent completion epoch.
+        # scratch is per-step, shared across all layers, allocated ONCE.
         FA_SCRATCH_CAP = 262144
         fa_rows = max(
             min(self._max_num_seqs * self._max_model_len, FA_SCRATCH_CAP),
@@ -2507,11 +2404,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             and cfg.record_bytes % 4 == 0
             and int(getattr(self, "sliding_window", 0) or 0) == 0
             and kvarn_native_decode_abi_supported(True)
-            and (
-                self._kvarn_native_kernel_variant
-                != KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER
-                or kvarn_native_last_producer_abi_supported()
-            )
         )
         native_key = None
         if use_native_scratch:
@@ -2523,21 +2415,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             )
             native_batch = min(max(self._max_num_seqs, 1), 12)
             native_key = (device, D, Hk, native_batch, native_splits)
-            if (
-                self._kvarn_native_kernel_variant
-                == KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER
-            ):
-                native_key = (*native_key, "id19", id(self))
-                cls._ensure_exclusive_native_decode_scratch(
-                    native_key,
-                    native_batch=native_batch,
-                    num_query_heads=Hq,
-                    num_kv_splits=native_splits,
-                    head_dim=D,
-                    device=device,
-                    owner_id=id(self),
-                )
-            elif native_key not in cls._shared_native_decode_scratch:
+            if native_key not in cls._shared_native_decode_scratch:
                 cls._shared_native_decode_scratch[native_key] = (
                     torch.empty(
                         native_batch,
@@ -2616,11 +2494,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._native_output_fp16_buf = cls._shared_native_output_fp16_buf[bkey]
         self._native_decode_scratch = (
             cls._shared_native_decode_scratch[native_key]
-            if native_key is not None
-            else None
-        )
-        self._native_last_producer_state = (
-            cls._shared_native_last_producer_state.get(native_key)
             if native_key is not None
             else None
         )
