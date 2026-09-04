@@ -315,6 +315,21 @@ def test_b70_q6_split_policy_requires_q6_kernel(name: str, variant: int) -> None
         )
 
 
+def test_b70_q6_v2_split_policy_requires_profiled_id12_kernel() -> None:
+    validate_kvarn_native_factory_selection(
+        "xe2_dpas",
+        "q6_next_page_prefetch",
+        12,
+        split_policy="b70_q6_v2",
+    )
+    with pytest.raises(
+        ValueError, match="requires kernel variant.*q6_next_page_prefetch"
+    ):
+        validate_kvarn_native_factory_selection(
+            "xe2_dpas", "q6_scalar", 2, split_policy="b70_q6_v2"
+        )
+
+
 def test_native_kernel_variant_five_remains_reserved() -> None:
     with pytest.raises(ValueError, match="variant 5 is reserved"):
         validate_kvarn_native_factory_selection("xe2_dpas", "page128", 5)
@@ -460,6 +475,116 @@ def test_b70_q6_split_policy_preserves_short_context_collapse(
 
     assert kvarn_native_split_count(1024, batch_size=1) == 1
     assert kvarn_native_split_count(1024, batch_size=2) == 16
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "context", "expected_splits"),
+    [
+        (1, 4096, 32),
+        (1, 16_384, 32),
+        (1, 65_023, 32),
+        (2, 65_023, 16),
+        (3, 65_023, 8),
+        (4, 4096, 8),
+        (4, 16_384, 8),
+        (4, 48 * 1024, 8),
+        (4, 48 * 1024 + 1, 32),
+        (4, 65_023, 32),
+        (5, 65_023, 4),
+        (8, 65_023, 4),
+        (9, 65_023, 2),
+        (12, 65_023, 2),
+    ],
+)
+def test_b70_q6_v2_split_policy_context_and_batch_boundaries(
+    batch_size: int, context: int, expected_splits: int
+) -> None:
+    assert (
+        kvarn_native_split_count(
+            context,
+            32,
+            batch_size=batch_size,
+            split_policy="b70_q6_v2",
+            kernel_variant=kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
+        )
+        == expected_splits
+    )
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "context", "expected_splits"),
+    [
+        # ID12 uses K64 work units. S=32 becomes valid on the 32nd work unit.
+        (1, 1984, 1),
+        (1, 1985, 32),
+        # Before the long-context B4 switch, S=8 becomes valid on unit eight.
+        (4, 448, 1),
+        (4, 449, 8),
+    ],
+)
+def test_b70_q6_v2_preserves_id12_work_unit_collapse(
+    batch_size: int, context: int, expected_splits: int
+) -> None:
+    assert (
+        kvarn_native_split_count(
+            context,
+            32,
+            batch_size=batch_size,
+            split_policy="b70_q6_v2",
+            kernel_variant=kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
+        )
+        == expected_splits
+    )
+
+
+def test_b70_q6_v2_reserves_max_scratch_across_dynamic_schedule() -> None:
+    variant = kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH
+    assert kvarn_native_split_scratch_count(4096, 32, "b70_q6_v2", variant) == 32
+    assert kvarn_native_split_scratch_count(65_023, 32, "b70_q6_v2", variant) == 32
+    with pytest.raises(ValueError, match="requires max_splits=32"):
+        kvarn_native_split_count(
+            65_023,
+            16,
+            batch_size=4,
+            split_policy="b70_q6_v2",
+            kernel_variant=variant,
+        )
+
+
+def test_b70_q6_v2_policy_request_and_legacy_policy_remains_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6_v2")
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
+    assert kvarn_native_split_policy_requested() == ("b70_q6_v2", 32)
+
+    # V1 is intentionally stable even where V2 changes B4 to S=32.
+    assert (
+        kvarn_native_split_count(
+            65_023,
+            32,
+            batch_size=4,
+            split_policy="b70_q6",
+            kernel_variant=kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
+        )
+        == 8
+    )
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "32")
+    with pytest.raises(ValueError, match="conflicts.*b70_q6_v2"):
+        kvarn_native_split_policy_requested()
+
+
+@pytest.mark.parametrize("batch_size", [0, 13])
+def test_b70_q6_v2_rejects_unsupported_batch_boundaries(batch_size: int) -> None:
+    with pytest.raises(ValueError, match="batch sizes 1 through 12"):
+        kvarn_native_split_count(
+            4096,
+            32,
+            batch_size=batch_size,
+            split_policy="b70_q6_v2",
+            kernel_variant=kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
+        )
 
 
 def test_b70_q6_page_pair_uses_k128_but_keeps_full_scratch_capacity(
