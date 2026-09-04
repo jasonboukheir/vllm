@@ -102,6 +102,18 @@ _KVARN_NATIVE_Q6_KERNEL_VARIANTS = frozenset(
         KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
     }
 )
+_KVARN_NATIVE_IMPLEMENTED_KERNEL_VARIANTS = frozenset(
+    _KVARN_NATIVE_KERNEL_VARIANTS.values()
+)
+
+
+def _kvarn_native_work_unit_tokens(kernel_variant: int) -> int:
+    """Return the C++ decoder's scheduling granularity for one variant."""
+    if kernel_variant == _KVARN_NATIVE_KERNEL_PAGE128_RESERVED:
+        raise ValueError("KVarN kernel variant 5 is reserved and cannot be selected")
+    if kernel_variant not in _KVARN_NATIVE_IMPLEMENTED_KERNEL_VARIANTS:
+        raise ValueError(f"unknown KVarN native kernel variant: {kernel_variant}")
+    return 128 if kernel_variant == KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR else 64
 
 
 def kvarn_native_feature_enabled(feature: str) -> bool:
@@ -264,7 +276,11 @@ def validate_kvarn_native_factory_selection(
 
 @functools.lru_cache(maxsize=256)
 def _kvarn_native_split_count_cached(
-    max_seq_len: int, max_splits: int, batch_size: int, split_policy: str
+    max_seq_len: int,
+    max_splits: int,
+    batch_size: int,
+    split_policy: str,
+    kernel_variant: int,
 ) -> int:
     splits = max_splits
     if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6:
@@ -281,9 +297,13 @@ def _kvarn_native_split_count_cached(
         else:
             splits = 2
 
-    # The C++ wrapper collapses short-context multi-split requests to one split
-    # to avoid empty partials and their reduction drift.
-    kv_tiles = (max_seq_len + 63) // 64
+    # Mirror the C++ wrapper's variant-specific work-unit rule exactly. The
+    # paired-page kernel schedules K128 pages; every other current native
+    # implementation schedules K64 tiles. Using K64 unconditionally can make
+    # Python enable the multi-split output reducer after C++ has collapsed the
+    # launch to one split, which C++ correctly rejects as an ABI mismatch.
+    work_unit_tokens = _kvarn_native_work_unit_tokens(kernel_variant)
+    kv_tiles = (max_seq_len + work_unit_tokens - 1) // work_unit_tokens
     return 1 if splits > 1 and kv_tiles < splits else splits
 
 
@@ -293,12 +313,13 @@ def kvarn_native_split_count(
     *,
     batch_size: int = 1,
     split_policy: str | None = None,
+    kernel_variant: int = KVARN_NATIVE_KERNEL_BASELINE,
 ) -> int:
     """Select the explicit native split count for one context extent.
 
-    Production callers pass the policy frozen by ``KVarNAttentionImpl``. The
-    optional resolver keeps this helper convenient for focused unit tests and
-    direct callers without moving policy back into C++.
+    Production callers pass the policy and kernel variant frozen by
+    ``KVarNAttentionImpl``. The defaults keep this helper source-compatible for
+    focused tests and direct callers while matching the baseline K64 kernel.
     """
     if max_splits is None:
         requested_policy, max_splits = kvarn_native_split_policy_requested()
@@ -311,19 +332,27 @@ def kvarn_native_split_count(
     if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6 and max_splits != 32:
         raise ValueError("b70_q6 split policy requires max_splits=32")
     return _kvarn_native_split_count_cached(
-        max_seq_len, max_splits, batch_size, split_policy
+        max_seq_len, max_splits, batch_size, split_policy, kernel_variant
     )
 
 
 def kvarn_native_split_scratch_count(
-    max_seq_len: int, max_splits: int, split_policy: str
+    max_seq_len: int,
+    max_splits: int,
+    split_policy: str,
+    kernel_variant: int = KVARN_NATIVE_KERNEL_BASELINE,
 ) -> int:
     """Return persistent scratch capacity for the engine-lifetime policy."""
+    _kvarn_native_work_unit_tokens(kernel_variant)
     if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6:
         if max_splits != 32:
             raise ValueError("b70_q6 split policy requires max_splits=32")
         return max_splits
-    return kvarn_native_split_count(max_seq_len, max_splits)
+    return kvarn_native_split_count(
+        max_seq_len,
+        max_splits,
+        kernel_variant=kernel_variant,
+    )
 
 
 def _kvarn_native_scratch_views(
@@ -1452,6 +1481,7 @@ def kvarn_decode_attention(
             impl._kvarn_native_max_splits,
             batch_size=B,
             split_policy=impl._kvarn_native_split_policy,
+            kernel_variant=impl._kvarn_native_kernel_variant,
         )
         native_scratch = impl._native_decode_scratch
         scratch_fits = (

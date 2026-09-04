@@ -2042,6 +2042,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 self._max_model_len,
                 self._kvarn_native_max_splits,
                 self._kvarn_native_split_policy,
+                self._kvarn_native_kernel_variant,
             )
             native_batch = min(max(self._max_num_seqs, 1), 12)
             native_key = (device, D, Hk, native_batch, native_splits)

@@ -369,6 +369,51 @@ def test_native_split_count_defaults_to_validated_multisplit(
     assert kvarn_native_split_count(512) == 1
 
 
+def test_page_pair_split_count_matches_cpp_k128_boundaries() -> None:
+    page_pair = kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR
+
+    # At S=32 the K64 variants have 32 work units here, but page-pair has only
+    # 16 and must collapse exactly as the C++ wrapper does.
+    assert kvarn_native_split_count(1985, 32) == 32
+    assert kvarn_native_split_count(1985, 32, kernel_variant=page_pair) == 1
+
+    # The page-pair launch reaches its 32nd K128 unit immediately after the
+    # end of page 31.
+    assert kvarn_native_split_count(3968, 32, kernel_variant=page_pair) == 1
+    assert kvarn_native_split_count(3969, 32, kernel_variant=page_pair) == 32
+    assert kvarn_native_split_scratch_count(1985, 32, "fixed") == 32
+    assert (
+        kvarn_native_split_scratch_count(
+            1985,
+            32,
+            "fixed",
+            page_pair,
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    "kernel_variant",
+    [
+        kvarn_decode.KVARN_NATIVE_KERNEL_BASELINE,
+        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_SCALAR,
+        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
+    ],
+)
+def test_k64_variants_keep_established_split_boundaries(kernel_variant: int) -> None:
+    assert kvarn_native_split_count(1984, 32, kernel_variant=kernel_variant) == 1
+    assert kvarn_native_split_count(1985, 32, kernel_variant=kernel_variant) == 32
+
+
+@pytest.mark.parametrize("kernel_variant", [5, 13, -1])
+def test_native_split_count_rejects_reserved_or_unknown_variants(
+    kernel_variant: int,
+) -> None:
+    with pytest.raises(ValueError, match="reserved|unknown"):
+        kvarn_native_split_count(4096, 32, kernel_variant=kernel_variant)
+
+
 @pytest.mark.parametrize(
     ("batch_size", "expected_splits"),
     [(1, 32), (2, 16), (3, 8), (4, 8), (5, 4), (8, 4), (9, 2), (12, 2)],
@@ -403,6 +448,40 @@ def test_b70_q6_split_policy_preserves_short_context_collapse(
 
     assert kvarn_native_split_count(1024, batch_size=1) == 1
     assert kvarn_native_split_count(1024, batch_size=2) == 16
+
+
+def test_b70_q6_page_pair_uses_k128_but_keeps_full_scratch_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6")
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
+    page_pair = kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR
+
+    assert (
+        kvarn_native_split_count(
+            1985,
+            batch_size=1,
+            kernel_variant=page_pair,
+        )
+        == 1
+    )
+    assert (
+        kvarn_native_split_count(
+            3969,
+            batch_size=1,
+            kernel_variant=page_pair,
+        )
+        == 32
+    )
+    assert (
+        kvarn_native_split_scratch_count(
+            1985,
+            32,
+            "b70_q6",
+            page_pair,
+        )
+        == 32
+    )
 
 
 def test_batch_aware_policy_views_capacity_scratch_contiguously_for_every_batch() -> (
