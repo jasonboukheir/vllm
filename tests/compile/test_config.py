@@ -322,6 +322,18 @@ def test_splitting_ops_dynamic():
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
 
 
+def test_kvarn_fused_qkv_update_is_a_compilation_boundary():
+    config = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        use_inductor_graph_partition=False,
+    )
+    config.set_splitting_ops_for_v1(all2all_backend="naive")
+
+    assert config.splitting_ops is not None
+    assert "vllm::unified_qkv_cache_update" in config.splitting_ops
+    assert config.splitting_ops_contain_kv_cache_update()
+
+
 def test_moe_splitting_ops_deepep_ht_inductor_partition():
     # Inductor partition case: user-provided splitting_ops should be
     # preserved and MoE ops should be appended for DeepEP HT with dp>1.
