@@ -7,6 +7,9 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.determinism.request_stable_linear import (
+    configure_xpu_kvarn_request_stability,
+)
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
@@ -131,6 +134,7 @@ class XPUWorker(Worker):
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
 
         _configure_kvarn_onednn_determinism(self.cache_config.cache_dtype)
+        configure_xpu_kvarn_request_stability(self.vllm_config)
 
         ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
         ENV_LOCAL_WORLD_SIZE = os.getenv(

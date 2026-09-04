@@ -11,6 +11,13 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
 
+@pytest.fixture(autouse=True)
+def _reset_request_stability_policy_cache():
+    request_stable._get_xpu_kvarn_request_stability_policy.cache_clear()
+    yield
+    request_stable._get_xpu_kvarn_request_stability_policy.cache_clear()
+
+
 class RecordingQuantMethod:
     def __init__(self) -> None:
         self.calls: list[tuple[torch.Tensor, torch.Tensor | None]] = []
@@ -913,6 +920,7 @@ def test_gemma_rms_norm_uses_request_stable_dispatch(
     layer = SimpleNamespace(
         weight=torch.nn.Parameter(torch.zeros(4)),
         variance_epsilon=1e-6,
+        _xpu_kvarn_request_stable_rmsnorm=True,
     )
     x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     residual = torch.ones_like(x) if fused else None
@@ -945,11 +953,36 @@ def test_gemma_rms_norm_xpu_preserves_request_stable_dispatch(
         calls.append((x, residual))
         return x
 
-    layer = SimpleNamespace(forward_native=recording_native)
+    layer = SimpleNamespace(
+        forward_native=recording_native,
+        _xpu_kvarn_request_stable_rmsnorm=True,
+    )
     x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
     assert GemmaRMSNorm.forward_xpu(layer, x) is x
     assert calls == [(x, None)]
+
+
+def test_gemma_rms_norm_disabled_skips_request_stable_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    monkeypatch.setattr(
+        request_stable,
+        "apply_rms_norm_by_request",
+        lambda *_args: pytest.fail("disabled RMSNorm policy used stable dispatch"),
+    )
+    layer = SimpleNamespace(
+        weight=torch.nn.Parameter(torch.zeros(4)),
+        variance_epsilon=1e-6,
+        _xpu_kvarn_request_stable_rmsnorm=False,
+    )
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    result = GemmaRMSNorm.forward_native(layer, x)
+
+    assert isinstance(result, torch.Tensor)
 
 
 def test_inactive_linear_fast_path_does_not_read_forward_context(
@@ -1078,6 +1111,141 @@ def test_request_stable_config_accepts_frozen_profile(
         request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
     )
     assert request_stable.use_xpu_kvarn_request_stable_linears(_scoped_config())
+
+
+@pytest.mark.parametrize(
+    (
+        "projection_rows",
+        "rmsnorm",
+        "expected_projection_rows",
+        "expected_rmsnorm",
+        "expected_context",
+    ),
+    [
+        (None, None, True, True, True),
+        ("0", "1", False, True, True),
+        ("1", "0", True, False, True),
+        ("0", "0", False, False, False),
+    ],
+)
+def test_request_stability_axes_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+    projection_rows: str | None,
+    rmsnorm: str | None,
+    expected_projection_rows: bool,
+    expected_rmsnorm: bool,
+    expected_context: bool,
+) -> None:
+    monkeypatch.setattr(
+        request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
+    )
+    selector_values = {
+        request_stable.XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV: projection_rows,
+        request_stable.XPU_KVARN_REQUEST_STABLE_RMSNORM_ENV: rmsnorm,
+    }
+    for name, value in selector_values.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    config = _scoped_config()
+    assert (
+        request_stable.use_xpu_kvarn_request_stable_projection_rows(config)
+        is expected_projection_rows
+    )
+    assert (
+        request_stable.use_xpu_kvarn_request_stable_rmsnorm(config)
+        is expected_rmsnorm
+    )
+    assert (
+        request_stable.use_xpu_kvarn_request_stable_context(config)
+        is expected_context
+    )
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        request_stable.XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV,
+        request_stable.XPU_KVARN_REQUEST_STABLE_RMSNORM_ENV,
+    ],
+)
+@pytest.mark.parametrize("raw_value", ["", "false", "2", " 0"])
+def test_request_stability_axes_reject_invalid_values_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    selector: str,
+    raw_value: str,
+) -> None:
+    monkeypatch.setattr(
+        request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
+    )
+    monkeypatch.setenv(selector, raw_value)
+
+    with pytest.raises(ValueError, match=f"{selector} must be exactly '0' or '1'"):
+        request_stable.configure_xpu_kvarn_request_stability(_scoped_config())
+
+
+def test_request_stability_axes_are_immutable_after_first_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        request_stable.XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV, "0"
+    )
+    policy = request_stable._get_xpu_kvarn_request_stability_policy()
+    monkeypatch.setenv(
+        request_stable.XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV, "1"
+    )
+
+    assert policy.projection_rows is False
+    assert request_stable._get_xpu_kvarn_request_stability_policy() is policy
+
+
+def test_request_stability_startup_logs_effective_factory_axes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        request_stable, "current_platform", SimpleNamespace(is_xpu=lambda: True)
+    )
+    monkeypatch.setenv(
+        request_stable.XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV, "0"
+    )
+    monkeypatch.delenv(
+        request_stable.XPU_KVARN_REQUEST_STABLE_RMSNORM_ENV, raising=False
+    )
+    calls = []
+    monkeypatch.setattr(
+        request_stable.logger,
+        "info_once",
+        lambda *args: calls.append(args),
+    )
+
+    request_stable.configure_xpu_kvarn_request_stability(_scoped_config())
+
+    assert calls == [
+        (
+            "[KVARN_FACTORY] selected_request_stable_projection_rows=%s; "
+            "projection_rows_selector_source=%s; "
+            "selected_request_stable_rmsnorm=%s; rmsnorm_selector_source=%s; "
+            "profile_eligible=%s; immutable for engine lifetime",
+            "false",
+            request_stable.XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV,
+            "true",
+            "safe-default",
+            "true",
+        )
+    ]
+
+
+def test_request_stability_axes_do_not_own_non_kvarn_engines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        request_stable.XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV, "invalid"
+    )
+    config = _scoped_config(cache_config__cache_dtype="auto")
+
+    assert request_stable.configure_xpu_kvarn_request_stability(config) is None
 
 
 def test_request_stable_config_accepts_explicit_single_row_ubatch(

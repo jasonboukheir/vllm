@@ -17,7 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.determinism.request_stable_linear import (
     is_xpu_kvarn_packed_ordinary_decode,
-    use_xpu_kvarn_request_stable_linears,
+    use_xpu_kvarn_request_stable_projection_rows,
 )
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -99,8 +99,8 @@ class LogitsProcessor(PluggableLayer):
         vllm_config = get_current_vllm_config()
         model_config = vllm_config.model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
-        self._xpu_kvarn_request_stable = use_xpu_kvarn_request_stable_linears(
-            vllm_config
+        self._xpu_kvarn_request_stable = (
+            use_xpu_kvarn_request_stable_projection_rows(vllm_config)
         )
 
     def forward(

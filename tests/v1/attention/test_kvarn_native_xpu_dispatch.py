@@ -1225,6 +1225,31 @@ def _enable_xe2_request_stable_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch.ops._xpu_C, "is_xe2_arch", lambda: True)
 
 
+def test_xpu_forward_context_is_omitted_when_both_stability_axes_are_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.determinism.request_stable_linear as request_stable
+    from vllm.platforms.xpu import XPUPlatform
+
+    _enable_xe2_request_stable_profile(monkeypatch)
+    monkeypatch.setenv(
+        request_stable.XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV, "0"
+    )
+    monkeypatch.setenv(request_stable.XPU_KVARN_REQUEST_STABLE_RMSNORM_ENV, "0")
+    request_stable._get_xpu_kvarn_request_stability_policy.cache_clear()
+    try:
+        assert (
+            XPUPlatform.set_additional_forward_context(
+                attn_metadata=None,
+                vllm_config=_request_stable_config(),
+                num_tokens=1,
+            )
+            == {}
+        )
+    finally:
+        request_stable._get_xpu_kvarn_request_stability_policy.cache_clear()
+
+
 def test_xpu_forward_context_exposes_validated_kvarn_request_slices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -3,7 +3,9 @@
 """Request-stable operator dispatch for the scoped XPU KVarN profile."""
 
 import functools
+import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -12,11 +14,18 @@ from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
+logger = init_logger(__name__)
+
 XPU_KVARN_REQUEST_SLICES_KEY = "xpu_kvarn_request_slices"
 XPU_KVARN_CANONICAL_LINEAR_ROWS = 64
+XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV = (
+    "KVARN_REQUEST_STABLE_PROJECTION_ROWS"
+)
+XPU_KVARN_REQUEST_STABLE_RMSNORM_ENV = "KVARN_REQUEST_STABLE_RMSNORM"
 _QWEN_GDN_CANONICAL_LINEAR_SUFFIXES = (
     ".linear_attn.in_proj_qkvz",
     ".linear_attn.in_proj_ba",
@@ -32,11 +41,48 @@ class XPUKvarnRequestSlices(tuple):
     """Request slices validated once by the XPU forward-context builder."""
 
 
-def use_xpu_kvarn_request_stable_linears(vllm_config: Any) -> bool:
-    """Return whether the frozen eager Qwen/XPU profile needs stable GEMM rows.
+@dataclass(frozen=True)
+class XPUKvarnRequestStabilityPolicy:
+    """Immutable request-stability policy selected for one engine process."""
+
+    projection_rows: bool
+    rmsnorm: bool
+    projection_rows_source: str
+    rmsnorm_source: str
+
+
+def _strict_enabled_selector(name: str) -> tuple[bool, str]:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return True, "safe-default"
+    if raw_value == "1":
+        return True, name
+    if raw_value == "0":
+        return False, name
+    raise ValueError(f"{name} must be exactly '0' or '1', got {raw_value!r}")
+
+
+@functools.cache
+def _get_xpu_kvarn_request_stability_policy() -> XPUKvarnRequestStabilityPolicy:
+    projection_rows, projection_rows_source = _strict_enabled_selector(
+        XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV
+    )
+    rmsnorm, rmsnorm_source = _strict_enabled_selector(
+        XPU_KVARN_REQUEST_STABLE_RMSNORM_ENV
+    )
+    return XPUKvarnRequestStabilityPolicy(
+        projection_rows=projection_rows,
+        rmsnorm=rmsnorm,
+        projection_rows_source=projection_rows_source,
+        rmsnorm_source=rmsnorm_source,
+    )
+
+
+def _is_xpu_kvarn_request_stable_profile(vllm_config: Any) -> bool:
+    """Return whether this is the frozen eager Qwen/XPU KVarN profile.
 
     This is intentionally narrower than a platform-wide batch-invariance claim.
-    Unsupported execution modes retain their existing linear dispatch.
+    Unsupported execution modes retain their existing operator dispatch.
     """
     if not current_platform.is_xpu():
         return False
@@ -102,6 +148,64 @@ def use_xpu_kvarn_request_stable_linears(vllm_config: Any) -> bool:
     if getattr(vllm_config, "speculative_config", None) is not None:
         return False
     return getattr(vllm_config, "lora_config", None) is None
+
+
+def configure_xpu_kvarn_request_stability(
+    vllm_config: Any,
+) -> XPUKvarnRequestStabilityPolicy | None:
+    """Validate and log immutable KVarN request-stability selectors.
+
+    The selectors are intentionally parsed only for KVarN engines. Their
+    process-cached values cannot change after startup. The returned booleans
+    are requested values; the scoped profile check determines whether they
+    become active.
+    """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    cache_dtype = getattr(cache_config, "cache_dtype", None)
+    if not isinstance(cache_dtype, str) or not cache_dtype.startswith("kvarn_"):
+        return None
+
+    policy = _get_xpu_kvarn_request_stability_policy()
+    eligible = _is_xpu_kvarn_request_stable_profile(vllm_config)
+    logger.info_once(
+        "[KVARN_FACTORY] selected_request_stable_projection_rows=%s; "
+        "projection_rows_selector_source=%s; "
+        "selected_request_stable_rmsnorm=%s; rmsnorm_selector_source=%s; "
+        "profile_eligible=%s; immutable for engine lifetime",
+        str(policy.projection_rows and eligible).lower(),
+        policy.projection_rows_source,
+        str(policy.rmsnorm and eligible).lower(),
+        policy.rmsnorm_source,
+        str(eligible).lower(),
+    )
+    return policy
+
+
+def use_xpu_kvarn_request_stable_projection_rows(vllm_config: Any) -> bool:
+    """Return whether projections use request-stable canonical row counts."""
+    return _is_xpu_kvarn_request_stable_profile(
+        vllm_config
+    ) and _get_xpu_kvarn_request_stability_policy().projection_rows
+
+
+def use_xpu_kvarn_request_stable_rmsnorm(vllm_config: Any) -> bool:
+    """Return whether Gemma RMSNorm uses the request-stable reduction."""
+    return _is_xpu_kvarn_request_stable_profile(
+        vllm_config
+    ) and _get_xpu_kvarn_request_stability_policy().rmsnorm
+
+
+def use_xpu_kvarn_request_stable_context(vllm_config: Any) -> bool:
+    """Return whether either request-stable operator needs request slices."""
+    if not _is_xpu_kvarn_request_stable_profile(vllm_config):
+        return False
+    policy = _get_xpu_kvarn_request_stability_policy()
+    return policy.projection_rows or policy.rmsnorm
+
+
+def use_xpu_kvarn_request_stable_linears(vllm_config: Any) -> bool:
+    """Backward-compatible name for request-stable projection-row policy."""
+    return use_xpu_kvarn_request_stable_projection_rows(vllm_config)
 
 
 def _validate_request_slices(
