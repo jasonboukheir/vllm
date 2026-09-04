@@ -99,6 +99,34 @@ if _HAS_FLASH_ATTN:
 
 logger = init_logger(__name__)
 
+_KVARN_FLUSH_INDEX_MATERIALIZATION_ENV = "KVARN_FLUSH_INDEX_MATERIALIZATION"
+_KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE = "per_layer"
+_KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED = "shared"
+_KVARN_FLUSH_INDEX_COUNTER_KEYS = (
+    "flush_calls",
+    "layer_batches",
+    "schedule_groups",
+    "device_index_tensor_materializations",
+    "shared_layer_reuses",
+)
+
+
+def _kvarn_flush_index_materialization_requested() -> tuple[str, str]:
+    """Resolve the process-lifetime flush-index materialization policy."""
+    raw_value = os.environ.get(_KVARN_FLUSH_INDEX_MATERIALIZATION_ENV)
+    if raw_value is None:
+        return _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE, "reference-default"
+    if raw_value not in {
+        _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE,
+        _KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED,
+    }:
+        raise ValueError(
+            f"{_KVARN_FLUSH_INDEX_MATERIALIZATION_ENV} must be exactly "
+            f"'{_KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE}' or "
+            f"'{_KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED}', got {raw_value!r}"
+        )
+    return raw_value, _KVARN_FLUSH_INDEX_MATERIALIZATION_ENV
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Hadamard cache (one D×D matrix per (head_dim, device))
@@ -1368,6 +1396,14 @@ class _BlockTail:
     filled_count: int = 0  # CPU-side counter (avoid .all() sync)
 
 
+@dataclass(frozen=True)
+class _KVarNFlushDeviceIndices:
+    """Own one flush schedule's device indices for an entire flush call."""
+
+    block_ids: torch.Tensor
+    pool_slots: torch.Tensor
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Attention impl
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1427,6 +1463,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     # int4 store) have already been JIT-compiled via the pool-init warmup.
     _kernel_warmed: ClassVar[set] = set()
 
+    # The selector freezes on the first KVarN layer constructed for a model.
+    # Device index owners themselves are intentionally call-local: retaining
+    # them across steps would let recycled block ids observe a stale schedule.
+    _flush_index_materialization: ClassVar[str | None] = None
+    _flush_index_counters: ClassVar[dict[str, int]] = {}
+
     # Registry of impls so the builder can enumerate per-layer pools when
     # it needs to update sink markers / trigger flushes.
     _all_impls: ClassVar[list[KVarNAttentionImpl]] = []
@@ -1461,8 +1503,31 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls._is_sink_t_per_device.clear()
         cls._max_known_block_id.clear()
         cls._kernel_warmed.clear()
+        cls._flush_index_materialization = None
+        cls._flush_index_counters.clear()
         cls._all_impls.clear()
         cls._tiles_dumped = False
+
+    @classmethod
+    def _select_flush_index_materialization(cls) -> str:
+        if cls._flush_index_materialization is None:
+            selection, source = _kvarn_flush_index_materialization_requested()
+            cls._flush_index_materialization = selection
+            logger.info_once(
+                "[KVARN_FACTORY] selected_flush_index_materialization=%s; "
+                "selector_source=%s; immutable for engine lifetime",
+                selection,
+                source,
+            )
+        return cls._flush_index_materialization
+
+    @classmethod
+    def flush_index_materialization_counters(cls) -> dict[str, int]:
+        """Return cumulative materialization provenance for this model load."""
+        return {
+            key: cls._flush_index_counters.get(key, 0)
+            for key in _KVARN_FLUSH_INDEX_COUNTER_KEYS
+        }
 
     @classmethod
     def _ensure_shared_q_output_scratch(
@@ -1587,6 +1652,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             self._kvarn_native_max_splits,
             self._kvarn_native_split_policy,
         )
+        type(self)._select_flush_index_materialization()
 
         # Per-block fp16 tail buffer (in-progress tiles). Keyed by block_id.
         # Stage 3b uses a Python dict — small concurrent batch sizes only.
@@ -2610,19 +2676,51 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
         # Block-chunk so one Sinkhorn launch stays bounded (~2k [R,C] tiles).
         CHUNK_BLOCKS = max(1, 2048 // max(Hk, 1))
+        materialization = cls._select_flush_index_materialization()
+        shared_indices: dict[tuple, _KVarNFlushDeviceIndices] = {}
+        # Own every device index tensor until all layer writes have been
+        # enqueued. Nothing survives this call, so the next scheduler step
+        # cannot observe stale block ids after allocator recycling.
+        index_owners: list[_KVarNFlushDeviceIndices] = []
+        call_layer_batches = 0
+        call_schedule_groups = 0
+        call_device_materializations = 0
+        call_shared_reuses = 0
         for impl, kvc, bids, slots in by_impl.values():
             if kvc is None:
                 continue
             dev = impl._tail_K_pool.device
-            # WSL fix: one H2D for the whole block set, slice on device
-            # per chunk (a torch.as_tensor H2D per chunk is a sync, ~100x on WSL).
-            slots_dev = torch.as_tensor(slots, dtype=torch.long, device=dev)
-            bids_dev = torch.as_tensor(bids, dtype=torch.long, device=dev)
+            call_layer_batches += 1
+            schedule_key = None
+            indices = None
+            if materialization == _KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED:
+                schedule_key = (
+                    dev,
+                    impl._group_key,
+                    tuple(bids),
+                    tuple(slots),
+                )
+                indices = shared_indices.get(schedule_key)
+            if indices is None:
+                # One H2D per complete block set, then device slices per chunk.
+                # In shared mode, only an exact group-scoped schedule match can
+                # reuse these tensors across layers.
+                indices = _KVarNFlushDeviceIndices(
+                    block_ids=torch.as_tensor(bids, dtype=torch.long, device=dev),
+                    pool_slots=torch.as_tensor(slots, dtype=torch.long, device=dev),
+                )
+                index_owners.append(indices)
+                call_schedule_groups += 1
+                call_device_materializations += 2
+                if schedule_key is not None:
+                    shared_indices[schedule_key] = indices
+            else:
+                call_shared_reuses += 1
             for c0 in range(0, len(bids), CHUNK_BLOCKS):
                 bchunk = bids[c0 : c0 + CHUNK_BLOCKS]
                 nB = len(bchunk)
-                slot_t = slots_dev[c0 : c0 + CHUNK_BLOCKS]
-                bid_t = bids_dev[c0 : c0 + CHUNK_BLOCKS]
+                slot_t = indices.pool_slots[c0 : c0 + CHUNK_BLOCKS]
+                bid_t = indices.block_ids[c0 : c0 + CHUNK_BLOCKS]
                 # One gather per chunk (was nB tiny .float() ops).
                 K_rot = impl._tail_K_pool.index_select(0, slot_t).float()  # [nB,G,Hk,D]
                 V_rot = impl._tail_V_pool.index_select(0, slot_t).float()
@@ -2654,6 +2752,41 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                     rec = torch.nn.functional.pad(rec, (0, T - rec.shape[1]))
                 # One scatter per chunk (was nB*Hk _write_packed calls).
                 kvc[bid_t] = rec.view(nB, Hk, T)
+
+        call_counters = {
+            "flush_calls": 1,
+            "layer_batches": call_layer_batches,
+            "schedule_groups": call_schedule_groups,
+            "device_index_tensor_materializations": call_device_materializations,
+            "shared_layer_reuses": call_shared_reuses,
+        }
+        for key, value in call_counters.items():
+            cls._flush_index_counters[key] = (
+                cls._flush_index_counters.get(key, 0) + value
+            )
+        logger.info_once(
+            "[KVARN_FLUSH_INDEX] selected=%s; first_flush_layer_batches=%d; "
+            "first_flush_schedule_groups=%d; "
+            "first_flush_device_index_tensor_materializations=%d; "
+            "first_flush_shared_layer_reuses=%d",
+            materialization,
+            call_layer_batches,
+            call_schedule_groups,
+            call_device_materializations,
+            call_shared_reuses,
+        )
+        cumulative = cls.flush_index_materialization_counters()
+        logger.debug(
+            "[KVARN_FLUSH_INDEX_COUNTER] selected=%s; flush_calls=%d; "
+            "layer_batches=%d; schedule_groups=%d; "
+            "device_index_tensor_materializations=%d; shared_layer_reuses=%d",
+            materialization,
+            cumulative["flush_calls"],
+            cumulative["layer_batches"],
+            cumulative["schedule_groups"],
+            cumulative["device_index_tensor_materializations"],
+            cumulative["shared_layer_reuses"],
+        )
 
     @classmethod
     def _batched_flush_legacy(cls, flush_pairs: list) -> None:

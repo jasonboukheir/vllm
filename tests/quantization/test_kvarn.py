@@ -25,6 +25,7 @@ from vllm.v1.attention.backends.kvarn_attn import (
     _is_pure_kvarn_decode_step,
     _is_pure_qlen1_batch,
     _kvarn_block_table_numpy,
+    _kvarn_flush_index_materialization_requested,
     _kvarn_prefill_fp16_window_blocks,
     _kvarn_reclaimable_block_ids,
     _kvarn_walk_back_flush_blocks,
@@ -515,6 +516,188 @@ def test_cache_layout_is_frozen_at_attention_initialization(
         KVarNAttentionImpl.reset_process_state()
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "expected", "source"),
+    [
+        (None, "per_layer", "reference-default"),
+        ("per_layer", "per_layer", "KVARN_FLUSH_INDEX_MATERIALIZATION"),
+        ("shared", "shared", "KVARN_FLUSH_INDEX_MATERIALIZATION"),
+    ],
+)
+def test_flush_index_materialization_selector(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str | None,
+    expected: str,
+    source: str,
+) -> None:
+    if raw_value is None:
+        monkeypatch.delenv("KVARN_FLUSH_INDEX_MATERIALIZATION", raising=False)
+    else:
+        monkeypatch.setenv("KVARN_FLUSH_INDEX_MATERIALIZATION", raw_value)
+
+    assert _kvarn_flush_index_materialization_requested() == (expected, source)
+
+
+@pytest.mark.parametrize("raw_value", ["", "reference", "SHARED", " shared"])
+def test_flush_index_materialization_selector_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, raw_value: str
+) -> None:
+    monkeypatch.setenv("KVARN_FLUSH_INDEX_MATERIALIZATION", raw_value)
+    with pytest.raises(
+        ValueError,
+        match=(
+            "KVARN_FLUSH_INDEX_MATERIALIZATION must be exactly 'per_layer' or 'shared'"
+        ),
+    ):
+        _kvarn_flush_index_materialization_requested()
+
+
+def test_flush_index_materialization_selection_is_frozen_and_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_FLUSH_INDEX_MATERIALIZATION", raising=False)
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        with patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker:
+            assert KVarNAttentionImpl._select_flush_index_materialization() == (
+                "per_layer"
+            )
+            monkeypatch.setenv("KVARN_FLUSH_INDEX_MATERIALIZATION", "shared")
+            assert KVarNAttentionImpl._select_flush_index_materialization() == (
+                "per_layer"
+            )
+
+        marker.assert_called_once_with(
+            "[KVARN_FACTORY] selected_flush_index_materialization=%s; "
+            "selector_source=%s; immutable for engine lifetime",
+            "per_layer",
+            "reference-default",
+        )
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+@pytest.mark.parametrize(
+    ("selection", "second_group", "expected_materializations", "expected_reuses"),
+    [
+        pytest.param("per_layer", False, 4, 0, id="reference-per-layer"),
+        pytest.param("shared", False, 2, 1, id="shared-one-group"),
+        pytest.param("shared", True, 4, 0, id="shared-group-isolation"),
+    ],
+)
+def test_batched_flush_index_materialization_is_scoped_and_counted(
+    monkeypatch: pytest.MonkeyPatch,
+    selection: str,
+    second_group: bool,
+    expected_materializations: int,
+    expected_reuses: int,
+) -> None:
+    monkeypatch.setenv("KVARN_FLUSH_INDEX_MATERIALIZATION", selection)
+    monkeypatch.setenv("KVARN_FAST_FLUSH", "1")
+    KVarNAttentionImpl.reset_process_state()
+    cfg = SimpleNamespace(
+        head_dim=2,
+        group=2,
+        record_bytes=26,
+        k_packed_bytes=1,
+        v_packed_bytes=1,
+    )
+    first_group = ("cache-group-a",)
+    groups = (first_group, ("cache-group-b",) if second_group else first_group)
+
+    def make_impl(group_key: tuple):
+        return SimpleNamespace(
+            kvarn_config=cfg,
+            num_kv_heads=1,
+            _group_key=group_key,
+            _tail_K_pool=torch.zeros(3, 2, 1, 2),
+            _tail_V_pool=torch.zeros(3, 2, 1, 2),
+            _tails={1: object(), 3: object()},
+            _kvarn_cache_layout="natural",
+        )
+
+    impls = tuple(make_impl(group_key) for group_key in groups)
+    caches = tuple(torch.full((4, 1, 26), 255, dtype=torch.uint8) for _ in impls)
+    for group_key in set(groups):
+        KVarNAttentionImpl._block_to_slot_dict[group_key] = {1: 0, 3: 2}
+
+    flush_pairs = [
+        (impl, block_id, cache)
+        for impl, cache in zip(impls, caches, strict=True)
+        for block_id in (1, 3)
+    ]
+    real_as_tensor = torch.as_tensor
+    materialized_host_indices: list[tuple[int, ...]] = []
+
+    def counted_as_tensor(values, *args, **kwargs):
+        materialized_host_indices.append(tuple(values))
+        return real_as_tensor(values, *args, **kwargs)
+
+    def fake_sinkhorn_pack(K_tiles, V_tiles, config, *, cache_layout):
+        del V_tiles, cache_layout
+        rows = K_tiles.shape[0]
+
+        def half(width: int) -> torch.Tensor:
+            return torch.zeros((rows, width), dtype=torch.float16)
+
+        return (
+            {
+                "q_packed_uint8": torch.zeros(
+                    (rows, config.k_packed_bytes), dtype=torch.uint8
+                ),
+                "s_col_K": half(config.head_dim),
+                "zp_K": half(config.head_dim),
+                "s_row_K": half(config.group),
+            },
+            {
+                "q_packed_uint8": torch.zeros(
+                    (rows, config.v_packed_bytes), dtype=torch.uint8
+                ),
+                "s_col_V": half(config.head_dim),
+                "s_row_V": half(config.group),
+                "zp_V": half(config.group),
+            },
+        )
+
+    try:
+        with (
+            patch.object(torch, "as_tensor", side_effect=counted_as_tensor),
+            patch(
+                "vllm.v1.attention.backends.kvarn_attn._sinkhorn_pack_kv",
+                side_effect=fake_sinkhorn_pack,
+            ),
+            patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker,
+        ):
+            KVarNAttentionImpl._batched_flush(flush_pairs)
+
+        assert len(materialized_host_indices) == expected_materializations
+        assert KVarNAttentionImpl.flush_index_materialization_counters() == {
+            "flush_calls": 1,
+            "layer_batches": 2,
+            "schedule_groups": expected_materializations // 2,
+            "device_index_tensor_materializations": expected_materializations,
+            "shared_layer_reuses": expected_reuses,
+        }
+        marker.assert_any_call(
+            "[KVARN_FLUSH_INDEX] selected=%s; first_flush_layer_batches=%d; "
+            "first_flush_schedule_groups=%d; "
+            "first_flush_device_index_tensor_materializations=%d; "
+            "first_flush_shared_layer_reuses=%d",
+            selection,
+            2,
+            expected_materializations // 2,
+            expected_materializations,
+            expected_reuses,
+        )
+        for impl, cache in zip(impls, caches, strict=True):
+            assert not impl._tails
+            assert torch.count_nonzero(cache[1]) == 0
+            assert torch.count_nonzero(cache[3]) == 0
+            assert torch.all(cache[[0, 2]] == 255)
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
 def test_b70_q6_split_policy_is_frozen_and_reported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -594,6 +777,8 @@ def test_reset_process_state_releases_previous_model_generation():
         KVarNAttentionImpl._is_sink_t_per_device[mirror_key] = torch.ones(1)
         KVarNAttentionImpl._kernel_warmed.add(("decode", device))
         KVarNAttentionImpl._tiles_dumped = True
+        KVarNAttentionImpl._flush_index_materialization = "shared"
+        KVarNAttentionImpl._flush_index_counters["flush_calls"] = 3
         for mapping in _shared_q_output_maps():
             mapping[scratch_key] = torch.ones(1)
         KVarNAttentionImpl._shared_native_decode_scratch[scratch_key] = (
@@ -626,6 +811,14 @@ def test_reset_process_state_releases_previous_model_generation():
         assert all(not mapping for mapping in mappings)
         assert not KVarNAttentionImpl._all_impls
         assert not KVarNAttentionImpl._kernel_warmed
+        assert KVarNAttentionImpl._flush_index_materialization is None
+        assert KVarNAttentionImpl.flush_index_materialization_counters() == {
+            "flush_calls": 0,
+            "layer_batches": 0,
+            "schedule_groups": 0,
+            "device_index_tensor_materializations": 0,
+            "shared_layer_reuses": 0,
+        }
         assert KVarNAttentionImpl._tiles_dumped is False
     finally:
         KVarNAttentionImpl.reset_process_state()
