@@ -45,6 +45,9 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode"):
         softmax_scale: float,
         unrotate_output: bool = False,
         write_bf16_output: bool = False,
+        num_kv_splits: int = 0,
+        kernel_variant: int = 0,
+        dpas_layout: bool = False,
     ) -> None:
         return
 
@@ -68,6 +71,9 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch"):
         softmax_scale: float,
         unrotate_output: bool = False,
         write_bf16_output: bool = False,
+        num_kv_splits: int = 0,
+        kernel_variant: int = 0,
+        dpas_layout: bool = False,
     ) -> None:
         return
 
@@ -86,6 +92,19 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_materialize_packed_kv"):
         key_output: torch.Tensor,
         value_output: torch.Tensor,
         max_seq_len: int,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_dequant"):
+
+    @register_fake("_vllm_fa2_C::kvarn_dequant")
+    def _kvarn_dequant_fake(
+        packed_cache: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        dpas_layout: bool = False,
     ) -> None:
         return
 
@@ -101,6 +120,7 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_scatter"):
         tail_key: torch.Tensor,
         tail_value: torch.Tensor,
         group: int,
+        dpas_layout: bool = False,
     ) -> None:
         return
 

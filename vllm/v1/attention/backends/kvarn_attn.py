@@ -75,11 +75,17 @@ from vllm.v1.attention.ops.kvarn_store import (
     kvarn_store_tile_v_batch_from_sinkhorn,
 )
 from vllm.v1.attention.ops.triton_kvarn_decode import (
+    KVARN_CACHE_LAYOUT_NATURAL,
+    KVARN_CACHE_LAYOUT_XE2_DPAS,
     _kvarn_scatter_store_kernel,
     _require_kvarn_dpas_reader,
+    kvarn_cache_layout_requested,
     kvarn_decode_attention,
-    kvarn_dpas_layout_requested,
+    kvarn_native_decode_abi_supported,
+    kvarn_native_kernel_variant_requested,
     kvarn_native_layer_selected,
+    kvarn_native_layout_abi_supported,
+    kvarn_native_split_policy_requested,
     kvarn_native_store_supported,
 )
 from vllm.v1.attention.ops.triton_kvarn_sinkhorn import kvarn_sinkhorn_triton
@@ -211,16 +217,20 @@ def _build_hadamard(d: int, device: torch.device) -> torch.Tensor:
     return _hadamard_cached(d, str(torch.device(device)))
 
 
-def _kvarn_dpas_layout_for_config(cfg) -> bool:
-    if not kvarn_dpas_layout_requested():
-        return False
+def _resolve_kvarn_cache_layout(cfg) -> str:
+    """Resolve and validate the immutable packed-cache layout for an engine."""
+    layout = kvarn_cache_layout_requested()
+    if layout == KVARN_CACHE_LAYOUT_NATURAL:
+        return layout
+    if layout != KVARN_CACHE_LAYOUT_XE2_DPAS:
+        raise RuntimeError(f"Unsupported KVarN cache layout: {layout}")
     actual = (cfg.head_dim, cfg.group, cfg.key_bits, cfg.value_bits)
     if actual != (256, 128, 4, 4):
         raise RuntimeError(
-            "KVARN_NATIVE_XPU_DPAS_LAYOUT=1 requires D256/G128/K4V4; "
+            "The xe2_dpas KVarN cache layout requires D256/G128/K4V4; "
             f"got D{actual[0]}/G{actual[1]}/K{actual[2]}V{actual[3]}"
         )
-    return True
+    return layout
 
 
 def _use_kvarn_fused_verify(
@@ -242,7 +252,7 @@ def _use_kvarn_fused_verify(
     )
 
 
-def _sinkhorn_pack_kv(K_tiles, V_tiles, cfg):
+def _sinkhorn_pack_kv(K_tiles, V_tiles, cfg, *, cache_layout: str):
     """Sinkhorn-balance + pack a batch of K and V tiles into int4 stores.
 
     K_tiles is [N, D, group] (absorb axis = channel), V_tiles is [N, group, D]
@@ -252,7 +262,12 @@ def _sinkhorn_pack_kv(K_tiles, V_tiles, cfg):
     [R, C] — kvarn_sinkhorn_triton takes R, C as per-launch constexpr — so K and V
     must be balanced in SEPARATE launches. (A single torch.cat here assumed square
     and broke at head_dim=256.)"""
-    dpas_layout = _kvarn_dpas_layout_for_config(cfg)
+    if cache_layout not in (
+        KVARN_CACHE_LAYOUT_NATURAL,
+        KVARN_CACHE_LAYOUT_XE2_DPAS,
+    ):
+        raise RuntimeError(f"Unsupported KVarN cache layout: {cache_layout}")
+    dpas_layout = cache_layout == KVARN_CACHE_LAYOUT_XE2_DPAS
     if K_tiles.shape[1:] == V_tiles.shape[1:]:
         nk = K_tiles.shape[0]
         bal, sc, sr = kvarn_sinkhorn_triton(
@@ -1541,6 +1556,24 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         )
 
         self.kvarn_config = KVarNConfig.from_cache_dtype(kv_cache_dtype, head_size)
+        self._kvarn_cache_layout = _resolve_kvarn_cache_layout(self.kvarn_config)
+        self._kvarn_dpas_layout = (
+            self._kvarn_cache_layout == KVARN_CACHE_LAYOUT_XE2_DPAS
+        )
+        self._kvarn_native_max_splits = kvarn_native_split_policy_requested()
+        (
+            self._kvarn_native_kernel_variant_name,
+            self._kvarn_native_kernel_variant,
+        ) = kvarn_native_kernel_variant_requested()
+        logger.info_once(
+            "[KVARN_FACTORY] selected_cache_layout=%s; "
+            "selected_kernel_variant=%s(%d); max_decode_splits=%d; "
+            "immutable for engine lifetime",
+            self._kvarn_cache_layout,
+            self._kvarn_native_kernel_variant_name,
+            self._kvarn_native_kernel_variant,
+            self._kvarn_native_max_splits,
+        )
 
         # Per-block fp16 tail buffer (in-progress tiles). Keyed by block_id.
         # Stage 3b uses a Python dict — small concurrent batch sizes only.
@@ -1644,7 +1677,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         native_env = (
             os.environ.get("KVARN_NATIVE_XPU"),
             os.environ.get("KVARN_NATIVE_XPU_PERSISTENT_SCRATCH"),
-            os.environ.get("KVARN_NATIVE_XPU_SPLITS"),
         )
         required_blocks = max(
             num_blocks_hint,
@@ -1801,7 +1833,14 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # one-time cost lands inside a small measured window). Compile them here,
         # once per shape/config, at pool-init time (outside any captured region)
         # using the exact tile shapes the flush uses, so serving never pays it.
-        warm_key = (device, cfg.head_dim, cfg.group, cfg.key_bits, cfg.value_bits)
+        warm_key = (
+            device,
+            cfg.head_dim,
+            cfg.group,
+            cfg.key_bits,
+            cfg.value_bits,
+            self._kvarn_cache_layout,
+        )
         if warm_key not in cls._kernel_warmed:
             k_dummy = torch.zeros(
                 1, cfg.head_dim, cfg.group, dtype=torch.float16, device=device
@@ -1809,7 +1848,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             v_dummy = torch.zeros(
                 1, cfg.group, cfg.head_dim, dtype=torch.float16, device=device
             )
-            _sinkhorn_pack_kv(k_dummy, v_dummy, cfg)
+            _sinkhorn_pack_kv(
+                k_dummy,
+                v_dummy,
+                cfg,
+                cache_layout=self._kvarn_cache_layout,
+            )
             cls._kernel_warmed.add(warm_key)
 
         # Decode-kernel warmup. The DECODE kernels (fused
@@ -1904,11 +1948,13 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             and cfg.record_bytes >= 35_072
             and cfg.record_bytes % 4 == 0
             and int(getattr(self, "sliding_window", 0) or 0) == 0
-            and hasattr(torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch")
+            and kvarn_native_decode_abi_supported(True)
         )
         native_key = None
         if use_native_scratch:
-            native_splits = kvarn_native_split_count(self._max_model_len)
+            native_splits = kvarn_native_split_count(
+                self._max_model_len, self._kvarn_native_max_splits
+            )
             native_batch = min(max(self._max_num_seqs, 1), 12)
             native_key = (device, D, Hk, native_batch, native_splits)
             if native_key not in cls._shared_native_decode_scratch:
@@ -2002,7 +2048,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._pool_ready_env = (
             os.environ.get("KVARN_NATIVE_XPU"),
             os.environ.get("KVARN_NATIVE_XPU_PERSISTENT_SCRATCH"),
-            os.environ.get("KVARN_NATIVE_XPU_SPLITS"),
         )
 
     def _warm_decode_kernels(self, device: torch.device) -> None:
@@ -2272,7 +2317,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             V_S_COL_OFFSET=cfg.v_s_col_offset,
             V_S_ROW_OFFSET=cfg.v_s_row_offset,
             V_ZP_OFFSET=cfg.v_zp_offset,
-            DPAS_LAYOUT=kvarn_dpas_layout_requested(),
+            DPAS_LAYOUT=self._kvarn_dpas_layout,
             num_warps=4,
             num_stages=2,
         )
@@ -2393,7 +2438,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             K: [group, num_kv_heads, head_dim] fp16
             V: [group, num_kv_heads, head_dim] fp16
         """
-        _require_kvarn_dpas_reader(False, "Python dequantizer")
+        _require_kvarn_dpas_reader(self._kvarn_dpas_layout, False, "Python dequantizer")
         cfg = self.kvarn_config
         group = cfg.group
         D = cfg.head_dim
@@ -2483,7 +2528,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
         # Sinkhorn + pack (fused launch when square head_dim==group, else
         # separate K/V launches — see _sinkhorn_pack_kv).
-        K_out, V_out = _sinkhorn_pack_kv(K_tiles, V_tiles, cfg)
+        K_out, V_out = _sinkhorn_pack_kv(
+            K_tiles,
+            V_tiles,
+            cfg,
+            cache_layout=self._kvarn_cache_layout,
+        )
         Hk = self.num_kv_heads
 
         for h in range(Hk):
@@ -2565,7 +2615,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 # Tiles: K [N, D, G] (absorb=channel), V [N, G, D] (absorb=token).
                 K_tiles = K_rot.permute(0, 2, 3, 1).reshape(nB * Hk, D, G)
                 V_tiles = V_rot.permute(0, 2, 1, 3).reshape(nB * Hk, G, D)
-                K_out, V_out = _sinkhorn_pack_kv(K_tiles, V_tiles, cfg)
+                K_out, V_out = _sinkhorn_pack_kv(
+                    K_tiles,
+                    V_tiles,
+                    cfg,
+                    cache_layout=impl._kvarn_cache_layout,
+                )
                 # Assemble the packed cache record [nB*Hk, tile_bytes] by
                 # concatenating fields in config-offset order (fp16 scales
                 # byte-reinterpreted to uint8), then pad to record_bytes.
@@ -2676,7 +2731,17 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             del K_stack, V_stack
             # Sinkhorn + pack (fused when square head_dim==group, else separate
             # K/V launches for non-square head_dim=256 — see _sinkhorn_pack_kv).
-            K_out, V_out = _sinkhorn_pack_kv(K_tiles, V_tiles, cfg)
+            cache_layout = chunk[0][0]._kvarn_cache_layout
+            if any(impl._kvarn_cache_layout != cache_layout for impl, *_ in chunk):
+                raise RuntimeError(
+                    "Cannot batch KVarN flushes across different cache layouts"
+                )
+            K_out, V_out = _sinkhorn_pack_kv(
+                K_tiles,
+                V_tiles,
+                cfg,
+                cache_layout=cache_layout,
+            )
             del K_tiles, V_tiles
             # Distribute packed results to each (layer, block, head) cache slot.
             for i, (impl, bid, kvc, _) in enumerate(chunk):
@@ -2749,8 +2814,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 ),
                 is_capturing=is_capturing,
                 op_available=(
-                    hasattr(torch.ops._vllm_fa2_C, "kvarn_decode")
-                    and hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_scatter")
+                    kvarn_native_decode_abi_supported(False)
+                    and kvarn_native_layout_abi_supported("kvarn_hadamard_scatter")
                 ),
             )
             and (
@@ -2775,6 +2840,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 self._tail_K_pool,
                 self._tail_V_pool,
                 cfg.group,
+                self._kvarn_dpas_layout,
             )
             return
 
@@ -3327,7 +3393,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # continuations), where one materialization amortizes over thousands
         # of query tokens. KVARN_FUSED_VERIFY=0 forces materialize always.
         _group = self.kvarn_config.group
-        dpas_layout = _kvarn_dpas_layout_for_config(self.kvarn_config)
+        dpas_layout = self._kvarn_dpas_layout
         if _use_kvarn_fused_verify(
             max_query_len=md.max_query_len,
             max_seq_len=int(md.max_seq_len),
@@ -3337,14 +3403,14 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         ):
             return self._fused_verify_path(q, kv_cache, md)
         if not _HAS_FLASH_ATTN or self.head_size > 256 or self._fa_K_buf is None:
-            _require_kvarn_dpas_reader(False, "slow multi-query decode")
+            _require_kvarn_dpas_reader(dpas_layout, False, "slow multi-query decode")
             return self._decode_path_slow(q, kv_cache, md)
 
         seq_lens = md.seq_lens[:B].to(torch.int32)
         cu_k = F.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0))
         total_k = int(cu_k[-1].item())
         if total_k <= 0 or total_k > self._fa_K_buf.shape[0]:
-            _require_kvarn_dpas_reader(False, "slow multi-query decode")
+            _require_kvarn_dpas_reader(dpas_layout, False, "slow multi-query decode")
             return self._decode_path_slow(q, kv_cache, md)
 
         cfg = self.kvarn_config
