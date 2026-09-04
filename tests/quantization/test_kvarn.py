@@ -26,10 +26,13 @@ from vllm.v1.attention.backends.kvarn_attn import (
     _is_pure_qlen1_batch,
     _kvarn_block_table_numpy,
     _kvarn_flush_index_materialization_requested,
+    _kvarn_flush_writer_requested,
+    _kvarn_native_balanced_writer_supported,
     _kvarn_prefill_fp16_window_blocks,
     _kvarn_reclaimable_block_ids,
     _kvarn_walk_back_flush_blocks,
     _KVarNMetadataStageRing,
+    _launch_kvarn_native_balanced_writer,
     _protect_kvarn_prefill_window_blocks,
     _reconcile_kvarn_sink_ownership,
     _resolve_kvarn_cache_layout,
@@ -884,6 +887,164 @@ def test_flush_index_materialization_selection_is_frozen_and_logged(
             "per_layer",
             "reference-default",
         )
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected", "source"),
+    [
+        (None, "reference", "reference-default"),
+        ("reference", "reference", "KVARN_FLUSH_WRITER"),
+        ("native_xe2", "native_xe2", "KVARN_FLUSH_WRITER"),
+    ],
+)
+def test_flush_writer_selector(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str | None,
+    expected: str,
+    source: str,
+) -> None:
+    if raw_value is None:
+        monkeypatch.delenv("KVARN_FLUSH_WRITER", raising=False)
+    else:
+        monkeypatch.setenv("KVARN_FLUSH_WRITER", raw_value)
+
+    assert _kvarn_flush_writer_requested() == (expected, source)
+
+
+@pytest.mark.parametrize("raw_value", ["", "native", "NATIVE_XE2", " native_xe2"])
+def test_flush_writer_selector_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, raw_value: str
+) -> None:
+    monkeypatch.setenv("KVARN_FLUSH_WRITER", raw_value)
+    with pytest.raises(
+        ValueError,
+        match="KVARN_FLUSH_WRITER must be exactly 'reference' or 'native_xe2'",
+    ):
+        _kvarn_flush_writer_requested()
+
+
+def test_flush_writer_selection_is_frozen_and_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_FLUSH_WRITER", raising=False)
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        with patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker:
+            assert KVarNAttentionImpl._select_flush_writer() == "reference"
+            monkeypatch.setenv("KVARN_FLUSH_WRITER", "native_xe2")
+            assert KVarNAttentionImpl._select_flush_writer() == "reference"
+
+        marker.assert_called_once_with(
+            "[KVARN_FACTORY] selected_flush_writer=%s; selector_source=%s; "
+            "immutable for engine lifetime",
+            "reference",
+            "reference-default",
+        )
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({}, True),
+        ({"cache_layout": "natural"}, False),
+        ({"head_dim": 128}, False),
+        ({"group": 64}, False),
+        ({"key_bits": 2}, False),
+        ({"value_bits": 2}, False),
+        ({"num_kv_heads": 8}, False),
+        ({"record_bytes": 35_071}, False),
+        ({"op_available": False}, False),
+        ({"rtn_quantile": 0.005}, False),
+    ],
+)
+def test_native_balanced_writer_requires_exact_cache_abi(override, expected) -> None:
+    values = {
+        "cache_layout": "xe2_dpas",
+        "head_dim": 256,
+        "group": 128,
+        "key_bits": 4,
+        "value_bits": 4,
+        "num_kv_heads": 4,
+        "record_bytes": 65_536,
+        "op_available": True,
+        "rtn_quantile": 0.0,
+    }
+    values.update(override)
+    assert _kvarn_native_balanced_writer_supported(**values) is expected
+
+
+def test_native_balanced_writer_dispatch_preserves_tensor_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    balanced = tuple(torch.empty(1) for _ in range(6))
+    block_ids = torch.tensor([4, 1], dtype=torch.int64)
+    packed_cache = torch.empty(7, 4, 65_536, dtype=torch.uint8)
+    call = Mock()
+    fake_ops = SimpleNamespace(kvarn_pack_balanced_kv=call)
+    monkeypatch.setattr(kvarn_attn.torch.ops, "_vllm_fa2_C", fake_ops)
+
+    _launch_kvarn_native_balanced_writer(balanced, block_ids, packed_cache)
+
+    call.assert_called_once_with(*balanced, block_ids, packed_cache, True)
+
+
+def test_batched_flush_native_writer_bypasses_reference_record_assembly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    monkeypatch.setenv("KVARN_FLUSH_WRITER", "native_xe2")
+    # The legacy debug switch must not silently override an explicitly selected
+    # native writer.
+    monkeypatch.setenv("KVARN_FAST_FLUSH", "0")
+    KVarNAttentionImpl.reset_process_state()
+    group_key = ("native-writer-test",)
+    cfg = SimpleNamespace(
+        head_dim=256,
+        group=128,
+        record_bytes=65_536,
+        k_packed_bytes=16_384,
+        v_packed_bytes=16_384,
+    )
+    impl = SimpleNamespace(
+        kvarn_config=cfg,
+        num_kv_heads=4,
+        _group_key=group_key,
+        _tail_K_pool=torch.zeros(1, 128, 4, 256, dtype=torch.float16),
+        _tail_V_pool=torch.zeros(1, 128, 4, 256, dtype=torch.float16),
+        _tails={3: object()},
+        _kvarn_cache_layout="xe2_dpas",
+        _kvarn_flush_writer="native_xe2",
+    )
+    cache = torch.full((4, 4, 65_536), 0xA5, dtype=torch.uint8)
+    KVarNAttentionImpl._block_to_slot_dict[group_key] = {3: 0}
+    balanced = tuple(torch.empty(0) for _ in range(6))
+    launch = Mock()
+
+    try:
+        with (
+            patch.object(kvarn_attn, "_sinkhorn_balance_kv", return_value=balanced),
+            patch.object(
+                kvarn_attn,
+                "_sinkhorn_pack_kv",
+                side_effect=AssertionError("reference packer must not run"),
+            ),
+            patch.object(kvarn_attn, "_launch_kvarn_native_balanced_writer", launch),
+        ):
+            KVarNAttentionImpl._batched_flush([(impl, 3, cache)])
+
+        assert not impl._tails
+        launch.assert_called_once()
+        args = launch.call_args.args
+        assert args[0] is balanced
+        assert args[1].tolist() == [3]
+        assert args[2] is cache
     finally:
         KVarNAttentionImpl.reset_process_state()
 

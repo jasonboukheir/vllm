@@ -143,6 +143,23 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_qkv_scatter"):
         return
 
 
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_pack_balanced_kv"):
+
+    @register_fake("_vllm_fa2_C::kvarn_pack_balanced_kv")
+    def _kvarn_pack_balanced_kv_fake(
+        key_balanced: torch.Tensor,
+        key_sinkhorn_col: torch.Tensor,
+        key_sinkhorn_row: torch.Tensor,
+        value_balanced: torch.Tensor,
+        value_sinkhorn_col: torch.Tensor,
+        value_sinkhorn_row: torch.Tensor,
+        block_ids: torch.Tensor,
+        packed_cache: torch.Tensor,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
 if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard"):
 
     @register_fake("_vllm_fa2_C::kvarn_hadamard")
