@@ -29,7 +29,7 @@ from vllm.model_executor.determinism.batch_invariant import (
 )
 from vllm.model_executor.determinism.request_stable_linear import (
     apply_linear_by_request,
-    use_xpu_kvarn_request_stable_linears,
+    use_xpu_kvarn_request_stable_projection_rows,
 )
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -295,7 +295,7 @@ class LinearBase(PluggableLayer):
         self.disable_tp = disable_tp
         vllm_config = get_current_vllm_config_or_none()
         self._xpu_kvarn_request_stable = vllm_config is not None and (
-            use_xpu_kvarn_request_stable_linears(vllm_config)
+            use_xpu_kvarn_request_stable_projection_rows(vllm_config)
         )
         if disable_tp:
             self.tp_rank, self.tp_size = 0, 1

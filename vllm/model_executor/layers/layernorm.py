@@ -9,6 +9,7 @@ import torch.nn.functional as F
 # Import kernels
 import vllm.kernels  # noqa: F401
 from vllm import envs, ir
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
@@ -147,6 +148,17 @@ class GemmaRMSNorm(CustomOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            self._xpu_kvarn_request_stable_rmsnorm = False
+        else:
+            from vllm.model_executor.determinism.request_stable_linear import (
+                use_xpu_kvarn_request_stable_rmsnorm,
+            )
+
+            self._xpu_kvarn_request_stable_rmsnorm = (
+                use_xpu_kvarn_request_stable_rmsnorm(vllm_config)
+            )
 
     def forward_native(
         self,
@@ -176,6 +188,9 @@ class GemmaRMSNorm(CustomOp):
                 self.variance_epsilon,
                 residual=part_residual,
             )
+
+        if not self._xpu_kvarn_request_stable_rmsnorm:
+            return apply_once(x, residual)
 
         from vllm.model_executor.determinism.request_stable_linear import (
             apply_rms_norm_by_request,
@@ -207,7 +222,10 @@ class GemmaRMSNorm(CustomOp):
         # The fused XPU kernel bypasses the request-stable reduction used by
         # the scoped KVarN profile. Keep that profile on the invariant native
         # path whenever the model runner attached request boundaries.
-        if get_xpu_kvarn_request_slices() is not None:
+        if (
+            self._xpu_kvarn_request_stable_rmsnorm
+            and get_xpu_kvarn_request_slices() is not None
+        ):
             return self.forward_native(x, residual)
 
         import vllm._xpu_ops  # noqa: F401 registers torch.ops.vllm.xpu_gemma_rms_norm

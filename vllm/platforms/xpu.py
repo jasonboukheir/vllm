@@ -157,10 +157,10 @@ class XPUPlatform(Platform):
             XPU_KVARN_CANONICAL_LINEAR_ROWS,
             XPU_KVARN_REQUEST_SLICES_KEY,
             XPUKvarnRequestSlices,
-            use_xpu_kvarn_request_stable_linears,
+            use_xpu_kvarn_request_stable_context,
         )
 
-        if not use_xpu_kvarn_request_stable_linears(vllm_config):
+        if not use_xpu_kvarn_request_stable_context(vllm_config):
             return {}
         if not cls._kvarn_request_stable_xe2_validated:
             if not torch.ops._xpu_C.is_xe2_arch():
@@ -233,7 +233,7 @@ class XPUPlatform(Platform):
                 or any(value is not None for value in disallowed_spec_fields)
             ):
                 raise RuntimeError(
-                    "XPU KVarN request-stable linears require ordinary no-spec "
+                    "XPU KVarN request-stable operators require ordinary no-spec "
                     "GDN metadata"
                 )
 
