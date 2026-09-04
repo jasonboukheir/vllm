@@ -247,6 +247,7 @@ def test_native_kernel_variant_selection_is_named_and_fail_closed(
         ("q6_main_grf128", 10),
         ("q6_split_reducer_specialized", 11),
         ("q6_next_page_prefetch", 12),
+        ("q6_next_page_prefetch_split_reducer", 13),
     ],
 )
 def test_native_kernel_variant_factory_ids_are_stable(
@@ -270,6 +271,7 @@ def test_native_kernel_variant_factory_ids_are_stable(
         ("q6_main_grf128", 10),
         ("q6_split_reducer_specialized", 11),
         ("q6_next_page_prefetch", 12),
+        ("q6_next_page_prefetch_split_reducer", 13),
     ],
 )
 def test_native_experimental_variants_require_dpas_cache_layout(
@@ -294,6 +296,7 @@ def test_native_experimental_variants_require_dpas_cache_layout(
         ("q6_main_grf128", 10),
         ("q6_split_reducer_specialized", 11),
         ("q6_next_page_prefetch", 12),
+        ("q6_next_page_prefetch_split_reducer", 13),
     ],
 )
 def test_b70_q6_split_policy_requires_q6_kernel(name: str, variant: int) -> None:
@@ -313,7 +316,7 @@ def test_native_kernel_variant_five_remains_reserved() -> None:
 
 @pytest.mark.parametrize(
     ("name", "variant"),
-    [("q6_page_pair", 10), ("unknown", 9), ("baseline", 13)],
+    [("q6_page_pair", 10), ("unknown", 9), ("baseline", 14)],
 )
 def test_native_kernel_variant_validation_rejects_unregistered_pairs(
     name: str, variant: int
@@ -399,6 +402,7 @@ def test_page_pair_split_count_matches_cpp_k128_boundaries() -> None:
         kvarn_decode.KVARN_NATIVE_KERNEL_BASELINE,
         kvarn_decode.KVARN_NATIVE_KERNEL_Q6_SCALAR,
         kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
+        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
     ],
 )
 def test_k64_variants_keep_established_split_boundaries(kernel_variant: int) -> None:
@@ -406,7 +410,7 @@ def test_k64_variants_keep_established_split_boundaries(kernel_variant: int) -> 
     assert kvarn_native_split_count(1985, 32, kernel_variant=kernel_variant) == 32
 
 
-@pytest.mark.parametrize("kernel_variant", [5, 13, -1])
+@pytest.mark.parametrize("kernel_variant", [5, 14, -1])
 def test_native_split_count_rejects_reserved_or_unknown_variants(
     kernel_variant: int,
 ) -> None:
