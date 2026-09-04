@@ -426,6 +426,12 @@ class Attention(nn.Module, AttentionLayerBase):
         # which group an impl belongs to by matching the builder's layer_names.
         with contextlib.suppress(Exception):
             self.impl.layer_name = prefix  # type: ignore[attr-defined]
+        configure_qkv_update = getattr(
+            self.impl, "configure_fused_qkv_cache_update", None
+        )
+        self.use_fused_qkv_cache_update = bool(
+            configure_qkv_update(prefix) if configure_qkv_update is not None else False
+        )
         self.backend = AttentionBackendEnum[self.attn_backend.get_name()]
         self.dtype = dtype
 
@@ -534,9 +540,6 @@ class Attention(nn.Module, AttentionLayerBase):
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
         kv_cache_dummy_dep = None
-        use_qkv_cache_update = bool(
-            getattr(self.impl, "use_fused_qkv_cache_update", False)
-        )
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
             if (
@@ -545,7 +548,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 and key is not None
                 and value is not None
             ):
-                if use_qkv_cache_update:
+                if self.use_fused_qkv_cache_update:
                     kv_cache_dummy_dep = unified_qkv_cache_update(
                         query, key, value, self.layer_name
                     )
@@ -570,7 +573,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 and key is not None
                 and value is not None
             ):
-                if use_qkv_cache_update:
+                if self.use_fused_qkv_cache_update:
                     kv_cache_dummy_dep = torch.ops.vllm.unified_qkv_cache_update(
                         query, key, value, encoded
                     )
@@ -759,6 +762,7 @@ direct_register_custom_op(
 )
 
 
+@eager_break_during_capture
 def unified_qkv_cache_update(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -798,6 +802,7 @@ direct_register_custom_op(
     op_func=unified_qkv_cache_update,
     fake_impl=unified_qkv_cache_update_fake,
     mutates_args=[],
+    tags=(torch.Tag.cudagraph_unsafe,),
 )
 
 

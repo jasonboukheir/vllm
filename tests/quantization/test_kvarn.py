@@ -125,6 +125,8 @@ def test_native_store_requires_a_pure_qlen1_decode(override, expected):
 
 def _fused_frontend_impl() -> KVarNAttentionImpl:
     impl = object.__new__(KVarNAttentionImpl)
+    impl._kvarn_frontend_variant = "qkv_scatter"
+    impl._kvarn_frontend_bound = True
     impl.use_fused_qkv_cache_update = True
     impl._pending_fused_qkv_signature = None
     impl.num_heads = 24
@@ -182,6 +184,22 @@ def test_fused_qkv_frontend_eligibility_fails_closed(
     assert not impl._native_qkv_scatter_eligible(
         layer, query, key, value, slots, _pure_decode_metadata(tokens=1)
     )
+    assert not impl._native_qkv_scatter_eligible(
+        layer, query, key, value, torch.tensor(0, dtype=torch.int64), metadata
+    )
+    assert not impl._native_qkv_scatter_eligible(
+        layer, query, key, value, slots.to(torch.int32), metadata
+    )
+    impl._block_to_slot_t = None
+    assert not impl._native_qkv_scatter_eligible(
+        layer, query, key, value, slots, metadata
+    )
+    impl._block_to_slot_t = torch.zeros(2, dtype=torch.int32)
+    impl._tail_V_pool = None
+    assert not impl._native_qkv_scatter_eligible(
+        layer, query, key, value, slots, metadata
+    )
+    impl._tail_V_pool = torch.empty_like(impl._tail_K_pool)
     impl._q_rot_fp16_buf = torch.empty(47, 256, dtype=torch.float16)
     assert not impl._native_qkv_scatter_eligible(
         layer, query, key, value, slots, metadata
@@ -240,6 +258,21 @@ def test_fused_qkv_frontend_unsupported_step_uses_reference_store(
     assert impl._pending_fused_qkv_signature is None
 
 
+def test_reference_store_invalidates_stale_fused_rotation() -> None:
+    impl = _fused_frontend_impl()
+    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
+    metadata = _pure_decode_metadata()
+    impl._pending_fused_qkv_signature = impl._fused_qkv_signature(query, metadata)
+    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
+    key = torch.empty(0, 4, 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    slots = torch.empty(0, dtype=torch.int64)
+
+    impl.do_kv_cache_update(SimpleNamespace(), key, value, cache, slots)
+
+    assert impl._pending_fused_qkv_signature is None
+
+
 def test_unified_qkv_cache_update_passes_query_without_changing_cache_abi(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -267,6 +300,42 @@ def test_unified_qkv_cache_update_passes_query_without_changing_cache_abi(
     assert dependency.dtype == key.dtype
 
 
+def test_unified_qkv_cache_update_is_cudagraph_unsafe_and_has_fake_dispatch():
+    import vllm.model_executor.layers.attention.attention  # noqa: F401
+
+    op = torch.ops.vllm.unified_qkv_cache_update.default
+    assert torch.Tag.cudagraph_unsafe in op.tags
+    query = torch.empty(2, 24, 256, dtype=torch.bfloat16, device="meta")
+    key = torch.empty(2, 4, 256, dtype=torch.bfloat16, device="meta")
+    value = torch.empty_like(key)
+
+    dependency = op(query, key, value, "model.layers.0.self_attn")
+
+    assert dependency.device.type == "meta"
+    assert dependency.shape == (0,)
+    assert dependency.dtype == key.dtype
+
+
+def test_reference_frontend_skips_fused_signature_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = _fused_frontend_impl()
+    impl.use_fused_qkv_cache_update = False
+    impl._pending_fused_qkv_signature = None
+    monkeypatch.setattr(impl, "_record_cache_view", lambda cache: cache)
+    monkeypatch.setattr(impl, "_ensure_pool", Mock())
+    consume = Mock(side_effect=AssertionError("reference frontend built a signature"))
+    monkeypatch.setattr(impl, "_consume_fused_qkv_rotation", consume)
+    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
+    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+
+    output = impl.forward(SimpleNamespace(), query, key, value, torch.empty(0), None)
+
+    consume.assert_not_called()
+    assert output.shape == (2, 24 * 256)
+
+
 def test_attention_routes_selected_frontend_through_qkv_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -279,7 +348,8 @@ def test_attention_routes_selected_frontend_through_qkv_update(
     attention.num_kv_heads = 4
     attention.head_size = 256
     attention.head_size_v = 256
-    attention.impl = SimpleNamespace(use_fused_qkv_cache_update=True)
+    attention.impl = SimpleNamespace()
+    attention.use_fused_qkv_cache_update = True
     attention.use_direct_call = True
     attention.attn_backend = SimpleNamespace(forward_includes_kv_cache_update=False)
     attention.kv_sharing_target_layer_name = None
@@ -724,7 +794,7 @@ def test_fused_qkv_frontend_is_frozen_and_reported(
                 "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
                 return_value=2,
             ),
-            patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker,
+            patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as marker,
         ):
             impl = KVarNAttentionImpl(
                 num_heads=24,
@@ -733,19 +803,26 @@ def test_fused_qkv_frontend_is_frozen_and_reported(
                 num_kv_heads=4,
                 kv_cache_dtype="kvarn_k4v4_g128",
             )
+            selected = impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
 
         assert impl._kvarn_frontend_variant == "qkv_scatter"
+        assert selected
         assert impl.use_fused_qkv_cache_update
         marker.assert_any_call(
-            "[KVARN_FRONTEND] selected=%s; native_op=%s; "
-            "fallback=reference; immutable for engine lifetime",
+            "[KVARN_FRONTEND] configured=%s; layer=%s; selected=%s; "
+            "native_op=%s; fallback=reference; immutable for engine lifetime",
             "qkv_scatter",
+            "model.layers.0.self_attn",
+            True,
             "kvarn_hadamard_qkv_scatter",
         )
 
         monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "reference")
         assert impl._kvarn_frontend_variant == "qkv_scatter"
+        assert impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
         assert impl.use_fused_qkv_cache_update
+        with pytest.raises(RuntimeError, match="layer binding is immutable"):
+            impl.configure_fused_qkv_cache_update("model.layers.1.self_attn")
     finally:
         KVarNAttentionImpl.reset_process_state()
 
@@ -930,6 +1007,19 @@ def test_batched_flush_index_materialization_is_scoped_and_counted(
             assert torch.all(cache[[0, 2]] == 255)
     finally:
         KVarNAttentionImpl.reset_process_state()
+
+
+def test_fused_qkv_frontend_layer_filter_freezes_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = _fused_frontend_impl()
+    impl._kvarn_frontend_bound = False
+    impl.use_fused_qkv_cache_update = False
+    monkeypatch.setenv("KVARN_NATIVE_XPU_LAYER", "model.layers.1.self_attn")
+
+    assert not impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
+    monkeypatch.setenv("KVARN_NATIVE_XPU_LAYER", "model.layers.0.self_attn")
+    assert not impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
 
 
 def test_b70_q6_split_policy_is_frozen_and_reported(
