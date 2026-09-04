@@ -296,12 +296,28 @@ def _kvarn_native_scratch_views(
     num_query_heads: int,
     num_splits: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Slice capacity-sized scratch to the custom operator's exact ABI."""
+    """View capacity-sized scratch through the custom operator's exact ABI.
+
+    Narrowing an inner dimension of the capacity allocation leaves gaps between
+    batches and is therefore non-contiguous whenever ``num_splits`` is below
+    the allocation maximum.  The scratch contents are disposable, so remap a
+    contiguous prefix of each allocation instead.  ``view`` deliberately fails
+    rather than copying if a future caller supplies non-contiguous storage.
+    """
     temp_output, exp_sums, max_logits = native_scratch
+    head_dim = temp_output.shape[-1]
+    temp_elements = batch_size * num_query_heads * num_splits * head_dim
+    stats_elements = batch_size * num_query_heads * num_splits
     return (
-        temp_output[:batch_size, : num_query_heads * num_splits],
-        exp_sums[:batch_size, :, :num_splits],
-        max_logits[:batch_size, :, :num_splits],
+        temp_output.view(-1)[:temp_elements].view(
+            batch_size, num_query_heads * num_splits, head_dim
+        ),
+        exp_sums.view(-1)[:stats_elements].view(
+            batch_size, num_query_heads, num_splits
+        ),
+        max_logits.view(-1)[:stats_elements].view(
+            batch_size, num_query_heads, num_splits
+        ),
     )
 
 

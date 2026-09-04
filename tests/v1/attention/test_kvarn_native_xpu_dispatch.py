@@ -367,20 +367,54 @@ def test_b70_q6_split_policy_preserves_short_context_collapse(
     assert kvarn_native_split_count(1024, batch_size=2) == 16
 
 
-def test_batch_aware_policy_slices_capacity_scratch_to_exact_invocation_shape() -> None:
+def test_batch_aware_policy_views_capacity_scratch_contiguously_for_every_batch() -> (
+    None
+):
     scratch = (
-        torch.empty((12, 24 * 32, 256), device="meta"),
-        torch.empty((12, 24, 32), device="meta"),
-        torch.empty((12, 24, 32), device="meta"),
+        torch.empty((12, 24 * 32, 256), dtype=torch.float16),
+        torch.empty((12, 24, 32), dtype=torch.float32),
+        torch.empty((12, 24, 32), dtype=torch.float32),
     )
+    expected_by_batch = {
+        1: 32,
+        2: 16,
+        3: 8,
+        4: 8,
+        5: 4,
+        6: 4,
+        7: 4,
+        8: 4,
+        9: 2,
+        10: 2,
+        11: 2,
+        12: 2,
+    }
 
-    temp_output, exp_sums, max_logits = _kvarn_native_scratch_views(
-        scratch, batch_size=4, num_query_heads=24, num_splits=8
-    )
+    for batch_size, expected_splits in expected_by_batch.items():
+        num_splits = kvarn_native_split_count(
+            4096,
+            32,
+            batch_size=batch_size,
+            split_policy="b70_q6",
+        )
+        assert num_splits == expected_splits
 
-    assert temp_output.shape == (4, 24 * 8, 256)
-    assert exp_sums.shape == (4, 24, 8)
-    assert max_logits.shape == (4, 24, 8)
+        temp_output, exp_sums, max_logits = _kvarn_native_scratch_views(
+            scratch,
+            batch_size=batch_size,
+            num_query_heads=24,
+            num_splits=num_splits,
+        )
+
+        assert temp_output.shape == (batch_size, 24 * num_splits, 256)
+        assert exp_sums.shape == (batch_size, 24, num_splits)
+        assert max_logits.shape == (batch_size, 24, num_splits)
+        assert temp_output.is_contiguous()
+        assert exp_sums.is_contiguous()
+        assert max_logits.is_contiguous()
+        assert temp_output.data_ptr() == scratch[0].data_ptr()
+        assert exp_sums.data_ptr() == scratch[1].data_ptr()
+        assert max_logits.data_ptr() == scratch[2].data_ptr()
 
 
 def test_b70_q6_split_policy_rejects_ambiguous_or_unsupported_selection(
