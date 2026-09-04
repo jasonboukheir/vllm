@@ -78,6 +78,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     KVARN_CACHE_LAYOUT_NATURAL,
     KVARN_CACHE_LAYOUT_XE2_DPAS,
     KVARN_FRONTEND_QKV_SCATTER,
+    KVARN_FRONTEND_QKV_SCATTER_INLINE,
     KVARN_PREFILL_STORE_HADAMARD_SCATTER,
     _kvarn_scatter_store_kernel,
     _require_kvarn_dpas_reader,
@@ -1663,6 +1664,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
     supports_quant_query_input: bool = False
     use_fused_qkv_cache_update: bool = False
+    use_inline_qkv_cache_update: bool = False
     _kvarn_frontend_bound: bool = False
 
     # Shared decode scratch — these are per-step throwaway buffers used by
@@ -1937,6 +1939,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._kvarn_frontend_variant = kvarn_frontend_variant_requested()
         self._kvarn_prefill_store_variant = kvarn_prefill_store_variant_requested()
         self.use_fused_qkv_cache_update = False
+        self.use_inline_qkv_cache_update = False
         self._kvarn_frontend_bound = False
         self._pending_fused_qkv_signature: tuple | None = None
         (
@@ -3365,11 +3368,15 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             return self.use_fused_qkv_cache_update
 
         self.layer_name = layer_name
-        self.use_fused_qkv_cache_update = (
-            self._kvarn_frontend_variant == KVARN_FRONTEND_QKV_SCATTER
-            and kvarn_native_layer_selected(
-                layer_name, os.environ.get("KVARN_NATIVE_XPU_LAYER", "")
-            )
+        self.use_fused_qkv_cache_update = self._kvarn_frontend_variant in {
+            KVARN_FRONTEND_QKV_SCATTER,
+            KVARN_FRONTEND_QKV_SCATTER_INLINE,
+        } and kvarn_native_layer_selected(
+            layer_name, os.environ.get("KVARN_NATIVE_XPU_LAYER", "")
+        )
+        self.use_inline_qkv_cache_update = (
+            self.use_fused_qkv_cache_update
+            and self._kvarn_frontend_variant == KVARN_FRONTEND_QKV_SCATTER_INLINE
         )
         self._kvarn_frontend_bound = True
         logger.info(
@@ -3384,6 +3391,15 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 else "none"
             ),
         )
+        if self.use_inline_qkv_cache_update:
+            logger.info(
+                "[KVARN_FRONTEND_INLINE] configured=%s; layer=%s; "
+                "route=single_attention_context; "
+                "native_op=kvarn_hadamard_qkv_scatter; "
+                "immutable for engine lifetime",
+                self._kvarn_frontend_variant,
+                layer_name,
+            )
         return self.use_fused_qkv_cache_update
 
     def _fused_qkv_signature(self, query: torch.Tensor, attn_metadata) -> tuple:
