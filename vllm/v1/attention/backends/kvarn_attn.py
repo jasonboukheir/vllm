@@ -86,6 +86,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_layer_selected,
     kvarn_native_layout_abi_supported,
     kvarn_native_split_policy_requested,
+    kvarn_native_split_scratch_count,
     kvarn_native_store_supported,
     validate_kvarn_native_factory_selection,
 )
@@ -1561,7 +1562,10 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._kvarn_dpas_layout = (
             self._kvarn_cache_layout == KVARN_CACHE_LAYOUT_XE2_DPAS
         )
-        self._kvarn_native_max_splits = kvarn_native_split_policy_requested()
+        (
+            self._kvarn_native_split_policy,
+            self._kvarn_native_max_splits,
+        ) = kvarn_native_split_policy_requested()
         (
             self._kvarn_native_kernel_variant_name,
             self._kvarn_native_kernel_variant,
@@ -1570,15 +1574,18 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             self._kvarn_cache_layout,
             self._kvarn_native_kernel_variant_name,
             self._kvarn_native_kernel_variant,
+            self._kvarn_native_split_policy,
         )
         logger.info_once(
             "[KVARN_FACTORY] selected_cache_layout=%s; "
             "selected_kernel_variant=%s(%d); max_decode_splits=%d; "
+            "selected_split_policy=%s; "
             "immutable for engine lifetime",
             self._kvarn_cache_layout,
             self._kvarn_native_kernel_variant_name,
             self._kvarn_native_kernel_variant,
             self._kvarn_native_max_splits,
+            self._kvarn_native_split_policy,
         )
 
         # Per-block fp16 tail buffer (in-progress tiles). Keyed by block_id.
@@ -1939,7 +1946,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         from vllm.v1.attention.ops.triton_kvarn_decode import (
             adaptive_num_kv_splits,
             kvarn_native_feature_enabled,
-            kvarn_native_split_count,
         )
 
         use_native_scratch = (
@@ -1958,8 +1964,10 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         )
         native_key = None
         if use_native_scratch:
-            native_splits = kvarn_native_split_count(
-                self._max_model_len, self._kvarn_native_max_splits
+            native_splits = kvarn_native_split_scratch_count(
+                self._max_model_len,
+                self._kvarn_native_max_splits,
+                self._kvarn_native_split_policy,
             )
             native_batch = min(max(self._max_num_seqs, 1), 12)
             native_key = (device, D, Hk, native_batch, native_splits)

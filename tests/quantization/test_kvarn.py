@@ -479,6 +479,7 @@ def test_cache_layout_is_frozen_at_attention_initialization(
 ) -> None:
     monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
     monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
     monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
     monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
     KVarNAttentionImpl.reset_process_state()
@@ -496,6 +497,7 @@ def test_cache_layout_is_frozen_at_attention_initialization(
             )
         assert impl._kvarn_cache_layout == "natural"
         assert not impl._kvarn_dpas_layout
+        assert impl._kvarn_native_split_policy == "fixed"
         assert impl._kvarn_native_max_splits == 16
         assert impl._kvarn_native_kernel_variant_name == "baseline"
         assert impl._kvarn_native_kernel_variant == 0
@@ -505,9 +507,51 @@ def test_cache_layout_is_frozen_at_attention_initialization(
         monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", "unknown")
         assert impl._kvarn_cache_layout == "natural"
         assert not impl._kvarn_dpas_layout
+        assert impl._kvarn_native_split_policy == "fixed"
         assert impl._kvarn_native_max_splits == 16
         assert impl._kvarn_native_kernel_variant_name == "baseline"
         assert impl._kvarn_native_kernel_variant == 0
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_b70_q6_split_policy_is_frozen_and_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", "xe2_dpas")
+    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6")
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", "q6_scalar")
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        with (
+            patch(
+                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
+                return_value=2,
+            ),
+            patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker,
+        ):
+            impl = KVarNAttentionImpl(
+                num_heads=24,
+                head_size=256,
+                scale=1.0 / 16.0,
+                num_kv_heads=4,
+                kv_cache_dtype="kvarn_k4v4_g128",
+            )
+
+        assert impl._kvarn_native_split_policy == "b70_q6"
+        assert impl._kvarn_native_max_splits == 32
+        marker.assert_any_call(
+            "[KVARN_FACTORY] selected_cache_layout=%s; "
+            "selected_kernel_variant=%s(%d); max_decode_splits=%d; "
+            "selected_split_policy=%s; immutable for engine lifetime",
+            "xe2_dpas",
+            "q6_scalar",
+            2,
+            32,
+            "b70_q6",
+        )
     finally:
         KVarNAttentionImpl.reset_process_state()
 
