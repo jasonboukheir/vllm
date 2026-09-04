@@ -40,6 +40,7 @@ from vllm.v1.attention.backends.kvarn_attn import (
     _launch_kvarn_native_sinkhorn_writer,
     _protect_kvarn_prefill_window_blocks,
     _reconcile_kvarn_sink_ownership,
+    _require_unique_kvarn_flush_block_ids,
     _resolve_kvarn_cache_layout,
     _rotate_kvarn_kv_into_scratch,
     _use_kvarn_fused_verify,
@@ -1704,6 +1705,7 @@ def test_native_sinkhorn_writer_dispatch_preserves_raw_tensor_identity(
         block_ids,
         packed_cache,
         16,
+        ownership_unique=True,
     )
 
     call.assert_called_once_with(
@@ -1715,6 +1717,104 @@ def test_native_sinkhorn_writer_dispatch_preserves_raw_tensor_identity(
         16,
         True,
     )
+
+
+def test_native_sinkhorn_writer_requires_host_ownership_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    call = Mock()
+    monkeypatch.setattr(
+        kvarn_attn.torch.ops,
+        "_vllm_fa2_C",
+        SimpleNamespace(kvarn_sinkhorn_pack_kv=call),
+    )
+    tail_key = torch.empty(1)
+    tail_value = torch.empty(1)
+    pool_slots = torch.empty(0, dtype=torch.int64)
+    block_ids = torch.empty(0, dtype=torch.int64)
+    packed_cache = torch.empty(1, dtype=torch.uint8)
+
+    with pytest.raises(RuntimeError, match="host-proven unique block_ids"):
+        _launch_kvarn_native_sinkhorn_writer(
+            tail_key,
+            tail_value,
+            pool_slots,
+            block_ids,
+            packed_cache,
+            16,
+            ownership_unique=False,
+        )
+    call.assert_not_called()
+
+
+def test_flush_schedule_uniqueness_contract_is_host_only() -> None:
+    _require_unique_kvarn_flush_block_ids([9, 2, 7])
+    with pytest.raises(RuntimeError, match="duplicate block_ids"):
+        _require_unique_kvarn_flush_block_ids([9, 2, 9])
+
+
+def test_flush_seen_proves_shared_owner_schedule_unique() -> None:
+    flush_seen: set[int] = set()
+    kwargs = dict(
+        committed_len=384,
+        group=128,
+        bt_cols=3,
+        resident_blocks={7: 0, 8: 1},
+        sinks={1},
+        flush_seen=flush_seen,
+        defer=False,
+    )
+    first = _kvarn_walk_back_flush_blocks([1, 7, 8], **kwargs)
+    co_owner = _kvarn_walk_back_flush_blocks([1, 7, 8], **kwargs)
+
+    assert first == [8, 7]
+    assert co_owner == []
+    _require_unique_kvarn_flush_block_ids(first + co_owner)
+
+
+def test_batched_flush_rejects_duplicate_record_owners_before_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    KVarNAttentionImpl.reset_process_state()
+    group_key = ("duplicate-writer-owner-test",)
+    cfg = SimpleNamespace(
+        head_dim=256,
+        group=128,
+        record_bytes=65_536,
+        k_packed_bytes=16_384,
+        v_packed_bytes=16_384,
+        sinkhorn_iters=16,
+    )
+    impl = SimpleNamespace(
+        kvarn_config=cfg,
+        num_kv_heads=4,
+        _group_key=group_key,
+        _tail_K_pool=torch.zeros(1, 128, 4, 256, dtype=torch.float16),
+        _tail_V_pool=torch.zeros(1, 128, 4, 256, dtype=torch.float16),
+        _tails={5: object()},
+        _kvarn_cache_layout="xe2_dpas",
+        _kvarn_flush_writer="sinkhorn_pack_xe2",
+    )
+    cache = torch.empty(6, 4, 65_536, dtype=torch.uint8)
+    KVarNAttentionImpl._block_to_slot_dict[group_key] = {5: 0}
+    materialize = Mock(side_effect=AssertionError("must reject on the host first"))
+    launch = Mock()
+
+    try:
+        with (
+            patch.object(kvarn_attn.torch, "as_tensor", materialize),
+            patch.object(kvarn_attn, "_launch_kvarn_native_sinkhorn_writer", launch),
+            pytest.raises(RuntimeError, match="duplicate block_ids"),
+        ):
+            KVarNAttentionImpl._batched_flush([(impl, 5, cache), (impl, 5, cache)])
+        materialize.assert_not_called()
+        launch.assert_not_called()
+    finally:
+        KVarNAttentionImpl.reset_process_state()
 
 
 def test_batched_flush_native_writer_bypasses_reference_record_assembly(
@@ -1834,6 +1934,7 @@ def test_batched_flush_sinkhorn_writer_bypasses_gather_and_fp32_intermediates(
         assert args[3].tolist() == [5, 2]
         assert args[4] is cache
         assert args[5] == 16
+        assert launch.call_args.kwargs == {"ownership_unique": True}
         marker.assert_any_call(
             "[KVARN_FLUSH_WRITER] active=sinkhorn_pack_xe2; "
             "native_op=kvarn_sinkhorn_pack_kv; cache_layout=%s; "

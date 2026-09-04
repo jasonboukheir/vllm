@@ -90,6 +90,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_layer_selected,
     kvarn_native_layout_abi_supported,
     kvarn_native_prefill_store_supported,
+    kvarn_native_sinkhorn_writer_abi_supported,
     kvarn_native_split_policy_requested,
     kvarn_native_split_scratch_count,
     kvarn_native_store_supported,
@@ -489,8 +490,20 @@ def _launch_kvarn_native_sinkhorn_writer(
     block_ids: torch.Tensor,
     packed_cache: torch.Tensor,
     sinkhorn_iterations: int,
+    *,
+    ownership_unique: bool,
 ) -> None:
-    """Balance raw full pages and write xe2_dpas records in one native op."""
+    """Balance raw full pages and write xe2_dpas records in one native op.
+
+    The native grid assigns one workgroup family to each output record, so
+    duplicate ``block_ids`` would be a write race.  ``ownership_unique`` is a
+    host-side proof supplied by the builder/flush schedule; inspecting the XPU
+    index tensor here would introduce a synchronization in the decode path.
+    """
+    if ownership_unique is not True:
+        raise RuntimeError(
+            "native KVarN Sinkhorn writer requires host-proven unique block_ids"
+        )
     torch.ops._vllm_fa2_C.kvarn_sinkhorn_pack_kv(
         tail_key,
         tail_value,
@@ -637,6 +650,12 @@ def _kvarn_reclaimable_block_ids(
         for bid in resident_blocks
         if bid not in blocks_needed and bid not in flush_seen
     ]
+
+
+def _require_unique_kvarn_flush_block_ids(block_ids: Sequence[int]) -> None:
+    """Validate native record ownership using the host schedule only."""
+    if len(block_ids) != len(set(block_ids)):
+        raise RuntimeError("KVarN flush schedule contains duplicate block_ids")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1939,7 +1958,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                     num_kv_heads=self.num_kv_heads,
                     record_bytes=self.kvarn_config.record_bytes,
                     sinkhorn_iterations=self.kvarn_config.sinkhorn_iters,
-                    op_available=kvarn_native_layout_abi_supported(op_name),
+                    op_available=kvarn_native_sinkhorn_writer_abi_supported(),
                     rtn_quantile=rtn_quantile,
                 )
                 if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2
@@ -2249,6 +2268,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                     dummy_blocks,
                     dummy_cache,
                     cfg.sinkhorn_iters,
+                    ownership_unique=True,
                 )
             else:
                 warm_tiles = (
@@ -3050,6 +3070,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         for impl, kvc, bids, slots in by_impl.values():
             if kvc is None:
                 continue
+            # The builder's flush_seen set makes this true in production. Keep
+            # the assertion on the host list: reading bid_t back from XPU would
+            # synchronize every flush. Direct/test callers must satisfy the
+            # same one-writer-family-per-cache-record contract.
+            _require_unique_kvarn_flush_block_ids(bids)
             dev = impl._tail_K_pool.device
             call_layer_batches += 1
             schedule_key = None
@@ -3097,6 +3122,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                         bid_t,
                         kvc,
                         cfg.sinkhorn_iters,
+                        ownership_unique=True,
                     )
                     logger.info_once(
                         "[KVARN_FLUSH_WRITER] active=sinkhorn_pack_xe2; "

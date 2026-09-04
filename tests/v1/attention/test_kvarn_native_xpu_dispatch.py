@@ -26,6 +26,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_layout_abi_supported,
     kvarn_native_prefill_store_supported,
     kvarn_native_problem_supported,
+    kvarn_native_sinkhorn_writer_abi_supported,
     kvarn_native_split_count,
     kvarn_native_split_policy_requested,
     kvarn_native_split_scratch_count,
@@ -875,6 +876,134 @@ def test_native_decode_requires_explicit_factory_abi(
     kvarn_native_layout_abi_supported.cache_clear()
 
 
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (
+            (
+                "tail_key",
+                "tail_value",
+                "pool_slots",
+                "block_ids",
+                "packed_cache",
+                "sinkhorn_iterations",
+                "dpas_layout",
+            ),
+            True,
+        ),
+        (("tail_key", "packed_cache", "dpas_layout"), False),
+        (
+            (
+                "tail_key",
+                "tail_value",
+                "pool_slots",
+                "block_ids",
+                "packed_cache",
+                "dpas_layout",
+                "sinkhorn_iterations",
+            ),
+            False,
+        ),
+        (
+            (
+                "tail_key",
+                "tail_value",
+                "pool_slots",
+                "block_ids",
+                "packed_cache",
+                "sinkhorn_iterations",
+                "dpas_layout",
+                "unexpected",
+            ),
+            False,
+        ),
+    ],
+)
+def test_sinkhorn_writer_requires_complete_exact_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: tuple[str, ...],
+    expected: bool,
+) -> None:
+    op = SimpleNamespace(
+        default=SimpleNamespace(
+            _schema=SimpleNamespace(
+                arguments=[
+                    SimpleNamespace(
+                        name=name,
+                        type={
+                            "sinkhorn_iterations": "int",
+                            "dpas_layout": "bool",
+                        }.get(name, "Tensor"),
+                    )
+                    for name in arguments
+                ],
+                returns=[],
+            )
+        )
+    )
+    monkeypatch.setattr(
+        kvarn_decode.torch.ops,
+        "_vllm_fa2_C",
+        SimpleNamespace(kvarn_sinkhorn_pack_kv=op),
+    )
+    kvarn_native_sinkhorn_writer_abi_supported.cache_clear()
+    assert kvarn_native_sinkhorn_writer_abi_supported() is expected
+    kvarn_native_sinkhorn_writer_abi_supported.cache_clear()
+
+
+def test_sinkhorn_writer_schema_detection_rejects_missing_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kvarn_decode.torch.ops, "_vllm_fa2_C", SimpleNamespace())
+    kvarn_native_sinkhorn_writer_abi_supported.cache_clear()
+    assert not kvarn_native_sinkhorn_writer_abi_supported()
+    kvarn_native_sinkhorn_writer_abi_supported.cache_clear()
+
+
+def test_sinkhorn_writer_schema_detection_rejects_wrong_type_or_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def supports(*, iteration_type: str, returns: list[object]) -> bool:
+        names = (
+            "tail_key",
+            "tail_value",
+            "pool_slots",
+            "block_ids",
+            "packed_cache",
+            "sinkhorn_iterations",
+            "dpas_layout",
+        )
+        arguments = [
+            SimpleNamespace(
+                name=name,
+                type=(
+                    iteration_type
+                    if name == "sinkhorn_iterations"
+                    else "bool"
+                    if name == "dpas_layout"
+                    else "Tensor"
+                ),
+            )
+            for name in names
+        ]
+        op = SimpleNamespace(
+            default=SimpleNamespace(
+                _schema=SimpleNamespace(arguments=arguments, returns=returns)
+            )
+        )
+        monkeypatch.setattr(
+            kvarn_decode.torch.ops,
+            "_vllm_fa2_C",
+            SimpleNamespace(kvarn_sinkhorn_pack_kv=op),
+        )
+        kvarn_native_sinkhorn_writer_abi_supported.cache_clear()
+        return kvarn_native_sinkhorn_writer_abi_supported()
+
+    assert not supports(iteration_type="float", returns=[])
+    assert not supports(iteration_type="int", returns=[SimpleNamespace()])
+    kvarn_native_sinkhorn_writer_abi_supported.cache_clear()
+
+
 def test_native_output_hadamard_requires_multisplit_and_matching_op_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -912,6 +1041,7 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
         "kvarn_dequant",
         "kvarn_hadamard_scatter",
         "kvarn_hadamard_qkv_scatter",
+        "kvarn_sinkhorn_pack_kv",
         "kvarn_hadamard",
     )
     for name in operator_names:
@@ -924,6 +1054,8 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
             assert kvarn_native_decode_abi_supported(
                 name == "kvarn_decode_with_scratch"
             )
+        if name == "kvarn_sinkhorn_pack_kv":
+            assert kvarn_native_sinkhorn_writer_abi_supported()
 
     query = torch.empty((1, 24, 256), dtype=torch.float16, device="meta")
     cache = torch.empty((2, 4, 35_072), dtype=torch.uint8, device="meta")
@@ -934,6 +1066,21 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
     tail_key = torch.empty((2, 128, 4, 256), dtype=torch.float16, device="meta")
     tail_value = torch.empty_like(tail_key)
     output = torch.empty_like(query)
+    pool_slots = torch.empty((1,), dtype=torch.int64, device="meta")
+    flush_block_ids = torch.empty((1,), dtype=torch.int64, device="meta")
+
+    assert (
+        torch.ops._vllm_fa2_C.kvarn_sinkhorn_pack_kv(
+            tail_key,
+            tail_value,
+            pool_slots,
+            flush_block_ids,
+            cache,
+            16,
+            True,
+        )
+        is None
+    )
 
     assert (
         torch.ops._vllm_fa2_C.kvarn_decode(
@@ -1335,9 +1482,7 @@ def test_xpu_forward_context_is_omitted_when_both_stability_axes_are_disabled(
     from vllm.platforms.xpu import XPUPlatform
 
     _enable_xe2_request_stable_profile(monkeypatch)
-    monkeypatch.setenv(
-        request_stable.XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV, "0"
-    )
+    monkeypatch.setenv(request_stable.XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV, "0")
     monkeypatch.setenv(request_stable.XPU_KVARN_REQUEST_STABLE_RMSNORM_ENV, "0")
     request_stable._get_xpu_kvarn_request_stability_policy.cache_clear()
     try:
