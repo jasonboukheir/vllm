@@ -49,6 +49,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheLayout,
     KVCacheTensor,
+    KVQuantMode,
     compute_layer_kv_cache_shape_bytes,
     compute_layout_strides,
     create_kv_cache_views,
@@ -699,6 +700,14 @@ def test_unknown_preset_fails_closed():
 def test_kvarn_presets_are_registered_as_quantized_cache_modes(cache_dtype):
     assert get_kv_quant_mode(cache_dtype).is_kvarn
     assert is_quantized_kv_cache(cache_dtype)
+
+
+def test_kvarn_and_nvfp4_ds_mla_quant_modes_are_distinct():
+    assert get_kv_quant_mode("nvfp4_ds_mla") is KVQuantMode.NVFP4_DS_MLA
+    assert all(get_kv_quant_mode(name).is_kvarn for name in KVARN_PRESETS)
+
+    members = KVQuantMode.__members__.values()
+    assert len(KVQuantMode.__members__) == len({member.value for member in members})
 
 
 @pytest.mark.parametrize(

@@ -929,6 +929,29 @@ def test_gemma_rms_norm_uses_request_stable_dispatch(
         assert isinstance(result, torch.Tensor)
 
 
+def test_gemma_rms_norm_xpu_preserves_request_stable_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    monkeypatch.setattr(
+        request_stable,
+        "get_xpu_kvarn_request_slices",
+        lambda: request_stable.XPUKvarnRequestSlices(((0, 2, 0, True),)),
+    )
+    calls = []
+
+    def recording_native(x, residual=None):
+        calls.append((x, residual))
+        return x
+
+    layer = SimpleNamespace(forward_native=recording_native)
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    assert GemmaRMSNorm.forward_xpu(layer, x) is x
+    assert calls == [(x, None)]
+
+
 def test_inactive_linear_fast_path_does_not_read_forward_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -19,6 +19,7 @@ from vllm.model_executor.determinism.request_stable_linear import (
     is_xpu_kvarn_packed_ordinary_decode,
     use_xpu_kvarn_request_stable_linears,
 )
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
@@ -179,7 +180,12 @@ class LogitsProcessor(PluggableLayer):
                 lm_head, hidden_states, bias=embedding_bias
             )
 
-        if not isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod):
+        # A quant config that excludes lm_head hands out UnquantizedLinearMethod
+        # rather than UnquantizedEmbeddingMethod, so accept both: either way the
+        # weight is plain and `lm_head.weight` can be cast directly.
+        if not isinstance(
+            lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+        ):
             raise ValueError(
                 "A head_dtype different from the model dtype is only "
                 "supported for an unquantized lm_head."
