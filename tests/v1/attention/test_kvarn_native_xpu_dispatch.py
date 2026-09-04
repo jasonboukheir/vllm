@@ -102,6 +102,9 @@ def test_native_feature_master_and_subfeature_toggles(
     assert not kvarn_native_feature_enabled("DECODE")
     assert kvarn_native_feature_enabled("MATERIALIZE")
 
+    monkeypatch.setenv("KVARN_NATIVE_XPU_MATERIALIZE", "0")
+    assert not kvarn_native_feature_enabled("MATERIALIZE")
+
 
 def _native_store(**overrides) -> dict:
     problem = dict(
