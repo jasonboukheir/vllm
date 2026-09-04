@@ -125,6 +125,16 @@ def kvarn_native_output_hadamard_supported(with_scratch: bool) -> bool:
     return _kvarn_op_supports_argument(op, "unrotate_output")
 
 
+@functools.lru_cache(maxsize=2)
+def kvarn_native_bf16_output_supported(with_scratch: bool) -> bool:
+    """Detect direct public-output support without assuming extension parity."""
+    op_name = "kvarn_decode_with_scratch" if with_scratch else "kvarn_decode"
+    if not hasattr(torch.ops._vllm_fa2_C, op_name):
+        return False
+    op = getattr(torch.ops._vllm_fa2_C, op_name)
+    return _kvarn_op_supports_argument(op, "write_bf16_output")
+
+
 def _kvarn_native_output_hadamard_enabled(
     num_kv_splits: int, with_scratch: bool
 ) -> bool:
@@ -1060,6 +1070,7 @@ def kvarn_decode_attention(
     cfg,
     impl,  # KVarNAttentionImpl (has pool + scratch buffers)
     md,  # KVarNMetadata (carries the precomputed task plan)
+    output: torch.Tensor | None = None,  # optional caller-owned [B, Hq, D] bf16
 ) -> torch.Tensor:
     """Decode driver — dequant + FlashAttention.
 
@@ -1076,9 +1087,9 @@ def kvarn_decode_attention(
     cu_seqlens) is precomputed once per batch in ``KVarNMetadataBuilder.build``
     and passed in via ``md`` — no per-layer host→GPU allocations.
 
-    Output: ``[B, Hq, D]`` in the internal fp16 compute dtype, in the
-    un-rotated frame.  The backend's final ``copy_`` converts directly into
-    the public output dtype without an intermediate allocation.
+    Output: ``[B, Hq, D]`` in the un-rotated frame. A compatible native
+    extension writes directly into a caller-owned bf16 output; older native
+    extensions and fallback paths return internal fp16 for the backend copy.
     """
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
@@ -1154,7 +1165,6 @@ def kvarn_decode_attention(
             torch.mm(q_input, H16, out=q_rot_fp16)
 
     if use_native_xpu:
-        output_rot = impl._fused_out_buf[:N].view(B, Hq, D)
         native_splits = kvarn_native_split_count(int(md.max_seq_len))
         native_scratch = impl._native_decode_scratch
         scratch_fits = (
@@ -1170,12 +1180,26 @@ def kvarn_decode_attention(
         fuse_output_hadamard = _kvarn_native_output_hadamard_enabled(
             native_splits, use_scratch_op
         )
+        write_bf16_output = (
+            fuse_output_hadamard
+            and output is not None
+            and output.shape == (B, Hq, D)
+            and output.dtype == torch.bfloat16
+            and output.device == query.device
+            and output.is_contiguous()
+            and kvarn_native_bf16_output_supported(use_scratch_op)
+        )
+        output_rot = (
+            output if write_bf16_output else impl._fused_out_buf[:N].view(B, Hq, D)
+        )
         logger.info_once(
             "Using the native Xe2 KVarN qlen=1 decoder (batch limit %d; "
-            "native H256 transforms=%s; fused output H256=%s)",
+            "native H256 transforms=%s; fused output H256=%s; "
+            "direct bf16 output=%s)",
             _KVARN_NATIVE_MAX_BATCH,
             use_native_hadamard,
             fuse_output_hadamard,
+            write_bf16_output,
         )
         with torch.profiler.record_function("kvarn_native_xpu_decode"):
             if use_scratch_op:
@@ -1195,7 +1219,11 @@ def kvarn_decode_attention(
                     int(md.max_seq_len),
                     scale,
                 )
-                if fuse_output_hadamard:
+                if write_bf16_output:
+                    torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+                        *decode_args, True, True
+                    )
+                elif fuse_output_hadamard:
                     torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(*decode_args, True)
                 else:
                     torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(*decode_args)
@@ -1216,7 +1244,9 @@ def kvarn_decode_attention(
                     int(md.max_seq_len),
                     scale,
                 )
-                if fuse_output_hadamard:
+                if write_bf16_output:
+                    torch.ops._vllm_fa2_C.kvarn_decode(*decode_args, True, True)
+                elif fuse_output_hadamard:
                     torch.ops._vllm_fa2_C.kvarn_decode(*decode_args, True)
                 else:
                     torch.ops._vllm_fa2_C.kvarn_decode(*decode_args)

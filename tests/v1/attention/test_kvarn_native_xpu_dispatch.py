@@ -15,6 +15,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     _kvarn_op_supports_argument,
     _require_kvarn_dpas_reader,
     kvarn_dpas_layout_requested,
+    kvarn_native_bf16_output_supported,
     kvarn_native_feature_enabled,
     kvarn_native_layer_selected,
     kvarn_native_problem_supported,
@@ -88,6 +89,10 @@ def _native_store(**overrides) -> dict:
 
 def test_native_store_follows_decode_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("KVARN_NATIVE_XPU", raising=False)
+    monkeypatch.setattr(kvarn_decode.current_platform, "is_xpu", lambda: True)
+    assert kvarn_native_store_supported(**_native_store())
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU", "0")
     assert not kvarn_native_store_supported(**_native_store())
 
     monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
@@ -252,6 +257,34 @@ def test_native_output_hadamard_schema_detection_is_backward_compatible() -> Non
     assert not _kvarn_op_supports_argument(SimpleNamespace(), "unrotate_output")
 
 
+def test_native_bf16_output_schema_detection_is_backward_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_op = SimpleNamespace(
+        default=SimpleNamespace(
+            _schema=SimpleNamespace(arguments=[SimpleNamespace(name="unrotate_output")])
+        )
+    )
+    new_op = SimpleNamespace(
+        default=SimpleNamespace(
+            _schema=SimpleNamespace(
+                arguments=[
+                    SimpleNamespace(name="unrotate_output"),
+                    SimpleNamespace(name="write_bf16_output"),
+                ]
+            )
+        )
+    )
+    fake_ops = SimpleNamespace(kvarn_decode=old_op, kvarn_decode_with_scratch=new_op)
+    monkeypatch.setattr(kvarn_decode.torch.ops, "_vllm_fa2_C", fake_ops)
+    kvarn_native_bf16_output_supported.cache_clear()
+
+    assert not kvarn_native_bf16_output_supported(False)
+    assert kvarn_native_bf16_output_supported(True)
+
+    kvarn_native_bf16_output_supported.cache_clear()
+
+
 def test_native_output_hadamard_requires_multisplit_and_matching_op_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -338,6 +371,27 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
             )
             is None
         )
+    if _kvarn_op_supports_argument(
+        torch.ops._vllm_fa2_C.kvarn_decode, "write_bf16_output"
+    ):
+        bf16_output = torch.empty_like(query, dtype=torch.bfloat16)
+        assert (
+            torch.ops._vllm_fa2_C.kvarn_decode(
+                query,
+                cache,
+                block_table,
+                seq_lens,
+                block_to_slot,
+                tail_key,
+                tail_value,
+                bf16_output,
+                128,
+                0.0625,
+                True,
+                True,
+            )
+            is None
+        )
 
     temp_output = torch.empty((1, 24, 256), dtype=torch.float16, device="meta")
     exp_sums = torch.empty((1, 24, 1), dtype=torch.float32, device="meta")
@@ -378,6 +432,30 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
                 output,
                 128,
                 0.0625,
+                True,
+            )
+            is None
+        )
+    if _kvarn_op_supports_argument(
+        torch.ops._vllm_fa2_C.kvarn_decode_with_scratch, "write_bf16_output"
+    ):
+        bf16_output = torch.empty_like(query, dtype=torch.bfloat16)
+        assert (
+            torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+                query,
+                cache,
+                block_table,
+                seq_lens,
+                block_to_slot,
+                tail_key,
+                tail_value,
+                temp_output,
+                exp_sums,
+                max_logits,
+                bf16_output,
+                128,
+                0.0625,
+                True,
                 True,
             )
             is None

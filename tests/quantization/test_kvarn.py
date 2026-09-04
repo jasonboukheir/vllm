@@ -938,6 +938,51 @@ def test_kvarn_forward_copies_into_provided_output(output_ndim):
     assert torch.equal(output[2], torch.full_like(output[2], -123))
 
 
+@pytest.mark.parametrize("output_ndim", [2, 3])
+def test_kvarn_forward_preserves_direct_decode_output(output_ndim):
+    impl = object.__new__(KVarNAttentionImpl)
+    impl.kvarn_config = SimpleNamespace(record_bytes=35072)
+    impl.num_heads = 2
+    impl.num_kv_heads = 1
+    impl.head_size = 4
+    impl._ensure_pool = lambda device, num_blocks_hint: None
+
+    def direct_decode(q, cache, metadata, output=None):
+        assert output is not None
+        output.fill_(7)
+        return output
+
+    impl._decode_path = direct_decode
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        is_prefill=False,
+        max_query_len=1,
+        num_decodes=2,
+        num_decode_tokens=2,
+        has_cached_multiquery=False,
+        vq_seqlen=None,
+    )
+    query = torch.zeros(3, 8, dtype=torch.bfloat16)
+    key = torch.zeros(3, 4, dtype=torch.bfloat16)
+    value = torch.zeros_like(key)
+    output_shape = (3, 2, 4) if output_ndim == 3 else (3, 8)
+    output = torch.full(output_shape, -123, dtype=torch.bfloat16)
+
+    result = impl.forward(
+        None,
+        query,
+        key,
+        value,
+        torch.empty((1, 1, 35072), dtype=torch.uint8),
+        metadata,
+        output=output,
+    )
+
+    assert result is output
+    assert torch.equal(output[:2], torch.full_like(output[:2], 7))
+    assert torch.equal(output[2], torch.full_like(output[2], -123))
+
+
 def test_immediately_recycled_sink_is_delabeled_outside_new_row_zero():
     """LIFO reuse must not carry a finished request's sink role into history."""
     old_sink = 5
