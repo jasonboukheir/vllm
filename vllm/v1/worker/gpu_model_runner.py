@@ -260,6 +260,11 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _block_table_cpu_view(block_table: Any, num_reqs: int) -> np.ndarray:
+    """Return only live request rows from the authoritative CPU mirror."""
+    return block_table.get_numpy_array()[:num_reqs]
+
+
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
     """Resolve checkpoint names without changing the model's module tree."""
     module_name, _, parameter_name = name.rpartition(".")
@@ -2429,6 +2434,13 @@ class GPUModelRunner(
             blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)
             return blk_table_tensor
 
+        def _get_block_table_cpu(kv_cache_gid: int):
+            kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
+            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                return None
+            blk_table = self.input_batch.block_table[kv_cache_gid]
+            return _block_table_cpu_view(blk_table, num_reqs)
+
         assert slot_mappings is not None
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
@@ -2529,6 +2541,7 @@ class GPUModelRunner(
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
+            block_table_cpu=_get_block_table_cpu(0),
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
@@ -2662,6 +2675,7 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+                cm.block_table_cpu = _get_block_table_cpu(kv_cache_gid)
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(

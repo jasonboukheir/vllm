@@ -681,6 +681,7 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
         max_query_len=decode_max_query_len,
         max_seq_len=common_attn_metadata.max_seq_len,
         block_table_tensor=common_attn_metadata.block_table_tensor,
+        block_table_cpu=common_attn_metadata.block_table_cpu,
         slot_mapping=common_attn_metadata.slot_mapping,
         causal=True,
         seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
