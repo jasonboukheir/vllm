@@ -661,7 +661,6 @@ def test_pool_initialized_fast_path_is_group_capacity_and_binding_safe():
         impl._pool_ready_env = (
             os.environ.get("KVARN_NATIVE_XPU"),
             os.environ.get("KVARN_NATIVE_XPU_PERSISTENT_SCRATCH"),
-            os.environ.get("KVARN_NATIVE_XPU_SPLITS"),
         )
         impl._native_decode_scratch = None
 

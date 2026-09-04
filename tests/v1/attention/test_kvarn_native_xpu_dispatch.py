@@ -409,6 +409,7 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
         "kvarn_materialize_packed_kv",
         "kvarn_dequant",
         "kvarn_hadamard_scatter",
+        "kvarn_hadamard_qkv_scatter",
         "kvarn_hadamard",
     )
     for name in operator_names:
@@ -616,6 +617,22 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
             query[:, :4],
             torch.empty((1,), dtype=torch.int64, device="meta"),
             block_to_slot,
+            tail_key,
+            tail_value,
+            128,
+            False,
+        )
+        is None
+    )
+    query_output = torch.empty_like(query)
+    assert (
+        torch.ops._vllm_fa2_C.kvarn_hadamard_qkv_scatter(
+            query,
+            query[:, :4],
+            query[:, :4],
+            torch.empty((1,), dtype=torch.int64, device="meta"),
+            block_to_slot,
+            query_output,
             tail_key,
             tail_value,
             128,
