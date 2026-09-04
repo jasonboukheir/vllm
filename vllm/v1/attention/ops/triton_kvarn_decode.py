@@ -32,6 +32,13 @@ logger = init_logger(__name__)
 _KVARN_NATIVE_RECORD_BYTES = 35_072
 _KVARN_NATIVE_SPLIT_COUNTS = frozenset({1, 2, 4, 8, 16, 17, 24, 32})
 _KVARN_NATIVE_MAX_BATCH = 12
+KVARN_CACHE_LAYOUT_NATURAL = "natural"
+KVARN_CACHE_LAYOUT_XE2_DPAS = "xe2_dpas"
+_KVARN_CACHE_LAYOUTS = frozenset(
+    {KVARN_CACHE_LAYOUT_NATURAL, KVARN_CACHE_LAYOUT_XE2_DPAS}
+)
+KVARN_NATIVE_KERNEL_BASELINE = 0
+_KVARN_NATIVE_KERNEL_VARIANTS = {"baseline": KVARN_NATIVE_KERNEL_BASELINE}
 
 
 def kvarn_native_feature_enabled(feature: str) -> bool:
@@ -48,36 +55,72 @@ def kvarn_native_feature_enabled(feature: str) -> bool:
     )
 
 
+def kvarn_cache_layout_requested() -> str:
+    """Resolve the process configuration to a named cache-layout ABI.
+
+    This is intended to be called once by ``KVarNAttentionImpl``. Hot paths
+    must consume the immutable selection stored on that implementation rather
+    than reading environment state again. The named selector leaves room for
+    future layout variants without conflating them with decoder-kernel choices.
+    """
+    named = os.environ.get("KVARN_NATIVE_XPU_CACHE_LAYOUT")
+    legacy = os.environ.get("KVARN_NATIVE_XPU_DPAS_LAYOUT")
+    if named is None:
+        if legacy not in (None, "0", "1"):
+            raise ValueError("KVARN_NATIVE_XPU_DPAS_LAYOUT must be 0 or 1")
+        return (
+            KVARN_CACHE_LAYOUT_XE2_DPAS if legacy == "1" else KVARN_CACHE_LAYOUT_NATURAL
+        )
+    if named not in _KVARN_CACHE_LAYOUTS:
+        choices = ", ".join(sorted(_KVARN_CACHE_LAYOUTS))
+        raise ValueError(f"KVARN_NATIVE_XPU_CACHE_LAYOUT must be one of: {choices}")
+    if legacy is not None:
+        legacy_layout = (
+            KVARN_CACHE_LAYOUT_XE2_DPAS if legacy == "1" else KVARN_CACHE_LAYOUT_NATURAL
+        )
+        if legacy not in ("0", "1") or legacy_layout != named:
+            raise ValueError(
+                "KVARN_NATIVE_XPU_CACHE_LAYOUT conflicts with "
+                "KVARN_NATIVE_XPU_DPAS_LAYOUT"
+            )
+    return named
+
+
 def kvarn_dpas_layout_requested() -> bool:
-    """Return whether cache payloads use the Xe2 DPAS fragment layout."""
-    return os.environ.get("KVARN_NATIVE_XPU_DPAS_LAYOUT", "0") == "1"
+    """Compatibility predicate for the named cache-layout selector."""
+    return kvarn_cache_layout_requested() == KVARN_CACHE_LAYOUT_XE2_DPAS
 
 
-def _require_kvarn_dpas_reader(selected: bool, reader: str) -> None:
-    if kvarn_dpas_layout_requested() and not selected:
+def _require_kvarn_dpas_reader(dpas_layout: bool, selected: bool, reader: str) -> None:
+    if dpas_layout and not selected:
         raise RuntimeError(
-            "KVARN_NATIVE_XPU_DPAS_LAYOUT=1 requires a matching DPAS-layout "
+            "The selected xe2_dpas KVarN cache layout requires a matching "
             f"reader; refusing the natural-layout {reader} fallback"
         )
 
 
 def _kvarn_dpas_layout_for_problem(
-    head_dim: int, group: int, key_bits: int, value_bits: int
+    dpas_layout: bool,
+    head_dim: int,
+    group: int,
+    key_bits: int,
+    value_bits: int,
 ) -> bool:
     """Validate and return the DPAS-layout selection for one cache ABI."""
-    if not kvarn_dpas_layout_requested():
+    if not dpas_layout:
         return False
     actual = (head_dim, group, key_bits, value_bits)
     if actual != (256, 128, 4, 4):
         raise RuntimeError(
-            "KVARN_NATIVE_XPU_DPAS_LAYOUT=1 requires D256/G128/K4V4; "
+            "The xe2_dpas KVarN cache layout requires D256/G128/K4V4; "
             f"got D{actual[0]}/G{actual[1]}/K{actual[2]}V{actual[3]}"
         )
     return True
 
 
-@functools.lru_cache(maxsize=256)
-def _kvarn_native_split_count_cached(max_seq_len: int, text: str) -> int:
+def kvarn_native_split_policy_requested() -> int:
+    """Resolve the fixed maximum split count for one engine initialization."""
+    text = os.environ.get("KVARN_NATIVE_XPU_SPLITS", "16")
     try:
         splits = int(text)
     except ValueError as exc:
@@ -88,22 +131,39 @@ def _kvarn_native_split_count_cached(max_seq_len: int, text: str) -> int:
         raise ValueError(
             "KVARN_NATIVE_XPU_SPLITS must be one of 1, 2, 4, 8, 16, 17, 24, or 32"
         )
+    return splits
+
+
+def kvarn_native_kernel_variant_requested() -> tuple[str, int]:
+    """Resolve the native implementation independently from cache layout."""
+    name = os.environ.get("KVARN_NATIVE_XPU_KERNEL_VARIANT", "baseline")
+    try:
+        return name, _KVARN_NATIVE_KERNEL_VARIANTS[name]
+    except KeyError as exc:
+        choices = ", ".join(sorted(_KVARN_NATIVE_KERNEL_VARIANTS))
+        raise ValueError(
+            f"KVARN_NATIVE_XPU_KERNEL_VARIANT must be one of: {choices}"
+        ) from exc
+
+
+@functools.lru_cache(maxsize=256)
+def _kvarn_native_split_count_cached(max_seq_len: int, max_splits: int) -> int:
     # The C++ wrapper collapses short-context multi-split requests to one split
     # to avoid empty partials and their reduction drift.
     kv_tiles = (max_seq_len + 63) // 64
-    return 1 if splits > 1 and kv_tiles < splits else splits
+    return 1 if max_splits > 1 and kv_tiles < max_splits else max_splits
 
 
-def kvarn_native_split_count(max_seq_len: int) -> int:
-    """Mirror the native decoder's split selection for scratch sizing.
+def kvarn_native_split_count(max_seq_len: int, max_splits: int | None = None) -> int:
+    """Select the explicit native split count for one context extent.
 
-    The extension still reads this transitional setting directly. Materialize
-    the beta default before its first call so Python scratch sizing, fused
-    reduction, and an older compatible extension agree even when the user did
-    not supply any KVarN environment variables.
+    Production callers pass the policy frozen by ``KVarNAttentionImpl``. The
+    optional resolver keeps this helper convenient for focused unit tests and
+    direct callers without moving policy back into C++.
     """
-    text = os.environ.setdefault("KVARN_NATIVE_XPU_SPLITS", "16")
-    return _kvarn_native_split_count_cached(max_seq_len, text)
+    if max_splits is None:
+        max_splits = kvarn_native_split_policy_requested()
+    return _kvarn_native_split_count_cached(max_seq_len, max_splits)
 
 
 def _kvarn_op_supports_argument(op: object, argument: str) -> bool:
@@ -113,6 +173,28 @@ def _kvarn_op_supports_argument(op: object, argument: str) -> bool:
     except (AttributeError, RuntimeError):
         return False
     return any(schema_arg.name == argument for schema_arg in arguments)
+
+
+@functools.lru_cache(maxsize=8)
+def kvarn_native_layout_abi_supported(op_name: str) -> bool:
+    """Require the immutable-layout ABI before selecting a native cache op."""
+    if not hasattr(torch.ops._vllm_fa2_C, op_name):
+        return False
+    return _kvarn_op_supports_argument(
+        getattr(torch.ops._vllm_fa2_C, op_name), "dpas_layout"
+    )
+
+
+@functools.lru_cache(maxsize=2)
+def kvarn_native_decode_abi_supported(with_scratch: bool) -> bool:
+    """Require explicit layout and split-count decode provenance."""
+    op_name = "kvarn_decode_with_scratch" if with_scratch else "kvarn_decode"
+    if not kvarn_native_layout_abi_supported(op_name):
+        return False
+    op = getattr(torch.ops._vllm_fa2_C, op_name)
+    return _kvarn_op_supports_argument(
+        op, "num_kv_splits"
+    ) and _kvarn_op_supports_argument(op, "kernel_variant")
 
 
 @functools.lru_cache(maxsize=2)
@@ -1097,7 +1179,13 @@ def kvarn_decode_attention(
     Hk = kv_cache.shape[1]
     device = query.device
     group = cfg.group
-    dpas_layout = _kvarn_dpas_layout_for_problem(D, group, cfg.key_bits, cfg.value_bits)
+    dpas_layout = _kvarn_dpas_layout_for_problem(
+        impl._kvarn_dpas_layout,
+        D,
+        group,
+        cfg.key_bits,
+        cfg.value_bits,
+    )
     N = B * Hq  # rows for the 2D Q rotation matmul
 
     # The dense fallback uses the same fp16 Hadamard as the K/V store so QKᵀ
@@ -1142,7 +1230,7 @@ def kvarn_decode_attention(
         and impl._tail_V_pool.is_contiguous()
         and q_rot_fp16.is_contiguous()
         and int(md.max_seq_len) >= 1
-        and hasattr(torch.ops._vllm_fa2_C, "kvarn_decode")
+        and kvarn_native_decode_abi_supported(False)
     )
     native_output = getattr(impl, "_native_output_fp16_buf", None)
     use_native_hadamard = (
@@ -1165,7 +1253,9 @@ def kvarn_decode_attention(
             torch.mm(q_input, H16, out=q_rot_fp16)
 
     if use_native_xpu:
-        native_splits = kvarn_native_split_count(int(md.max_seq_len))
+        native_splits = kvarn_native_split_count(
+            int(md.max_seq_len), impl._kvarn_native_max_splits
+        )
         native_scratch = impl._native_decode_scratch
         scratch_fits = (
             native_scratch is not None
@@ -1174,9 +1264,7 @@ def kvarn_decode_attention(
             and native_scratch[1].shape[0] >= B
             and native_scratch[1].shape[2] >= native_splits
         )
-        use_scratch_op = scratch_fits and hasattr(
-            torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch"
-        )
+        use_scratch_op = scratch_fits and kvarn_native_decode_abi_supported(True)
         fuse_output_hadamard = _kvarn_native_output_hadamard_enabled(
             native_splits, use_scratch_op
         )
@@ -1195,11 +1283,13 @@ def kvarn_decode_attention(
         logger.info_once(
             "Using the native Xe2 KVarN qlen=1 decoder (batch limit %d; "
             "native H256 transforms=%s; fused output H256=%s; "
-            "direct bf16 output=%s)",
+            "direct bf16 output=%s; cache layout=%s; splits=%d)",
             _KVARN_NATIVE_MAX_BATCH,
             use_native_hadamard,
             fuse_output_hadamard,
             write_bf16_output,
+            impl._kvarn_cache_layout,
+            native_splits,
         )
         with torch.profiler.record_function("kvarn_native_xpu_decode"):
             if use_scratch_op:
@@ -1219,14 +1309,14 @@ def kvarn_decode_attention(
                     int(md.max_seq_len),
                     scale,
                 )
-                if write_bf16_output:
-                    torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
-                        *decode_args, True, True
-                    )
-                elif fuse_output_hadamard:
-                    torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(*decode_args, True)
-                else:
-                    torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(*decode_args)
+                torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+                    *decode_args,
+                    fuse_output_hadamard,
+                    write_bf16_output,
+                    native_splits,
+                    impl._kvarn_native_kernel_variant,
+                    dpas_layout,
+                )
             else:
                 # This wrapper owns temporary scratch internally. Its C++
                 # implementation records all three allocations on the current
@@ -1244,12 +1334,14 @@ def kvarn_decode_attention(
                     int(md.max_seq_len),
                     scale,
                 )
-                if write_bf16_output:
-                    torch.ops._vllm_fa2_C.kvarn_decode(*decode_args, True, True)
-                elif fuse_output_hadamard:
-                    torch.ops._vllm_fa2_C.kvarn_decode(*decode_args, True)
-                else:
-                    torch.ops._vllm_fa2_C.kvarn_decode(*decode_args)
+                torch.ops._vllm_fa2_C.kvarn_decode(
+                    *decode_args,
+                    fuse_output_hadamard,
+                    write_bf16_output,
+                    native_splits,
+                    impl._kvarn_native_kernel_variant,
+                    dpas_layout,
+                )
         if fuse_output_hadamard:
             return output_rot
         with torch.profiler.record_function("kvarn_output_unrotation"):
@@ -1334,7 +1426,7 @@ def kvarn_decode_attention(
             and (B * Hk <= compute_units)
             and _mid_fits
         )
-    _require_kvarn_dpas_reader(not use_fused, "Triton fused decode")
+    _require_kvarn_dpas_reader(dpas_layout, not use_fused, "Triton fused decode")
     if use_fused and not split_k:
         fused_out = impl._fused_out_buf[:N]  # [N, D] fp16
         with torch.profiler.record_function("kvarn_fused_decode"):
@@ -1449,10 +1541,12 @@ def kvarn_decode_attention(
                 and K_packed.is_contiguous()
                 and V_packed.is_contiguous()
                 and int(md.max_seq_len) >= 1
-                and hasattr(torch.ops._vllm_fa2_C, "kvarn_materialize_packed_kv")
+                and kvarn_native_layout_abi_supported("kvarn_materialize_packed_kv")
             )
             _require_kvarn_dpas_reader(
-                use_native_materializer or dpas_layout, "materializer"
+                dpas_layout,
+                use_native_materializer or dpas_layout,
+                "materializer",
             )
             if use_native_materializer:
                 logger.info_once("Using the native Xe2 KVarN FP16 materializer")
@@ -1467,6 +1561,7 @@ def kvarn_decode_attention(
                     K_packed,
                     V_packed,
                     int(md.max_seq_len),
+                    dpas_layout,
                 )
             else:
                 _kvarn_build_packed_kv_kernel[(B * max_blocks_per_req, Hk)](
@@ -1551,7 +1646,7 @@ def kvarn_verify_attention(
 
     Output: ``[NQ, Hq, D]`` in ``query``'s dtype, un-rotated frame.
     """
-    _require_kvarn_dpas_reader(False, "Triton verify")
+    _require_kvarn_dpas_reader(impl._kvarn_dpas_layout, False, "Triton verify")
     NQ, Hq, D = query.shape
     Hk = kv_cache.shape[1]
     device = query.device

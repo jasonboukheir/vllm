@@ -14,10 +14,14 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     _kvarn_native_output_hadamard_enabled,
     _kvarn_op_supports_argument,
     _require_kvarn_dpas_reader,
+    kvarn_cache_layout_requested,
     kvarn_dpas_layout_requested,
     kvarn_native_bf16_output_supported,
+    kvarn_native_decode_abi_supported,
     kvarn_native_feature_enabled,
+    kvarn_native_kernel_variant_requested,
     kvarn_native_layer_selected,
+    kvarn_native_layout_abi_supported,
     kvarn_native_problem_supported,
     kvarn_native_split_count,
     kvarn_native_store_supported,
@@ -155,10 +159,13 @@ def test_native_problem_rejects_unsupported_abi(override: dict) -> None:
 def test_native_problem_accepts_matching_dpas_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
     monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    assert kvarn_cache_layout_requested() == "natural"
     assert kvarn_native_problem_supported(**_native_problem())
 
     monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
+    assert kvarn_cache_layout_requested() == "xe2_dpas"
     assert kvarn_dpas_layout_requested()
     assert kvarn_native_problem_supported(**_native_problem())
 
@@ -167,28 +174,43 @@ def test_native_problem_accepts_matching_dpas_layout(
     assert kvarn_native_problem_supported(**_native_problem())
 
 
-def test_dpas_layout_refuses_natural_reader_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
-    _require_kvarn_dpas_reader(True, "test reader")
+def test_dpas_layout_refuses_natural_reader_fallback() -> None:
+    _require_kvarn_dpas_reader(True, True, "test reader")
     with pytest.raises(RuntimeError, match="refusing the natural-layout"):
-        _require_kvarn_dpas_reader(False, "test reader")
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "0")
-    _require_kvarn_dpas_reader(False, "test reader")
+        _require_kvarn_dpas_reader(True, False, "test reader")
+    _require_kvarn_dpas_reader(False, False, "test reader")
 
 
-def test_dpas_layout_problem_validation_is_fail_closed(
+def test_dpas_layout_problem_validation_is_fail_closed() -> None:
+    assert not _kvarn_dpas_layout_for_problem(False, 128, 64, 2, 2)
+    assert _kvarn_dpas_layout_for_problem(True, 256, 128, 4, 4)
+    with pytest.raises(RuntimeError, match="requires D256/G128/K4V4"):
+        _kvarn_dpas_layout_for_problem(True, 256, 128, 4, 2)
+
+
+def test_named_layout_selector_rejects_conflicts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    assert not _kvarn_dpas_layout_for_problem(128, 64, 2, 2)
-
+    monkeypatch.setenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", "natural")
     monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
-    assert _kvarn_dpas_layout_for_problem(256, 128, 4, 4)
-    with pytest.raises(RuntimeError, match="requires D256/G128/K4V4"):
-        _kvarn_dpas_layout_for_problem(256, 128, 4, 2)
+    with pytest.raises(ValueError, match="conflicts"):
+        kvarn_cache_layout_requested()
+
+    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT")
+    monkeypatch.setenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", "future_layout")
+    with pytest.raises(ValueError, match="must be one of"):
+        kvarn_cache_layout_requested()
+
+
+def test_native_kernel_variant_selection_is_named_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
+    assert kvarn_native_kernel_variant_requested() == ("baseline", 0)
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", "unknown")
+    with pytest.raises(ValueError, match="must be one of"):
+        kvarn_native_kernel_variant_requested()
 
 
 def test_native_layer_filter_matches_components() -> None:
@@ -231,7 +253,7 @@ def test_native_split_count_defaults_to_validated_multisplit(
     monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
 
     assert kvarn_native_split_count(4096) == 16
-    assert os.environ["KVARN_NATIVE_XPU_SPLITS"] == "16"
+    assert "KVARN_NATIVE_XPU_SPLITS" not in os.environ
     assert kvarn_native_split_count(512) == 1
 
 
@@ -285,6 +307,40 @@ def test_native_bf16_output_schema_detection_is_backward_compatible(
     kvarn_native_bf16_output_supported.cache_clear()
 
 
+def test_native_decode_requires_explicit_factory_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout_only = SimpleNamespace(
+        default=SimpleNamespace(
+            _schema=SimpleNamespace(arguments=[SimpleNamespace(name="dpas_layout")])
+        )
+    )
+    factory_abi = SimpleNamespace(
+        default=SimpleNamespace(
+            _schema=SimpleNamespace(
+                arguments=[
+                    SimpleNamespace(name="num_kv_splits"),
+                    SimpleNamespace(name="kernel_variant"),
+                    SimpleNamespace(name="dpas_layout"),
+                ]
+            )
+        )
+    )
+    fake_ops = SimpleNamespace(
+        kvarn_decode=layout_only,
+        kvarn_decode_with_scratch=factory_abi,
+    )
+    monkeypatch.setattr(kvarn_decode.torch.ops, "_vllm_fa2_C", fake_ops)
+    kvarn_native_layout_abi_supported.cache_clear()
+    kvarn_native_decode_abi_supported.cache_clear()
+
+    assert not kvarn_native_decode_abi_supported(False)
+    assert kvarn_native_decode_abi_supported(True)
+
+    kvarn_native_decode_abi_supported.cache_clear()
+    kvarn_native_layout_abi_supported.cache_clear()
+
+
 def test_native_output_hadamard_requires_multisplit_and_matching_op_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -319,6 +375,7 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
         "kvarn_decode",
         "kvarn_decode_with_scratch",
         "kvarn_materialize_packed_kv",
+        "kvarn_dequant",
         "kvarn_hadamard_scatter",
         "kvarn_hadamard",
     )
@@ -326,6 +383,12 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
         qualified_name = f"_vllm_fa2_C::{name}"
         assert hasattr(torch.ops._vllm_fa2_C, name)
         assert torch._C._dispatch_has_kernel_for_dispatch_key(qualified_name, "Meta")
+        if name != "kvarn_hadamard":
+            assert kvarn_native_layout_abi_supported(name)
+        if name in ("kvarn_decode", "kvarn_decode_with_scratch"):
+            assert kvarn_native_decode_abi_supported(
+                name == "kvarn_decode_with_scratch"
+            )
 
     query = torch.empty((1, 24, 256), dtype=torch.float16, device="meta")
     cache = torch.empty((2, 4, 35_072), dtype=torch.uint8, device="meta")
@@ -349,6 +412,11 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
             output,
             128,
             0.0625,
+            False,
+            False,
+            1,
+            0,
+            False,
         )
         is None
     )
@@ -368,6 +436,10 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
                 128,
                 0.0625,
                 True,
+                False,
+                1,
+                0,
+                False,
             )
             is None
         )
@@ -389,6 +461,9 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
                 0.0625,
                 True,
                 True,
+                1,
+                0,
+                False,
             )
             is None
         )
@@ -411,6 +486,11 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
             output,
             128,
             0.0625,
+            False,
+            False,
+            1,
+            0,
+            False,
         )
         is None
     )
@@ -433,6 +513,10 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
                 128,
                 0.0625,
                 True,
+                False,
+                1,
+                0,
+                False,
             )
             is None
         )
@@ -457,6 +541,9 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
                 0.0625,
                 True,
                 True,
+                1,
+                0,
+                False,
             )
             is None
         )
@@ -475,6 +562,18 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
             materialized_key,
             materialized_value,
             128,
+            False,
+        )
+        is None
+    )
+
+    dequantized_key = torch.empty((2, 4, 256, 128), dtype=torch.float16, device="meta")
+    dequantized_value = torch.empty(
+        (2, 4, 128, 256), dtype=torch.float16, device="meta"
+    )
+    assert (
+        torch.ops._vllm_fa2_C.kvarn_dequant(
+            cache, dequantized_key, dequantized_value, False
         )
         is None
     )
@@ -488,6 +587,7 @@ def test_native_xpu_schemas_have_fake_dispatch() -> None:
             tail_key,
             tail_value,
             128,
+            False,
         )
         is None
     )

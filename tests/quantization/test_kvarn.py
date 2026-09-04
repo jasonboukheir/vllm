@@ -25,13 +25,13 @@ from vllm.v1.attention.backends.kvarn_attn import (
     _is_pure_kvarn_decode_step,
     _is_pure_qlen1_batch,
     _kvarn_block_table_numpy,
-    _kvarn_dpas_layout_for_config,
     _kvarn_prefill_fp16_window_blocks,
     _kvarn_reclaimable_block_ids,
     _kvarn_walk_back_flush_blocks,
     _KVarNMetadataStageRing,
     _protect_kvarn_prefill_window_blocks,
     _reconcile_kvarn_sink_ownership,
+    _resolve_kvarn_cache_layout,
     _rotate_kvarn_kv_into_scratch,
     _use_kvarn_fused_verify,
 )
@@ -464,13 +464,52 @@ def test_dpas_layout_dispatch_requires_exact_cache_config(
 ):
     cfg = SimpleNamespace(head_dim=256, group=128, key_bits=4, value_bits=4)
     monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    assert not _kvarn_dpas_layout_for_config(cfg)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
+    assert _resolve_kvarn_cache_layout(cfg) == "natural"
 
-    monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
-    assert _kvarn_dpas_layout_for_config(cfg)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", "xe2_dpas")
+    assert _resolve_kvarn_cache_layout(cfg) == "xe2_dpas"
     cfg.value_bits = 2
     with pytest.raises(RuntimeError, match="requires D256/G128/K4V4"):
-        _kvarn_dpas_layout_for_config(cfg)
+        _resolve_kvarn_cache_layout(cfg)
+
+
+def test_cache_layout_is_frozen_at_attention_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
+    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        with patch(
+            "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
+            return_value=2,
+        ):
+            impl = KVarNAttentionImpl(
+                num_heads=24,
+                head_size=256,
+                scale=1.0 / 16.0,
+                num_kv_heads=4,
+                kv_cache_dtype="kvarn_k4v4_g128",
+            )
+        assert impl._kvarn_cache_layout == "natural"
+        assert not impl._kvarn_dpas_layout
+        assert impl._kvarn_native_max_splits == 16
+        assert impl._kvarn_native_kernel_variant_name == "baseline"
+        assert impl._kvarn_native_kernel_variant == 0
+
+        monkeypatch.setenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", "xe2_dpas")
+        monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "32")
+        monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", "unknown")
+        assert impl._kvarn_cache_layout == "natural"
+        assert not impl._kvarn_dpas_layout
+        assert impl._kvarn_native_max_splits == 16
+        assert impl._kvarn_native_kernel_variant_name == "baseline"
+        assert impl._kvarn_native_kernel_variant == 0
+    finally:
+        KVarNAttentionImpl.reset_process_state()
 
 
 def test_dpas_layout_bypasses_natural_fused_verify_reader(
