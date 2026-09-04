@@ -250,6 +250,9 @@ def test_native_kernel_variant_selection_is_named_and_fail_closed(
         ("q6_next_page_prefetch_split_reducer", 13),
         ("q6_simd_unpack", 14),
         ("q6_block_output_store", 15),
+        ("q6_current_half_v_prefetch", 16),
+        ("q6_page_record_cursor", 17),
+        ("q6_prefetch_record_cursor", 18),
     ],
 )
 def test_native_kernel_variant_factory_ids_are_stable(
@@ -276,6 +279,9 @@ def test_native_kernel_variant_factory_ids_are_stable(
         ("q6_next_page_prefetch_split_reducer", 13),
         ("q6_simd_unpack", 14),
         ("q6_block_output_store", 15),
+        ("q6_current_half_v_prefetch", 16),
+        ("q6_page_record_cursor", 17),
+        ("q6_prefetch_record_cursor", 18),
     ],
 )
 def test_native_experimental_variants_require_dpas_cache_layout(
@@ -303,6 +309,9 @@ def test_native_experimental_variants_require_dpas_cache_layout(
         ("q6_next_page_prefetch_split_reducer", 13),
         ("q6_simd_unpack", 14),
         ("q6_block_output_store", 15),
+        ("q6_current_half_v_prefetch", 16),
+        ("q6_page_record_cursor", 17),
+        ("q6_prefetch_record_cursor", 18),
     ],
 )
 def test_b70_q6_split_policy_requires_q6_kernel(name: str, variant: int) -> None:
@@ -432,6 +441,9 @@ def test_page_pair_split_count_matches_cpp_k128_boundaries() -> None:
         kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
         kvarn_decode.KVARN_NATIVE_KERNEL_Q6_SIMD_UNPACK,
         kvarn_decode.KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE,
+        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
+        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
+        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
     ],
 )
 def test_k64_variants_keep_established_split_boundaries(kernel_variant: int) -> None:
