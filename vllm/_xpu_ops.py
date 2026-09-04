@@ -44,6 +44,7 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode"):
         max_seq_len: int,
         softmax_scale: float,
         unrotate_output: bool = False,
+        write_bf16_output: bool = False,
     ) -> None:
         return
 
@@ -66,6 +67,7 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch"):
         max_seq_len: int,
         softmax_scale: float,
         unrotate_output: bool = False,
+        write_bf16_output: bool = False,
     ) -> None:
         return
 

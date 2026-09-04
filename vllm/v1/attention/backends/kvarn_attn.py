@@ -2904,8 +2904,16 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         ):
             return output.fill_(0)
 
+        direct_decode_output: torch.Tensor | None = None
         if not attn_metadata.is_prefill:
-            attn_out = self._decode_path(q, kv_cache, attn_metadata)
+            direct_decode_output = output[:N]
+            if output.ndim != 3:
+                direct_decode_output = direct_decode_output.view(
+                    N, self.num_heads, self.head_size
+                )
+            attn_out = self._decode_path(
+                q, kv_cache, attn_metadata, output=direct_decode_output
+            )
         elif (
             attn_metadata.vq_seqlen is not None and attn_metadata.num_decode_tokens == N
         ):
@@ -2929,6 +2937,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 q, key[:N], value[:N], kv_cache, attn_metadata
             )
 
+        if attn_out is direct_decode_output:
+            return output
         if output.ndim == 3:
             output[:N].copy_(attn_out)
         else:
@@ -3109,6 +3119,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         q: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: KVarNMetadata,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Triton-driven decode: in-kernel dequant + scoring + weighted V,
         with the in-progress fp16 tail buffers combined via LSE in PyTorch.
@@ -3136,6 +3147,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cfg=self.kvarn_config,
             impl=self,
             md=attn_metadata,
+            output=output,
         )
 
     def _decode_path_slow(
