@@ -78,6 +78,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     KVARN_CACHE_LAYOUT_NATURAL,
     KVARN_CACHE_LAYOUT_XE2_DPAS,
     KVARN_FRONTEND_QKV_SCATTER,
+    KVARN_PREFILL_STORE_HADAMARD_SCATTER,
     _kvarn_scatter_store_kernel,
     _require_kvarn_dpas_reader,
     kvarn_cache_layout_requested,
@@ -87,9 +88,11 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_kernel_variant_requested,
     kvarn_native_layer_selected,
     kvarn_native_layout_abi_supported,
+    kvarn_native_prefill_store_supported,
     kvarn_native_split_policy_requested,
     kvarn_native_split_scratch_count,
     kvarn_native_store_supported,
+    kvarn_prefill_store_variant_requested,
     validate_kvarn_native_factory_selection,
 )
 from vllm.v1.attention.ops.triton_kvarn_sinkhorn import kvarn_sinkhorn_triton
@@ -188,6 +191,19 @@ def _is_pure_kvarn_decode_step(attn_metadata, num_tokens: int) -> bool:
         and getattr(attn_metadata, "num_decodes", 0) > 0
         and getattr(attn_metadata, "num_decode_tokens", -1) == num_tokens
         and getattr(attn_metadata, "num_actual_tokens", -1) == num_tokens
+    )
+
+
+def _is_pure_kvarn_prefill_step(attn_metadata, num_tokens: int) -> bool:
+    """Return whether every real token belongs to a multi-token prefill."""
+    return (
+        attn_metadata is not None
+        and getattr(attn_metadata, "is_prefill", False)
+        and getattr(attn_metadata, "max_query_len", 0) > 1
+        and getattr(attn_metadata, "num_decodes", -1) == 0
+        and getattr(attn_metadata, "num_decode_tokens", -1) == 0
+        and getattr(attn_metadata, "num_actual_tokens", -1) == num_tokens
+        and num_tokens > 1
     )
 
 
@@ -1708,6 +1724,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             self._kvarn_cache_layout == KVARN_CACHE_LAYOUT_XE2_DPAS
         )
         self._kvarn_frontend_variant = kvarn_frontend_variant_requested()
+        self._kvarn_prefill_store_variant = kvarn_prefill_store_variant_requested()
         self.use_fused_qkv_cache_update = False
         self._kvarn_frontend_bound = False
         self._pending_fused_qkv_signature: tuple | None = None
@@ -1735,6 +1752,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             self._kvarn_native_kernel_variant,
             self._kvarn_native_max_splits,
             self._kvarn_native_split_policy,
+        )
+        logger.info_once(
+            "[KVARN_FACTORY] selected_prefill_store=%s; "
+            "selector=KVARN_NATIVE_XPU_PREFILL_STORE; "
+            "fallback=reference; immutable for engine lifetime",
+            self._kvarn_prefill_store_variant,
         )
         type(self)._select_flush_index_materialization()
         self._kvarn_flush_writer = type(self)._select_flush_writer()
@@ -3211,6 +3234,105 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             self._kvarn_dpas_layout,
         )
 
+    def _native_prefill_scatter_eligible(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata,
+    ) -> bool:
+        """Fail-closed eligibility for the opt-in multi-token Xe2 writer."""
+        if (
+            self._kvarn_prefill_store_variant != KVARN_PREFILL_STORE_HADAMARD_SCATTER
+            or slot_mapping.ndim != 1
+            or not _is_pure_kvarn_prefill_step(attn_metadata, slot_mapping.shape[0])
+        ):
+            return False
+
+        num_tokens = slot_mapping.shape[0]
+        cfg = self.kvarn_config
+        block_to_slot = self._block_to_slot_t
+        tail_key = self._tail_K_pool
+        tail_value = self._tail_V_pool
+        if not all(
+            isinstance(tensor, torch.Tensor)
+            for tensor in (block_to_slot, tail_key, tail_value)
+        ):
+            return False
+
+        is_capturing = (
+            key.device.type == "xpu" and torch.xpu.is_current_stream_capturing()
+        )
+        return (
+            kvarn_native_prefill_store_supported(
+                device_type=key.device.type,
+                num_tokens=num_tokens,
+                num_query_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_size,
+                group=cfg.group,
+                key_bits=cfg.key_bits,
+                value_bits=cfg.value_bits,
+                record_bytes=cfg.record_bytes,
+                sliding_window=int(self.sliding_window or 0),
+                key_dtype=key.dtype,
+                value_dtype=value.dtype,
+                has_lookup=True,
+                has_tail_pool=True,
+                is_capturing=is_capturing,
+                op_available=kvarn_native_layout_abi_supported(
+                    "kvarn_hadamard_scatter"
+                ),
+            )
+            and kvarn_native_layer_selected(
+                getattr(self, "layer_name", ""),
+                os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
+            )
+            and key.ndim == 3
+            and key.shape[0] >= num_tokens
+            and key.shape[1:] == (self.num_kv_heads, self.head_size)
+            and value.ndim == 3
+            and value.shape == key.shape
+            and key.stride(-1) == value.stride(-1) == 1
+            and key.device == value.device
+            and slot_mapping.dtype == torch.int64
+            and slot_mapping.is_contiguous()
+            and slot_mapping.device == key.device
+            and block_to_slot.ndim == 1
+            and block_to_slot.dtype == torch.int32
+            and block_to_slot.is_contiguous()
+            and block_to_slot.device == key.device
+            and tail_key.ndim == 4
+            and tail_value.ndim == 4
+            and tail_key.dtype == torch.float16
+            and tail_value.dtype == torch.float16
+            and tail_key.shape == tail_value.shape
+            and tail_key.shape[1:] == (cfg.group, self.num_kv_heads, self.head_size)
+            and tail_key.stride() == tail_value.stride()
+            and tail_key.stride(-1) == 1
+            and tail_key.device == key.device
+            and tail_value.device == key.device
+        )
+
+    def _launch_native_prefill_scatter(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        num_tokens = slot_mapping.shape[0]
+        torch.ops._vllm_fa2_C.kvarn_hadamard_scatter(
+            key[:num_tokens],
+            value[:num_tokens],
+            slot_mapping[:num_tokens],
+            self._block_to_slot_t,
+            self._tail_K_pool,
+            self._tail_V_pool,
+            self.kvarn_config.group,
+            self._kvarn_dpas_layout,
+        )
+
     def do_qkv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -3286,9 +3408,24 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # capture; first call before capture sizes pool to kv_cache num_blocks).
         self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
 
+        attn_metadata = _active_kvarn_metadata(layer)
+        if self._native_prefill_scatter_eligible(
+            layer, key, value, slot_mapping, attn_metadata
+        ):
+            self._launch_native_prefill_scatter(key, value, slot_mapping)
+            logger.info_once(
+                "[KVARN_PREFILL_STORE] active=hadamard_scatter; "
+                "layer=%s; native_op=kvarn_hadamard_scatter; tokens=%d; "
+                "cache_layout=%s; fallback=reference",
+                getattr(self, "layer_name", ""),
+                N,
+                self._kvarn_cache_layout,
+            )
+            return
+
         is_capturing = device.type == "xpu" and torch.xpu.is_current_stream_capturing()
         use_native_store = (
-            _is_pure_kvarn_decode_step(_active_kvarn_metadata(layer), N)
+            _is_pure_kvarn_decode_step(attn_metadata, N)
             and kvarn_native_store_supported(
                 device_type=device.type,
                 num_tokens=N,
