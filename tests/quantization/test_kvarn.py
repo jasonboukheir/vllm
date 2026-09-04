@@ -23,6 +23,7 @@ from vllm.v1.attention.backends.kvarn_attn import (
     _cast_kvarn_activations,
     _defer_kvarn_prefill_history_blocks,
     _is_pure_kvarn_decode_step,
+    _is_pure_kvarn_prefill_step,
     _is_pure_qlen1_batch,
     _kvarn_block_table_numpy,
     _kvarn_flush_index_materialization_requested,
@@ -126,6 +127,32 @@ def test_native_store_requires_a_pure_qlen1_decode(override, expected):
     assert _is_pure_kvarn_decode_step(SimpleNamespace(**values), 4) is expected
 
 
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({}, True),
+        ({"is_prefill": False}, False),
+        ({"max_query_len": 1}, False),
+        ({"num_decodes": 1}, False),
+        ({"num_decode_tokens": 1}, False),
+        ({"num_actual_tokens": 3}, False),
+    ],
+)
+def test_native_prefill_store_requires_a_pure_multi_token_prefill(override, expected):
+    values = dict(
+        is_prefill=True,
+        max_query_len=4,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_actual_tokens=4,
+    )
+    values.update(override)
+
+    assert _is_pure_kvarn_prefill_step(SimpleNamespace(**values), 4) is expected
+    if not override:
+        assert not _is_pure_kvarn_prefill_step(SimpleNamespace(**values), 1)
+
+
 def _fused_frontend_impl() -> KVarNAttentionImpl:
     impl = object.__new__(KVarNAttentionImpl)
     impl._kvarn_frontend_variant = "qkv_scatter"
@@ -150,6 +177,99 @@ def _fused_frontend_impl() -> KVarNAttentionImpl:
     impl._tail_V_pool = torch.empty_like(impl._tail_K_pool)
     impl._q_rot_fp16_buf = torch.empty(48, 256, dtype=torch.float16)
     return impl
+
+
+def _prefill_scatter_impl() -> KVarNAttentionImpl:
+    impl = _fused_frontend_impl()
+    impl._kvarn_prefill_store_variant = "hadamard_scatter"
+    impl.use_fused_qkv_cache_update = False
+    return impl
+
+
+def _pure_prefill_metadata(tokens: int = 4) -> SimpleNamespace:
+    return SimpleNamespace(
+        is_prefill=True,
+        max_query_len=tokens,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_actual_tokens=tokens,
+    )
+
+
+def test_native_prefill_scatter_eligibility_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    impl = _prefill_scatter_impl()
+    metadata = _pure_prefill_metadata()
+    key = torch.empty(4, 4, 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    slots = torch.tensor([0, 1, 128, 257], dtype=torch.int64)
+    layer = SimpleNamespace()
+
+    monkeypatch.setattr(
+        kvarn_attn, "kvarn_native_prefill_store_supported", lambda **_: True
+    )
+    monkeypatch.setattr(kvarn_attn, "kvarn_native_layer_selected", lambda *_: True)
+
+    assert impl._native_prefill_scatter_eligible(layer, key, value, slots, metadata)
+    impl._kvarn_prefill_store_variant = "reference"
+    assert not impl._native_prefill_scatter_eligible(layer, key, value, slots, metadata)
+    impl._kvarn_prefill_store_variant = "hadamard_scatter"
+    assert not impl._native_prefill_scatter_eligible(
+        layer, key, value, slots, _pure_decode_metadata(tokens=4)
+    )
+    assert not impl._native_prefill_scatter_eligible(
+        layer, key[:, :, ::2], value[:, :, ::2], slots, metadata
+    )
+    assert not impl._native_prefill_scatter_eligible(
+        layer, key, value, slots.to(torch.int32), metadata
+    )
+    impl._block_to_slot_t = None
+    assert not impl._native_prefill_scatter_eligible(layer, key, value, slots, metadata)
+    impl._block_to_slot_t = torch.zeros(2, dtype=torch.int32)
+    impl._tail_V_pool = None
+    assert not impl._native_prefill_scatter_eligible(layer, key, value, slots, metadata)
+
+
+def test_native_prefill_scatter_dispatch_bypasses_reference_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    impl = _prefill_scatter_impl()
+    metadata = _pure_prefill_metadata()
+    key = torch.empty(4, 4, 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    slots = torch.tensor([0, 1, 128, 257], dtype=torch.int64)
+    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
+    layer = SimpleNamespace()
+    launch = Mock()
+    marker = Mock()
+
+    monkeypatch.setattr(kvarn_attn, "_active_kvarn_metadata", lambda _: metadata)
+    monkeypatch.setattr(kvarn_attn.logger, "info_once", marker)
+    monkeypatch.setattr(impl, "_ensure_pool", Mock())
+    monkeypatch.setattr(impl, "_native_prefill_scatter_eligible", lambda *_: True)
+    monkeypatch.setattr(impl, "_launch_native_prefill_scatter", launch)
+    monkeypatch.setattr(
+        kvarn_attn,
+        "_rotate_kvarn_kv_into_scratch",
+        Mock(side_effect=AssertionError("reference writer executed")),
+    )
+
+    impl.do_kv_cache_update(layer, key, value, cache, slots)
+
+    launch.assert_called_once_with(key, value, slots)
+    marker.assert_called_once_with(
+        "[KVARN_PREFILL_STORE] active=hadamard_scatter; "
+        "layer=%s; native_op=kvarn_hadamard_scatter; tokens=%d; "
+        "cache_layout=%s; fallback=reference",
+        "model.layers.0.self_attn",
+        4,
+        "xe2_dpas",
+    )
 
 
 def _pure_decode_metadata(tokens: int = 2) -> SimpleNamespace:
@@ -826,6 +946,45 @@ def test_fused_qkv_frontend_is_frozen_and_reported(
         assert impl.use_fused_qkv_cache_update
         with pytest.raises(RuntimeError, match="layer binding is immutable"):
             impl.configure_fused_qkv_cache_update("model.layers.1.self_attn")
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_prefill_store_is_frozen_and_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
+    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_PREFILL_STORE", "hadamard_scatter")
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        with (
+            patch(
+                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
+                return_value=2,
+            ),
+            patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker,
+        ):
+            impl = KVarNAttentionImpl(
+                num_heads=24,
+                head_size=256,
+                scale=1.0 / 16.0,
+                num_kv_heads=4,
+                kv_cache_dtype="kvarn_k4v4_g128",
+            )
+
+        assert impl._kvarn_prefill_store_variant == "hadamard_scatter"
+        marker.assert_any_call(
+            "[KVARN_FACTORY] selected_prefill_store=%s; "
+            "selector=KVARN_NATIVE_XPU_PREFILL_STORE; "
+            "fallback=reference; immutable for engine lifetime",
+            "hadamard_scatter",
+        )
+        monkeypatch.setenv("KVARN_NATIVE_XPU_PREFILL_STORE", "reference")
+        assert impl._kvarn_prefill_store_variant == "hadamard_scatter"
     finally:
         KVarNAttentionImpl.reset_process_state()
 

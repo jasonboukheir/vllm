@@ -24,11 +24,13 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_kernel_variant_requested,
     kvarn_native_layer_selected,
     kvarn_native_layout_abi_supported,
+    kvarn_native_prefill_store_supported,
     kvarn_native_problem_supported,
     kvarn_native_split_count,
     kvarn_native_split_policy_requested,
     kvarn_native_split_scratch_count,
     kvarn_native_store_supported,
+    kvarn_prefill_store_variant_requested,
     validate_kvarn_native_factory_selection,
 )
 
@@ -45,6 +47,20 @@ def test_fused_qkv_frontend_requires_explicit_valid_selection(
     monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "automatic")
     with pytest.raises(ValueError, match="KVARN_NATIVE_XPU_FRONTEND"):
         kvarn_frontend_variant_requested()
+
+
+def test_prefill_store_requires_explicit_valid_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU_PREFILL_STORE", raising=False)
+    assert kvarn_prefill_store_variant_requested() == "reference"
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_PREFILL_STORE", "hadamard_scatter")
+    assert kvarn_prefill_store_variant_requested() == "hadamard_scatter"
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_PREFILL_STORE", "automatic")
+    with pytest.raises(ValueError, match="KVARN_NATIVE_XPU_PREFILL_STORE"):
+        kvarn_prefill_store_variant_requested()
 
 
 def _native_problem(**overrides) -> dict:
@@ -110,6 +126,12 @@ def _native_store(**overrides) -> dict:
     return problem
 
 
+def _native_prefill_store(**overrides) -> dict:
+    problem = _native_store(num_tokens=4096)
+    problem.update(overrides)
+    return problem
+
+
 def test_native_store_follows_decode_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("KVARN_NATIVE_XPU", raising=False)
     monkeypatch.setattr(kvarn_decode.current_platform, "is_xpu", lambda: True)
@@ -123,6 +145,43 @@ def test_native_store_follows_decode_switch(monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.setenv("KVARN_NATIVE_XPU_DECODE", "0")
     assert not kvarn_native_store_supported(**_native_store())
+
+
+def test_native_prefill_store_follows_master_switch_and_has_no_decode_batch_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
+    assert kvarn_native_prefill_store_supported(**_native_prefill_store())
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU", "0")
+    assert not kvarn_native_prefill_store_supported(**_native_prefill_store())
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"device_type": "cuda"},
+        {"num_tokens": 1},
+        {"num_query_heads": 32},
+        {"num_kv_heads": 8},
+        {"head_dim": 128},
+        {"group": 64},
+        {"value_bits": 2},
+        {"record_bytes": 35_071},
+        {"sliding_window": 1024},
+        {"key_dtype": torch.float32, "value_dtype": torch.float32},
+        {"value_dtype": torch.float16},
+        {"has_lookup": False},
+        {"has_tail_pool": False},
+        {"is_capturing": True},
+        {"op_available": False},
+    ],
+)
+def test_native_prefill_store_rejects_unsupported_dispatch(
+    monkeypatch: pytest.MonkeyPatch, override: dict
+) -> None:
+    monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
+    assert not kvarn_native_prefill_store_supported(**_native_prefill_store(**override))
 
 
 @pytest.mark.parametrize(

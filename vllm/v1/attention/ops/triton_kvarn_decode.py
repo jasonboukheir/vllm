@@ -63,6 +63,11 @@ KVARN_FRONTEND_QKV_SCATTER = "qkv_scatter"
 _KVARN_FRONTEND_VARIANTS = frozenset(
     {KVARN_FRONTEND_REFERENCE, KVARN_FRONTEND_QKV_SCATTER}
 )
+KVARN_PREFILL_STORE_REFERENCE = "reference"
+KVARN_PREFILL_STORE_HADAMARD_SCATTER = "hadamard_scatter"
+_KVARN_PREFILL_STORE_VARIANTS = frozenset(
+    {KVARN_PREFILL_STORE_REFERENCE, KVARN_PREFILL_STORE_HADAMARD_SCATTER}
+)
 KVARN_NATIVE_KERNEL_BASELINE = 0
 KVARN_NATIVE_KERNEL_QK_I8U4 = 1
 KVARN_NATIVE_KERNEL_Q6_SCALAR = 2
@@ -164,6 +169,12 @@ def _kvarn_native_work_unit_tokens(kernel_variant: int) -> int:
     return 128 if kernel_variant == KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR else 64
 
 
+def _kvarn_native_master_enabled() -> bool:
+    """Return the platform-aware native KVarN master selection."""
+    native_default = "1" if current_platform.is_xpu() else "0"
+    return os.environ.get("KVARN_NATIVE_XPU", native_default) == "1"
+
+
 def kvarn_native_feature_enabled(feature: str) -> bool:
     """Return whether a native KVarN XPU sub-feature is enabled.
 
@@ -171,9 +182,8 @@ def kvarn_native_feature_enabled(feature: str) -> bool:
     for rollback or comparison; individual sub-features can also be disabled.
     Unsupported shapes and missing custom ops still fall back to Triton.
     """
-    native_default = "1" if current_platform.is_xpu() else "0"
     return (
-        os.environ.get("KVARN_NATIVE_XPU", native_default) == "1"
+        _kvarn_native_master_enabled()
         and os.environ.get(f"KVARN_NATIVE_XPU_{feature}", "1") == "1"
     )
 
@@ -220,6 +230,17 @@ def kvarn_frontend_variant_requested() -> str:
     if variant not in _KVARN_FRONTEND_VARIANTS:
         choices = ", ".join(sorted(_KVARN_FRONTEND_VARIANTS))
         raise ValueError(f"KVARN_NATIVE_XPU_FRONTEND must be one of: {choices}")
+    return variant
+
+
+def kvarn_prefill_store_variant_requested() -> str:
+    """Resolve the immutable multi-token K/V prefill-store selection."""
+    variant = os.environ.get(
+        "KVARN_NATIVE_XPU_PREFILL_STORE", KVARN_PREFILL_STORE_REFERENCE
+    )
+    if variant not in _KVARN_PREFILL_STORE_VARIANTS:
+        choices = ", ".join(sorted(_KVARN_PREFILL_STORE_VARIANTS))
+        raise ValueError("KVARN_NATIVE_XPU_PREFILL_STORE must be one of: " + choices)
     return variant
 
 
@@ -584,6 +605,54 @@ def kvarn_native_store_supported(
         )
         and key_dtype in (torch.float16, torch.bfloat16)
         and value_dtype == key_dtype
+        and op_available
+    )
+
+
+def kvarn_native_prefill_store_supported(
+    *,
+    device_type: str,
+    num_tokens: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    group: int,
+    key_bits: int,
+    value_bits: int,
+    record_bytes: int,
+    sliding_window: int,
+    key_dtype: torch.dtype,
+    value_dtype: torch.dtype,
+    has_lookup: bool,
+    has_tail_pool: bool,
+    is_capturing: bool,
+    op_available: bool,
+) -> bool:
+    """Pure eligibility check for the opt-in Xe2 multi-token K/V writer.
+
+    Unlike the qlen=1 decoder/store contract this path has no B<=12 limit: the
+    writer launches one independent subgroup per (token, K/V, KV head), and
+    its ABI carries the token count as an int64. Runtime tensor-shape checks
+    remain in the backend before the custom op is called.
+    """
+    return (
+        _kvarn_native_master_enabled()
+        and device_type == "xpu"
+        and num_tokens > 1
+        and num_query_heads == 24
+        and num_kv_heads == 4
+        and head_dim == 256
+        and group == 128
+        and key_bits == 4
+        and value_bits == 4
+        and record_bytes >= _KVARN_NATIVE_RECORD_BYTES
+        and record_bytes % 4 == 0
+        and sliding_window == 0
+        and key_dtype in (torch.float16, torch.bfloat16)
+        and value_dtype == key_dtype
+        and has_lookup
+        and has_tail_pool
+        and not is_capturing
         and op_available
     )
 
