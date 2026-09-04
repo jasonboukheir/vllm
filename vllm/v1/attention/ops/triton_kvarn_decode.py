@@ -32,6 +32,11 @@ logger = init_logger(__name__)
 _KVARN_NATIVE_RECORD_BYTES = 35_072
 _KVARN_NATIVE_SPLIT_COUNTS = frozenset({1, 2, 4, 8, 16, 17, 24, 32})
 _KVARN_NATIVE_MAX_BATCH = 12
+KVARN_NATIVE_SPLIT_POLICY_FIXED = "fixed"
+KVARN_NATIVE_SPLIT_POLICY_B70_Q6 = "b70_q6"
+_KVARN_NATIVE_SPLIT_POLICIES = frozenset(
+    {KVARN_NATIVE_SPLIT_POLICY_FIXED, KVARN_NATIVE_SPLIT_POLICY_B70_Q6}
+)
 KVARN_CACHE_LAYOUT_NATURAL = "natural"
 KVARN_CACHE_LAYOUT_XE2_DPAS = "xe2_dpas"
 _KVARN_CACHE_LAYOUTS = frozenset(
@@ -42,12 +47,19 @@ KVARN_NATIVE_KERNEL_QK_I8U4 = 1
 KVARN_NATIVE_KERNEL_Q6_SCALAR = 2
 KVARN_NATIVE_KERNEL_Q8_VECTOR = 3
 KVARN_NATIVE_KERNEL_Q6_VECTOR = 4
+_KVARN_NATIVE_KERNEL_PAGE128_RESERVED = 5
+KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS = 6
+KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS = 7
+KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS = 8
 _KVARN_NATIVE_KERNEL_VARIANTS = {
     "baseline": KVARN_NATIVE_KERNEL_BASELINE,
     "qk_i8u4": KVARN_NATIVE_KERNEL_QK_I8U4,
     "q6_scalar": KVARN_NATIVE_KERNEL_Q6_SCALAR,
     "q8_vector": KVARN_NATIVE_KERNEL_Q8_VECTOR,
     "q6_vector": KVARN_NATIVE_KERNEL_Q6_VECTOR,
+    "q6_cached_weights": KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS,
+    "q6_exact_rows": KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS,
+    "q6_cached_weights_exact_rows": KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS,
 }
 _KVARN_NATIVE_DPAS_ONLY_KERNEL_VARIANTS = frozenset(
     {
@@ -55,6 +67,18 @@ _KVARN_NATIVE_DPAS_ONLY_KERNEL_VARIANTS = frozenset(
         KVARN_NATIVE_KERNEL_Q6_SCALAR,
         KVARN_NATIVE_KERNEL_Q8_VECTOR,
         KVARN_NATIVE_KERNEL_Q6_VECTOR,
+        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS,
+        KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS,
+        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS,
+    }
+)
+_KVARN_NATIVE_Q6_KERNEL_VARIANTS = frozenset(
+    {
+        KVARN_NATIVE_KERNEL_Q6_SCALAR,
+        KVARN_NATIVE_KERNEL_Q6_VECTOR,
+        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS,
+        KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS,
+        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS,
     }
 )
 
@@ -136,8 +160,22 @@ def _kvarn_dpas_layout_for_problem(
     return True
 
 
-def kvarn_native_split_policy_requested() -> int:
-    """Resolve the fixed maximum split count for one engine initialization."""
+def kvarn_native_split_policy_requested() -> tuple[str, int]:
+    """Resolve the split policy and scratch capacity once per engine."""
+    policy = os.environ.get(
+        "KVARN_NATIVE_XPU_SPLIT_POLICY", KVARN_NATIVE_SPLIT_POLICY_FIXED
+    )
+    if policy not in _KVARN_NATIVE_SPLIT_POLICIES:
+        choices = ", ".join(sorted(_KVARN_NATIVE_SPLIT_POLICIES))
+        raise ValueError(f"KVARN_NATIVE_XPU_SPLIT_POLICY must be one of: {choices}")
+    if policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6:
+        if "KVARN_NATIVE_XPU_SPLITS" in os.environ:
+            raise ValueError(
+                "KVARN_NATIVE_XPU_SPLITS conflicts with "
+                "KVARN_NATIVE_XPU_SPLIT_POLICY=b70_q6"
+            )
+        return policy, 32
+
     text = os.environ.get("KVARN_NATIVE_XPU_SPLITS", "16")
     try:
         splits = int(text)
@@ -149,7 +187,7 @@ def kvarn_native_split_policy_requested() -> int:
         raise ValueError(
             "KVARN_NATIVE_XPU_SPLITS must be one of 1, 2, 4, 8, 16, 17, 24, or 32"
         )
-    return splits
+    return policy, splits
 
 
 def kvarn_native_kernel_variant_requested() -> tuple[str, int]:
@@ -165,9 +203,14 @@ def kvarn_native_kernel_variant_requested() -> tuple[str, int]:
 
 
 def validate_kvarn_native_factory_selection(
-    cache_layout: str, kernel_variant_name: str, kernel_variant: int
+    cache_layout: str,
+    kernel_variant_name: str,
+    kernel_variant: int,
+    split_policy: str = KVARN_NATIVE_SPLIT_POLICY_FIXED,
 ) -> None:
     """Fail before cache allocation when a kernel/layout ABI is incompatible."""
+    if kernel_variant == _KVARN_NATIVE_KERNEL_PAGE128_RESERVED:
+        raise ValueError("KVarN kernel variant 5 is reserved and cannot be selected")
     if (
         kernel_variant in _KVARN_NATIVE_DPAS_ONLY_KERNEL_VARIANTS
         and cache_layout != KVARN_CACHE_LAYOUT_XE2_DPAS
@@ -176,17 +219,45 @@ def validate_kvarn_native_factory_selection(
             f"KVarN kernel variant {kernel_variant_name!r} requires "
             f"KVARN_NATIVE_XPU_CACHE_LAYOUT={KVARN_CACHE_LAYOUT_XE2_DPAS}"
         )
+    if (
+        split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6
+        and kernel_variant not in _KVARN_NATIVE_Q6_KERNEL_VARIANTS
+    ):
+        raise ValueError("KVarN split policy 'b70_q6' requires a Q6 kernel variant")
 
 
 @functools.lru_cache(maxsize=256)
-def _kvarn_native_split_count_cached(max_seq_len: int, max_splits: int) -> int:
+def _kvarn_native_split_count_cached(
+    max_seq_len: int, max_splits: int, batch_size: int, split_policy: str
+) -> int:
+    splits = max_splits
+    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6:
+        if not 1 <= batch_size <= _KVARN_NATIVE_MAX_BATCH:
+            raise ValueError("b70_q6 split policy supports batch sizes 1 through 12")
+        if batch_size == 1:
+            splits = 32
+        elif batch_size == 2:
+            splits = 16
+        elif batch_size <= 4:
+            splits = 8
+        elif batch_size <= 8:
+            splits = 4
+        else:
+            splits = 2
+
     # The C++ wrapper collapses short-context multi-split requests to one split
     # to avoid empty partials and their reduction drift.
     kv_tiles = (max_seq_len + 63) // 64
-    return 1 if max_splits > 1 and kv_tiles < max_splits else max_splits
+    return 1 if splits > 1 and kv_tiles < splits else splits
 
 
-def kvarn_native_split_count(max_seq_len: int, max_splits: int | None = None) -> int:
+def kvarn_native_split_count(
+    max_seq_len: int,
+    max_splits: int | None = None,
+    *,
+    batch_size: int = 1,
+    split_policy: str | None = None,
+) -> int:
     """Select the explicit native split count for one context extent.
 
     Production callers pass the policy frozen by ``KVarNAttentionImpl``. The
@@ -194,8 +265,44 @@ def kvarn_native_split_count(max_seq_len: int, max_splits: int | None = None) ->
     direct callers without moving policy back into C++.
     """
     if max_splits is None:
-        max_splits = kvarn_native_split_policy_requested()
-    return _kvarn_native_split_count_cached(max_seq_len, max_splits)
+        requested_policy, max_splits = kvarn_native_split_policy_requested()
+        if split_policy is None:
+            split_policy = requested_policy
+    elif split_policy is None:
+        split_policy = KVARN_NATIVE_SPLIT_POLICY_FIXED
+    if split_policy not in _KVARN_NATIVE_SPLIT_POLICIES:
+        raise ValueError(f"unknown KVarN native split policy: {split_policy}")
+    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6 and max_splits != 32:
+        raise ValueError("b70_q6 split policy requires max_splits=32")
+    return _kvarn_native_split_count_cached(
+        max_seq_len, max_splits, batch_size, split_policy
+    )
+
+
+def kvarn_native_split_scratch_count(
+    max_seq_len: int, max_splits: int, split_policy: str
+) -> int:
+    """Return persistent scratch capacity for the engine-lifetime policy."""
+    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6:
+        if max_splits != 32:
+            raise ValueError("b70_q6 split policy requires max_splits=32")
+        return max_splits
+    return kvarn_native_split_count(max_seq_len, max_splits)
+
+
+def _kvarn_native_scratch_views(
+    native_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    batch_size: int,
+    num_query_heads: int,
+    num_splits: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Slice capacity-sized scratch to the custom operator's exact ABI."""
+    temp_output, exp_sums, max_logits = native_scratch
+    return (
+        temp_output[:batch_size, : num_query_heads * num_splits],
+        exp_sums[:batch_size, :, :num_splits],
+        max_logits[:batch_size, :, :num_splits],
+    )
 
 
 def _kvarn_op_supports_argument(op: object, argument: str) -> bool:
@@ -1286,7 +1393,10 @@ def kvarn_decode_attention(
 
     if use_native_xpu:
         native_splits = kvarn_native_split_count(
-            int(md.max_seq_len), impl._kvarn_native_max_splits
+            int(md.max_seq_len),
+            impl._kvarn_native_max_splits,
+            batch_size=B,
+            split_policy=impl._kvarn_native_split_policy,
         )
         native_scratch = impl._native_decode_scratch
         scratch_fits = (
@@ -1295,6 +1405,8 @@ def kvarn_decode_attention(
             and native_scratch[0].shape[1] >= Hq * native_splits
             and native_scratch[1].shape[0] >= B
             and native_scratch[1].shape[2] >= native_splits
+            and native_scratch[2].shape[0] >= B
+            and native_scratch[2].shape[2] >= native_splits
         )
         use_scratch_op = scratch_fits and kvarn_native_decode_abi_supported(True)
         fuse_output_hadamard = _kvarn_native_output_hadamard_enabled(
@@ -1325,7 +1437,10 @@ def kvarn_decode_attention(
         )
         with torch.profiler.record_function("kvarn_native_xpu_decode"):
             if use_scratch_op:
-                temp_output, exp_sums, max_logits = native_scratch
+                assert native_scratch is not None
+                temp_output, exp_sums, max_logits = _kvarn_native_scratch_views(
+                    native_scratch, B, Hq, native_splits
+                )
                 decode_args = (
                     q_rot_fp16.view(B, Hq, D),
                     kv_cache,
@@ -1334,9 +1449,9 @@ def kvarn_decode_attention(
                     impl._block_to_slot_t,
                     impl._tail_K_pool,
                     impl._tail_V_pool,
-                    temp_output[:B],
-                    exp_sums[:B],
-                    max_logits[:B],
+                    temp_output,
+                    exp_sums,
+                    max_logits,
                     output_rot,
                     int(md.max_seq_len),
                     scale,

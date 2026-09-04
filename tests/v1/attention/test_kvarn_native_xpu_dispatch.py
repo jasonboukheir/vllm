@@ -12,6 +12,7 @@ import vllm.v1.attention.ops.triton_kvarn_decode as kvarn_decode
 from vllm.v1.attention.ops.triton_kvarn_decode import (
     _kvarn_dpas_layout_for_problem,
     _kvarn_native_output_hadamard_enabled,
+    _kvarn_native_scratch_views,
     _kvarn_op_supports_argument,
     _require_kvarn_dpas_reader,
     kvarn_cache_layout_requested,
@@ -24,6 +25,8 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_layout_abi_supported,
     kvarn_native_problem_supported,
     kvarn_native_split_count,
+    kvarn_native_split_policy_requested,
+    kvarn_native_split_scratch_count,
     kvarn_native_store_supported,
     validate_kvarn_native_factory_selection,
 )
@@ -222,6 +225,9 @@ def test_native_kernel_variant_selection_is_named_and_fail_closed(
         ("q6_scalar", 2),
         ("q8_vector", 3),
         ("q6_vector", 4),
+        ("q6_cached_weights", 6),
+        ("q6_exact_rows", 7),
+        ("q6_cached_weights_exact_rows", 8),
     ],
 )
 def test_native_kernel_variant_factory_ids_are_stable(
@@ -233,7 +239,15 @@ def test_native_kernel_variant_factory_ids_are_stable(
 
 @pytest.mark.parametrize(
     ("name", "variant"),
-    [("qk_i8u4", 1), ("q6_scalar", 2), ("q8_vector", 3), ("q6_vector", 4)],
+    [
+        ("qk_i8u4", 1),
+        ("q6_scalar", 2),
+        ("q8_vector", 3),
+        ("q6_vector", 4),
+        ("q6_cached_weights", 6),
+        ("q6_exact_rows", 7),
+        ("q6_cached_weights_exact_rows", 8),
+    ],
 )
 def test_native_experimental_variants_require_dpas_cache_layout(
     name: str, variant: int
@@ -243,6 +257,31 @@ def test_native_experimental_variants_require_dpas_cache_layout(
         validate_kvarn_native_factory_selection("natural", name, variant)
 
     validate_kvarn_native_factory_selection("natural", "baseline", 0)
+
+
+@pytest.mark.parametrize(
+    ("name", "variant"),
+    [
+        ("q6_scalar", 2),
+        ("q6_vector", 4),
+        ("q6_cached_weights", 6),
+        ("q6_exact_rows", 7),
+        ("q6_cached_weights_exact_rows", 8),
+    ],
+)
+def test_b70_q6_split_policy_requires_q6_kernel(name: str, variant: int) -> None:
+    validate_kvarn_native_factory_selection(
+        "xe2_dpas", name, variant, split_policy="b70_q6"
+    )
+    with pytest.raises(ValueError, match="requires a Q6 kernel variant"):
+        validate_kvarn_native_factory_selection(
+            "xe2_dpas", "baseline", 0, split_policy="b70_q6"
+        )
+
+
+def test_native_kernel_variant_five_remains_reserved() -> None:
+    with pytest.raises(ValueError, match="variant 5 is reserved"):
+        validate_kvarn_native_factory_selection("xe2_dpas", "page128", 5)
 
 
 def test_native_layer_filter_matches_components() -> None:
@@ -264,6 +303,7 @@ def test_native_split_count_matches_cpp_short_context_rule(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kvarn_decode._kvarn_native_split_count_cached.cache_clear()
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
     monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "32")
     assert kvarn_native_split_count(4096) == 32
     assert kvarn_native_split_count(4096) == 32
@@ -282,11 +322,82 @@ def test_native_split_count_defaults_to_validated_multisplit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kvarn_decode._kvarn_native_split_count_cached.cache_clear()
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
     monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
 
+    assert kvarn_native_split_policy_requested() == ("fixed", 16)
     assert kvarn_native_split_count(4096) == 16
     assert "KVARN_NATIVE_XPU_SPLITS" not in os.environ
     assert kvarn_native_split_count(512) == 1
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "expected_splits"),
+    [(1, 32), (2, 16), (3, 8), (4, 8), (5, 4), (8, 4), (9, 2), (12, 2)],
+)
+def test_b70_q6_split_policy_is_batch_aware(
+    monkeypatch: pytest.MonkeyPatch, batch_size: int, expected_splits: int
+) -> None:
+    kvarn_decode._kvarn_native_split_count_cached.cache_clear()
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6")
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
+
+    policy, max_splits = kvarn_native_split_policy_requested()
+
+    assert (policy, max_splits) == ("b70_q6", 32)
+    assert (
+        kvarn_native_split_count(
+            4096,
+            max_splits,
+            batch_size=batch_size,
+            split_policy=policy,
+        )
+        == expected_splits
+    )
+    assert kvarn_native_split_scratch_count(4096, max_splits, policy) == 32
+
+
+def test_b70_q6_split_policy_preserves_short_context_collapse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6")
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
+
+    assert kvarn_native_split_count(1024, batch_size=1) == 1
+    assert kvarn_native_split_count(1024, batch_size=2) == 16
+
+
+def test_batch_aware_policy_slices_capacity_scratch_to_exact_invocation_shape() -> None:
+    scratch = (
+        torch.empty((12, 24 * 32, 256), device="meta"),
+        torch.empty((12, 24, 32), device="meta"),
+        torch.empty((12, 24, 32), device="meta"),
+    )
+
+    temp_output, exp_sums, max_logits = _kvarn_native_scratch_views(
+        scratch, batch_size=4, num_query_heads=24, num_splits=8
+    )
+
+    assert temp_output.shape == (4, 24 * 8, 256)
+    assert exp_sums.shape == (4, 24, 8)
+    assert max_logits.shape == (4, 24, 8)
+
+
+def test_b70_q6_split_policy_rejects_ambiguous_or_unsupported_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6")
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "32")
+    with pytest.raises(ValueError, match="conflicts"):
+        kvarn_native_split_policy_requested()
+
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS")
+    with pytest.raises(ValueError, match="batch sizes 1 through 12"):
+        kvarn_native_split_count(4096, batch_size=13)
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "unknown")
+    with pytest.raises(ValueError, match="must be one of"):
+        kvarn_native_split_policy_requested()
 
 
 def test_native_output_hadamard_schema_detection_is_backward_compatible() -> None:
