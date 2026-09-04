@@ -45,10 +45,11 @@ _KVARN_NATIVE_SPLIT_POLICIES = frozenset(
 _KVARN_NATIVE_B70_Q6_POLICIES = frozenset(
     {KVARN_NATIVE_SPLIT_POLICY_B70_Q6, KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2}
 )
-# The B70 primitive factory sweep factory-b70-20260904T112836Z.json showed that
-# ID12 B4 prefers S=8 at 4K and 16K, but S=32 at 65,023 tokens. Keep the
-# lower-overhead S=8 schedule through 48 Ki tokens and switch only above that
-# conservative, deliberately late boundary. The unmeasured crossover should
+# The B70 primitive factory sweeps showed that ID12 and its independently
+# selectable ID13 reducer variant prefer S=8 at 4K and 16K, but S=32 at
+# 65,023 tokens. Keep the lower-overhead S=8 schedule through 48 Ki tokens and
+# switch only above that conservative, deliberately late boundary. The
+# unmeasured crossover should
 # be retuned from matched service ABBA measurements rather than inferred more
 # aggressively from three points.
 _KVARN_NATIVE_B70_Q6_V2_B4_SPLIT32_AFTER = 48 * 1024
@@ -76,6 +77,12 @@ KVARN_NATIVE_KERNEL_Q6_MAIN_GRF128 = 10
 KVARN_NATIVE_KERNEL_Q6_SPLIT_REDUCER_SPECIALIZED = 11
 KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH = 12
 KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER = 13
+_KVARN_NATIVE_B70_Q6_V2_KERNEL_VARIANTS = frozenset(
+    {
+        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
+        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
+    }
+)
 KVARN_NATIVE_KERNEL_Q6_SIMD_UNPACK = 14
 KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE = 15
 _KVARN_NATIVE_KERNEL_VARIANTS = {
@@ -304,11 +311,12 @@ def validate_kvarn_native_factory_selection(
         )
     if (
         split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2
-        and kernel_variant != KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH
+        and kernel_variant not in _KVARN_NATIVE_B70_Q6_V2_KERNEL_VARIANTS
     ):
         raise ValueError(
             "KVarN split policy 'b70_q6_v2' requires kernel variant "
-            "'q6_next_page_prefetch'(12)"
+            "'q6_next_page_prefetch'(12) or "
+            "'q6_next_page_prefetch_split_reducer'(13)"
         )
 
 
