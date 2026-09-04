@@ -87,6 +87,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_layout_abi_supported,
     kvarn_native_split_policy_requested,
     kvarn_native_store_supported,
+    validate_kvarn_native_factory_selection,
 )
 from vllm.v1.attention.ops.triton_kvarn_sinkhorn import kvarn_sinkhorn_triton
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
@@ -1565,6 +1566,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             self._kvarn_native_kernel_variant_name,
             self._kvarn_native_kernel_variant,
         ) = kvarn_native_kernel_variant_requested()
+        validate_kvarn_native_factory_selection(
+            self._kvarn_cache_layout,
+            self._kvarn_native_kernel_variant_name,
+            self._kvarn_native_kernel_variant,
+        )
         logger.info_once(
             "[KVARN_FACTORY] selected_cache_layout=%s; "
             "selected_kernel_variant=%s(%d); max_decode_splits=%d; "
