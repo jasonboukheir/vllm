@@ -21,15 +21,50 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
-def _enable_kvarn_onednn_determinism(cache_dtype: str | None) -> bool:
+_KVARN_ONEDNN_DETERMINISTIC_ENV = "KVARN_ONEDNN_DETERMINISTIC"
+
+
+def _configure_kvarn_onednn_determinism(cache_dtype: str | None) -> bool | None:
+    """Select the process-wide oneDNN determinism policy for KVarN.
+
+    Deterministic oneDNN remains the safe default because KVarN qualification
+    requires identical replay results.  The explicit opt-out is an attributable
+    performance diagnostic; parsing is deliberately strict so a misspelling
+    cannot silently weaken that contract.
+
+    Returns the selected value for a KVarN cache, or ``None`` when KVarN is not
+    active and this selector therefore owns no process-wide state.
+    """
     if not isinstance(cache_dtype, str) or not cache_dtype.startswith("kvarn_"):
-        return False
+        return None
+
+    raw_value = os.environ.get(_KVARN_ONEDNN_DETERMINISTIC_ENV)
+    if raw_value is None:
+        deterministic = True
+        source = "safe-default"
+    elif raw_value == "1":
+        deterministic = True
+        source = _KVARN_ONEDNN_DETERMINISTIC_ENV
+    elif raw_value == "0":
+        deterministic = False
+        source = _KVARN_ONEDNN_DETERMINISTIC_ENV
+    else:
+        raise ValueError(
+            f"{_KVARN_ONEDNN_DETERMINISTIC_ENV} must be exactly '0' or '1', "
+            f"got {raw_value!r}"
+        )
 
     # KVarN requires repeatable model projections as well as repeatable cache
     # operations. oneDNN may otherwise select global split-K XPU matmuls whose
     # floating-point accumulation order varies between identical requests.
-    torch.backends.mkldnn.deterministic = True
-    return True
+    torch.backends.mkldnn.deterministic = deterministic
+    logger.info_once(
+        "[KVARN_FACTORY] selected_onednn_deterministic=%s; selector_source=%s; "
+        "immutable for engine lifetime",
+        str(deterministic).lower(),
+        source,
+    )
+    return deterministic
 
 
 class XPUWorker(Worker):
@@ -95,10 +130,7 @@ class XPUWorker(Worker):
         else:
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
 
-        if _enable_kvarn_onednn_determinism(self.cache_config.cache_dtype):
-            logger.info_once(
-                "Enabled deterministic oneDNN primitives for KVarN on XPU."
-            )
+        _configure_kvarn_onednn_determinism(self.cache_config.cache_dtype)
 
         ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
         ENV_LOCAL_WORLD_SIZE = os.getenv(
