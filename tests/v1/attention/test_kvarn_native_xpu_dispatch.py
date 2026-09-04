@@ -228,6 +228,10 @@ def test_native_kernel_variant_selection_is_named_and_fail_closed(
         ("q6_cached_weights", 6),
         ("q6_exact_rows", 7),
         ("q6_cached_weights_exact_rows", 8),
+        ("q6_page_pair", 9),
+        ("q6_main_grf128", 10),
+        ("q6_split_reducer_specialized", 11),
+        ("q6_next_page_prefetch", 12),
     ],
 )
 def test_native_kernel_variant_factory_ids_are_stable(
@@ -247,6 +251,10 @@ def test_native_kernel_variant_factory_ids_are_stable(
         ("q6_cached_weights", 6),
         ("q6_exact_rows", 7),
         ("q6_cached_weights_exact_rows", 8),
+        ("q6_page_pair", 9),
+        ("q6_main_grf128", 10),
+        ("q6_split_reducer_specialized", 11),
+        ("q6_next_page_prefetch", 12),
     ],
 )
 def test_native_experimental_variants_require_dpas_cache_layout(
@@ -267,6 +275,10 @@ def test_native_experimental_variants_require_dpas_cache_layout(
         ("q6_cached_weights", 6),
         ("q6_exact_rows", 7),
         ("q6_cached_weights_exact_rows", 8),
+        ("q6_page_pair", 9),
+        ("q6_main_grf128", 10),
+        ("q6_split_reducer_specialized", 11),
+        ("q6_next_page_prefetch", 12),
     ],
 )
 def test_b70_q6_split_policy_requires_q6_kernel(name: str, variant: int) -> None:
@@ -282,6 +294,17 @@ def test_b70_q6_split_policy_requires_q6_kernel(name: str, variant: int) -> None
 def test_native_kernel_variant_five_remains_reserved() -> None:
     with pytest.raises(ValueError, match="variant 5 is reserved"):
         validate_kvarn_native_factory_selection("xe2_dpas", "page128", 5)
+
+
+@pytest.mark.parametrize(
+    ("name", "variant"),
+    [("q6_page_pair", 10), ("unknown", 9), ("baseline", 13)],
+)
+def test_native_kernel_variant_validation_rejects_unregistered_pairs(
+    name: str, variant: int
+) -> None:
+    with pytest.raises(ValueError, match="name/id pair is not registered"):
+        validate_kvarn_native_factory_selection("xe2_dpas", name, variant)
 
 
 def test_native_layer_filter_matches_components() -> None:
