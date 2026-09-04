@@ -1027,6 +1027,11 @@ def test_fused_qkv_frontend_layer_filter_freezes_topology(
     [
         ("b70_q6", "q6_scalar", 2),
         ("b70_q6_v2", "q6_next_page_prefetch", 12),
+        (
+            "b70_q6_v2",
+            "q6_next_page_prefetch_split_reducer",
+            13,
+        ),
     ],
 )
 def test_b70_q6_split_policies_are_frozen_and_reported(
