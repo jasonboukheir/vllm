@@ -182,6 +182,7 @@ def _fused_frontend_impl() -> KVarNAttentionImpl:
     impl.use_fused_qkv_cache_update = True
     impl.use_inline_qkv_cache_update = False
     impl._pending_fused_qkv_signature = None
+    impl._forward_pool_elision_active_logged = False
     impl.num_heads = 24
     impl.num_kv_heads = 4
     impl.head_size = 256
@@ -983,26 +984,54 @@ def test_inline_qkv_path_produces_and_consumes_pool_proof(
     pool_ensure, launch, decode = _configure_native_qkv_receipt_lifecycle(
         monkeypatch, impl, metadata, events
     )
-    layer = SimpleNamespace(impl=impl)
+    layer = SimpleNamespace(
+        impl=impl,
+        _inline_qkv_attention_active_logged=False,
+    )
     context = Mock(return_value=(metadata, layer, cache, slots))
     monkeypatch.setattr(attention_module, "get_attention_context", context)
     monkeypatch.setattr(kv_transfer_utils, "has_kv_transfer_group", lambda: False)
 
-    attention_module.unified_qkv_attention_with_output(
-        query,
-        key,
-        value,
-        output,
-        "model.layers.0.self_attn",
-    )
+    with (
+        patch(
+            "vllm.model_executor.layers.attention.attention.logger.info"
+        ) as inline_marker,
+        patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as pool_marker,
+    ):
+        for _ in range(2):
+            attention_module.unified_qkv_attention_with_output(
+                query,
+                key,
+                value,
+                output,
+                "model.layers.0.self_attn",
+            )
 
-    context.assert_called_once_with("model.layers.0.self_attn")
-    assert events == ["ensure", "launch", "decode"]
-    pool_ensure.assert_called_once_with(query.device, num_blocks_hint=cache.shape[0])
-    launch.assert_called_once_with(query, key, value, slots)
+    assert context.call_count == 2
+    context.assert_called_with("model.layers.0.self_attn")
+    assert events == ["ensure", "launch", "decode"] * 2
+    assert pool_ensure.call_count == 2
+    pool_ensure.assert_called_with(query.device, num_blocks_hint=cache.shape[0])
+    assert launch.call_count == 2
+    launch.assert_called_with(query, key, value, slots)
     assert decode.call_args.kwargs["query_rotation_precomputed"] is True
     assert impl._pending_fused_qkv_signature is None
     assert output.eq(7).all()
+    inline_marker.assert_called_once_with(
+        "[KVARN_FRONTEND_INLINE] active=qkv_scatter_inline; "
+        "wrapper=unified_qkv_attention_with_output; layer=%s",
+        "model.layers.0.self_attn",
+    )
+    pool_marker.assert_any_call(
+        "[KVARN_FORWARD_POOL_ENSURE] active=fused_qkv_proof; "
+        "action=elide_ensure_pool; layer=%s",
+        "model.layers.0.self_attn",
+    )
+    assert sum(
+        entry.args
+        and entry.args[0].startswith("[KVARN_FORWARD_POOL_ENSURE] active=")
+        for entry in pool_marker.call_args_list
+    ) == 1
 
 
 def test_captured_native_qkv_fallback_does_not_publish_pool_proof(
@@ -1045,7 +1074,7 @@ def test_captured_native_qkv_fallback_does_not_publish_pool_proof(
     assert impl._pending_fused_qkv_signature is None
 
 
-def test_fused_qkv_pool_proof_elides_second_forward_ensure() -> None:
+def test_fused_qkv_pool_proof_elides_second_forward_ensure_once_logged() -> None:
     impl = _fused_frontend_impl()
     impl._kvarn_forward_pool_ensure = "fused_qkv_proof"
     metadata = _pure_decode_metadata()
@@ -1056,12 +1085,20 @@ def test_fused_qkv_pool_proof_elides_second_forward_ensure() -> None:
     impl._pending_fused_qkv_signature = impl._fused_qkv_signature(query, metadata)
     pool_ensure, decode = _configure_fused_forward_test(impl)
 
-    output = impl.forward(SimpleNamespace(), query, key, value, cache, metadata)
+    with patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as marker:
+        output = impl.forward(SimpleNamespace(), query, key, value, cache, metadata)
+        impl._pending_fused_qkv_signature = impl._fused_qkv_signature(query, metadata)
+        impl.forward(SimpleNamespace(), query, key, value, cache, metadata)
 
     pool_ensure.assert_not_called()
     assert output.eq(7).all()
     assert decode.call_args.kwargs["query_rotation_precomputed"] is True
     assert impl._pending_fused_qkv_signature is None
+    marker.assert_called_once_with(
+        "[KVARN_FORWARD_POOL_ENSURE] active=fused_qkv_proof; "
+        "action=elide_ensure_pool; layer=%s",
+        "model.layers.0.self_attn",
+    )
 
 
 @pytest.mark.parametrize("receipt", ["missing", "query_mismatch"])
@@ -1082,11 +1119,13 @@ def test_fused_qkv_pool_proof_fails_closed_without_matching_signature(
         )
     pool_ensure, decode = _configure_fused_forward_test(impl)
 
-    impl.forward(SimpleNamespace(), query, key, value, cache, metadata)
+    with patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as marker:
+        impl.forward(SimpleNamespace(), query, key, value, cache, metadata)
 
     pool_ensure.assert_called_once_with(query.device, num_blocks_hint=cache.shape[0])
     assert "query_rotation_precomputed" not in decode.call_args.kwargs
     assert impl._pending_fused_qkv_signature is None
+    marker.assert_not_called()
 
 
 def test_fused_qkv_pool_proof_fails_closed_when_pool_binding_changes() -> None:
@@ -1118,10 +1157,12 @@ def test_forward_pool_ensure_default_keeps_second_check() -> None:
     impl._pending_fused_qkv_signature = impl._fused_qkv_signature(query, metadata)
     pool_ensure, decode = _configure_fused_forward_test(impl)
 
-    impl.forward(SimpleNamespace(), query, key, value, cache, metadata)
+    with patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as marker:
+        impl.forward(SimpleNamespace(), query, key, value, cache, metadata)
 
     pool_ensure.assert_called_once_with(query.device, num_blocks_hint=cache.shape[0])
     assert decode.call_args.kwargs["query_rotation_precomputed"] is True
+    marker.assert_not_called()
 
 
 def test_fused_qkv_pool_proof_keeps_empty_cache_profile_ensure() -> None:
@@ -1207,7 +1248,10 @@ def test_inline_qkv_attention_uses_one_context_and_update_before_forward(
         do_qkv_cache_update=Mock(side_effect=lambda *_args: calls.append("update")),
         forward=Mock(side_effect=lambda *_args, **_kwargs: calls.append("forward")),
     )
-    layer = SimpleNamespace(impl=impl)
+    layer = SimpleNamespace(
+        impl=impl,
+        _inline_qkv_attention_active_logged=False,
+    )
     cache = object()
     metadata = object()
     slots = object()
@@ -1348,6 +1392,8 @@ def test_attention_routes_selected_frontend_through_qkv_update(
     fused_update = Mock(return_value=dependency)
     reference_update = Mock(side_effect=AssertionError("reference update selected"))
     attention_forward = Mock()
+    inline_marker = Mock()
+    monkeypatch.setattr(attention_module.logger, "info", inline_marker)
     monkeypatch.setattr(attention_module, "unified_qkv_cache_update", fused_update)
     monkeypatch.setattr(attention_module, "unified_kv_cache_update", reference_update)
     monkeypatch.setattr(
@@ -1372,6 +1418,7 @@ def test_attention_routes_selected_frontend_through_qkv_update(
     assert layer_name == attention.layer_name
     reference_update.assert_not_called()
     assert attention_forward.call_args.kwargs["kv_cache_dummy_dep"] is dependency
+    inline_marker.assert_not_called()
 
 
 def test_attention_routes_inline_frontend_without_dummy_dependency(
@@ -1461,6 +1508,7 @@ def test_attention_routes_inline_frontend_through_one_opaque_xpu_op(
     attention.impl = impl
     attention.use_fused_qkv_cache_update = True
     attention.use_inline_qkv_cache_update = True
+    attention._inline_qkv_attention_active_logged = False
     attention.use_direct_call = (
         not attention_module.current_platform.opaque_attention_op()
     )
@@ -2145,6 +2193,42 @@ def test_forward_pool_ensure_selection_is_frozen_and_logged(
             "fused_qkv_proof",
             "KVARN_FORWARD_POOL_ENSURE",
         )
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_fused_qkv_pool_proof_requires_a_fused_frontend_at_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
+    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "reference")
+    monkeypatch.setenv("KVARN_FORWARD_POOL_ENSURE", "fused_qkv_proof")
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        with (
+            patch(
+                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
+                return_value=2,
+            ),
+            pytest.raises(
+                RuntimeError,
+                match=(
+                    "KVARN_FORWARD_POOL_ENSURE=fused_qkv_proof requires "
+                    "KVARN_NATIVE_XPU_FRONTEND=qkv_scatter"
+                ),
+            ),
+        ):
+            KVarNAttentionImpl(
+                num_heads=24,
+                head_size=256,
+                scale=1.0 / 16.0,
+                num_kv_heads=4,
+                kv_cache_dtype="kvarn_k4v4_g128",
+            )
     finally:
         KVarNAttentionImpl.reset_process_state()
 

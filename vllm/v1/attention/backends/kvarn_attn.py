@@ -1942,6 +1942,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self.use_inline_qkv_cache_update = False
         self._kvarn_frontend_bound = False
         self._pending_fused_qkv_signature: tuple | None = None
+        self._forward_pool_elision_active_logged = False
         (
             self._kvarn_native_split_policy,
             self._kvarn_native_max_splits,
@@ -1976,6 +1977,21 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         type(self)._select_flush_index_materialization()
         self._kvarn_flush_writer = type(self)._select_flush_writer()
         self._kvarn_forward_pool_ensure = type(self)._select_forward_pool_ensure()
+        if (
+            self._kvarn_forward_pool_ensure
+            == _KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF
+            and self._kvarn_frontend_variant
+            not in {
+                KVARN_FRONTEND_QKV_SCATTER,
+                KVARN_FRONTEND_QKV_SCATTER_INLINE,
+            }
+        ):
+            raise RuntimeError(
+                f"{_KVARN_FORWARD_POOL_ENSURE_ENV}="
+                f"{_KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF} requires "
+                "KVARN_NATIVE_XPU_FRONTEND=qkv_scatter or "
+                "qkv_scatter_inline"
+            )
         self._kvarn_cached_prefill_materializer = type(
             self
         )._select_cached_prefill_materializer()
@@ -3877,7 +3893,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
         # Make sure pool + block-lookup tensors exist and cover num_blocks.
         if not profiling_without_cache:
-            may_consume_pool_proof = (
+            elide_pool_ensure = (
                 getattr(
                     self,
                     "_kvarn_forward_pool_ensure",
@@ -3886,7 +3902,16 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 == _KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF
                 and query_rotation_precomputed
             )
-            if not may_consume_pool_proof:
+            if elide_pool_ensure:
+                if not self._forward_pool_elision_active_logged:
+                    logger.info(
+                        "[KVARN_FORWARD_POOL_ENSURE] "
+                        "active=fused_qkv_proof; action=elide_ensure_pool; "
+                        "layer=%s",
+                        getattr(self, "layer_name", ""),
+                    )
+                    self._forward_pool_elision_active_logged = True
+            else:
                 self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
             # Cache the kv_cache ref so the metadata builder can drive flushes
             # into this layer's int4 cache (outside the captured region).
