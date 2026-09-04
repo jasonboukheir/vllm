@@ -93,6 +93,7 @@ KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE = 15
 KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH = 16
 KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR = 17
 KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR = 18
+KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER = 19
 _KVARN_NATIVE_KERNEL_VARIANTS = {
     "baseline": KVARN_NATIVE_KERNEL_BASELINE,
     "qk_i8u4": KVARN_NATIVE_KERNEL_QK_I8U4,
@@ -114,6 +115,7 @@ _KVARN_NATIVE_KERNEL_VARIANTS = {
     "q6_current_half_v_prefetch": KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
     "q6_page_record_cursor": KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
     "q6_prefetch_record_cursor": KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
+    "q6_b1_short_last_producer": KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER,
 }
 _KVARN_NATIVE_DPAS_ONLY_KERNEL_VARIANTS = frozenset(
     {
@@ -134,6 +136,7 @@ _KVARN_NATIVE_DPAS_ONLY_KERNEL_VARIANTS = frozenset(
         KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
         KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
         KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
+        KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER,
     }
 )
 _KVARN_NATIVE_Q6_KERNEL_VARIANTS = frozenset(
@@ -153,6 +156,7 @@ _KVARN_NATIVE_Q6_KERNEL_VARIANTS = frozenset(
         KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
         KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
         KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
+        KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER,
     }
 )
 _KVARN_NATIVE_IMPLEMENTED_KERNEL_VARIANTS = frozenset(
@@ -535,6 +539,68 @@ def kvarn_native_decode_abi_supported(with_scratch: bool) -> bool:
     return _kvarn_op_supports_argument(
         op, "num_kv_splits"
     ) and _kvarn_op_supports_argument(op, "kernel_variant")
+
+
+@functools.lru_cache(maxsize=1)
+def kvarn_native_last_producer_abi_supported() -> bool:
+    """Require the persistent completion-state argument for native ID19."""
+    if not kvarn_native_decode_abi_supported(True):
+        return False
+    return _kvarn_op_supports_argument(
+        torch.ops._vllm_fa2_C.kvarn_decode_with_scratch,
+        "last_producer_state_initialized",
+    )
+
+
+def _kvarn_native_runtime_kernel_selection(
+    requested_variant: int,
+    *,
+    batch_size: int,
+    max_seq_len: int,
+    num_kv_splits: int,
+    fuse_output_hadamard: bool,
+    use_scratch_op: bool,
+    last_producer_abi_supported: bool,
+    last_producer_state_ready: bool,
+) -> tuple[int, bool]:
+    """Resolve ID19 or fail closed to its byte-identical ID18 parent."""
+    if requested_variant != KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER:
+        return requested_variant, False
+    enabled = (
+        batch_size == 1
+        and max_seq_len <= 8192
+        and num_kv_splits > 1
+        and fuse_output_hadamard
+        and use_scratch_op
+        and last_producer_abi_supported
+        and last_producer_state_ready
+    )
+    if enabled:
+        return requested_variant, True
+    return KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR, False
+
+
+def _kvarn_native_scratch_call_trailer(
+    *,
+    fuse_output_hadamard: bool,
+    write_bf16_output: bool,
+    num_kv_splits: int,
+    kernel_variant: int,
+    dpas_layout: bool,
+    last_producer_abi_supported: bool,
+    last_producer_state_initialized: bool,
+) -> tuple[bool | int, ...]:
+    """Build a decode trailer compatible with both old and ID19 scratch ABIs."""
+    trailer: tuple[bool | int, ...] = (
+        fuse_output_hadamard,
+        write_bf16_output,
+        num_kv_splits,
+        kernel_variant,
+        dpas_layout,
+    )
+    if last_producer_abi_supported:
+        return (*trailer, last_producer_state_initialized)
+    return trailer
 
 
 @functools.lru_cache(maxsize=2)
@@ -1662,9 +1728,42 @@ def kvarn_decode_attention(
             and native_scratch[2].shape[2] >= native_splits
         )
         use_scratch_op = scratch_fits and kvarn_native_decode_abi_supported(True)
+        request_last_producer = (
+            impl._kvarn_native_kernel_variant
+            == KVARN_NATIVE_KERNEL_Q6_B1_SHORT_LAST_PRODUCER
+        )
+        last_producer_abi = (
+            request_last_producer and kvarn_native_last_producer_abi_supported()
+        )
+        last_producer_state_ready = (
+            request_last_producer
+            and use_scratch_op
+            and last_producer_abi
+            and impl._native_last_producer_state_ready(query.device)
+        )
+        if request_last_producer and not last_producer_state_ready:
+            # Never submit layer-exclusive persistent scratch on another stream.
+            use_scratch_op = False
         fuse_output_hadamard = _kvarn_native_output_hadamard_enabled(
             native_splits, use_scratch_op
         )
+        effective_kernel_variant, last_producer_state_initialized = (
+            _kvarn_native_runtime_kernel_selection(
+                impl._kvarn_native_kernel_variant,
+                batch_size=B,
+                max_seq_len=int(md.max_seq_len),
+                num_kv_splits=native_splits,
+                fuse_output_hadamard=fuse_output_hadamard,
+                use_scratch_op=use_scratch_op,
+                last_producer_abi_supported=last_producer_abi,
+                last_producer_state_ready=last_producer_state_ready,
+            )
+        )
+        if last_producer_state_initialized:
+            logger.info_once(
+                "[KVARN_FACTORY] ID19 last-producer fusion active; "
+                "scope=B1,max_seq_len<=8192,multi-split,owning XPU stream"
+            )
         write_bf16_output = (
             fuse_output_hadamard
             and output is not None
@@ -1680,13 +1779,16 @@ def kvarn_decode_attention(
         logger.info_once(
             "Using the native Xe2 KVarN qlen=1 decoder (batch limit %d; "
             "native H256 transforms=%s; fused output H256=%s; "
-            "direct bf16 output=%s; cache layout=%s; splits=%d)",
+            "direct bf16 output=%s; cache layout=%s; splits=%d; "
+            "kernel variant=%d; ID19 completion fusion=%s)",
             _KVARN_NATIVE_MAX_BATCH,
             use_native_hadamard,
             fuse_output_hadamard,
             write_bf16_output,
             impl._kvarn_cache_layout,
             native_splits,
+            effective_kernel_variant,
+            last_producer_state_initialized,
         )
         with torch.profiler.record_function("kvarn_native_xpu_decode"):
             if use_scratch_op:
@@ -1711,11 +1813,17 @@ def kvarn_decode_attention(
                 )
                 torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
                     *decode_args,
-                    fuse_output_hadamard,
-                    write_bf16_output,
-                    native_splits,
-                    impl._kvarn_native_kernel_variant,
-                    dpas_layout,
+                    *_kvarn_native_scratch_call_trailer(
+                        fuse_output_hadamard=fuse_output_hadamard,
+                        write_bf16_output=write_bf16_output,
+                        num_kv_splits=native_splits,
+                        kernel_variant=effective_kernel_variant,
+                        dpas_layout=dpas_layout,
+                        last_producer_abi_supported=last_producer_abi,
+                        last_producer_state_initialized=(
+                            last_producer_state_initialized
+                        ),
+                    ),
                 )
             else:
                 # This wrapper owns temporary scratch internally. Its C++
@@ -1739,7 +1847,7 @@ def kvarn_decode_attention(
                     fuse_output_hadamard,
                     write_bf16_output,
                     native_splits,
-                    impl._kvarn_native_kernel_variant,
+                    effective_kernel_variant,
                     dpas_layout,
                 )
         if fuse_output_hadamard:

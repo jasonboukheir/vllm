@@ -2193,6 +2193,7 @@ def test_reset_process_state_releases_previous_model_generation():
         mappings = (
             *_shared_q_output_maps(),
             KVarNAttentionImpl._shared_native_decode_scratch,
+            KVarNAttentionImpl._shared_native_last_producer_state,
             KVarNAttentionImpl._shared_mid_o_buf,
             KVarNAttentionImpl._shared_mid_lse_buf,
             KVarNAttentionImpl._shared_fa_K_buf,
@@ -2217,6 +2218,81 @@ def test_reset_process_state_releases_previous_model_generation():
             "shared_layer_reuses": 0,
         }
         assert KVarNAttentionImpl._tiles_dumped is False
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_id19_scratch_is_per_layer_and_initialized_exactly_once() -> None:
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        device = torch.device("cpu")
+        common = dict(
+            native_batch=1,
+            num_query_heads=24,
+            num_kv_splits=2,
+            head_dim=8,
+            device=device,
+            owner_stream="stream-0",
+        )
+        first_owner = object()
+        first_key = (device, 8, 4, 1, 2, "id19", id(first_owner))
+        KVarNAttentionImpl._ensure_exclusive_native_decode_scratch(
+            first_key, owner_id=id(first_owner), **common
+        )
+        first = KVarNAttentionImpl._shared_native_decode_scratch[first_key]
+        assert torch.equal(first[2].view(-1)[:8], torch.zeros(8))
+
+        first[2].view(-1)[:8].fill_(7)
+        KVarNAttentionImpl._ensure_exclusive_native_decode_scratch(
+            first_key, owner_id=id(first_owner), **common
+        )
+        assert KVarNAttentionImpl._shared_native_decode_scratch[first_key] is first
+        assert torch.equal(first[2].view(-1)[:8], torch.full((8,), 7.0))
+
+        second_owner = object()
+        second_key = (device, 8, 4, 1, 2, "id19", id(second_owner))
+        KVarNAttentionImpl._ensure_exclusive_native_decode_scratch(
+            second_key, owner_id=id(second_owner), **common
+        )
+        second = KVarNAttentionImpl._shared_native_decode_scratch[second_key]
+        assert second is not first
+        assert torch.equal(second[2].view(-1)[:8], torch.zeros(8))
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_id19_state_requires_same_owner_scratch_and_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        device = torch.device("cpu")
+        impl = object.__new__(KVarNAttentionImpl)
+        key = (device, 8, 4, 1, 2, "id19", id(impl))
+        KVarNAttentionImpl._ensure_exclusive_native_decode_scratch(
+            key,
+            native_batch=1,
+            num_query_heads=24,
+            num_kv_splits=2,
+            head_dim=8,
+            device=device,
+            owner_id=id(impl),
+            owner_stream="stream-0",
+        )
+        impl._native_decode_scratch = KVarNAttentionImpl._shared_native_decode_scratch[
+            key
+        ]
+        impl._native_last_producer_state = (
+            KVarNAttentionImpl._shared_native_last_producer_state[key]
+        )
+        monkeypatch.setattr(torch.xpu, "current_stream", lambda _device: "stream-0")
+        assert impl._native_last_producer_state_ready(device)
+
+        monkeypatch.setattr(torch.xpu, "current_stream", lambda _device: "stream-1")
+        assert not impl._native_last_producer_state_ready(device)
+        impl._native_decode_scratch = tuple(torch.empty(1) for _ in range(3))
+        monkeypatch.setattr(torch.xpu, "current_stream", lambda _device: "stream-0")
+        assert not impl._native_last_producer_state_ready(device)
     finally:
         KVarNAttentionImpl.reset_process_state()
 
