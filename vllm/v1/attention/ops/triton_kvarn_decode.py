@@ -34,9 +34,24 @@ _KVARN_NATIVE_SPLIT_COUNTS = frozenset({1, 2, 4, 8, 16, 17, 24, 32})
 _KVARN_NATIVE_MAX_BATCH = 12
 KVARN_NATIVE_SPLIT_POLICY_FIXED = "fixed"
 KVARN_NATIVE_SPLIT_POLICY_B70_Q6 = "b70_q6"
+KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2 = "b70_q6_v2"
 _KVARN_NATIVE_SPLIT_POLICIES = frozenset(
-    {KVARN_NATIVE_SPLIT_POLICY_FIXED, KVARN_NATIVE_SPLIT_POLICY_B70_Q6}
+    {
+        KVARN_NATIVE_SPLIT_POLICY_FIXED,
+        KVARN_NATIVE_SPLIT_POLICY_B70_Q6,
+        KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2,
+    }
 )
+_KVARN_NATIVE_B70_Q6_POLICIES = frozenset(
+    {KVARN_NATIVE_SPLIT_POLICY_B70_Q6, KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2}
+)
+# The B70 primitive factory sweep factory-b70-20260904T112836Z.json showed that
+# ID12 B4 prefers S=8 at 4K and 16K, but S=32 at 65,023 tokens. Keep the
+# lower-overhead S=8 schedule through 48 Ki tokens and switch only above that
+# conservative, deliberately late boundary. The unmeasured crossover should
+# be retuned from matched service ABBA measurements rather than inferred more
+# aggressively from three points.
+_KVARN_NATIVE_B70_Q6_V2_B4_SPLIT32_AFTER = 48 * 1024
 KVARN_CACHE_LAYOUT_NATURAL = "natural"
 KVARN_CACHE_LAYOUT_XE2_DPAS = "xe2_dpas"
 _KVARN_CACHE_LAYOUTS = frozenset(
@@ -224,11 +239,11 @@ def kvarn_native_split_policy_requested() -> tuple[str, int]:
     if policy not in _KVARN_NATIVE_SPLIT_POLICIES:
         choices = ", ".join(sorted(_KVARN_NATIVE_SPLIT_POLICIES))
         raise ValueError(f"KVARN_NATIVE_XPU_SPLIT_POLICY must be one of: {choices}")
-    if policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6:
+    if policy in _KVARN_NATIVE_B70_Q6_POLICIES:
         if "KVARN_NATIVE_XPU_SPLITS" in os.environ:
             raise ValueError(
                 "KVARN_NATIVE_XPU_SPLITS conflicts with "
-                "KVARN_NATIVE_XPU_SPLIT_POLICY=b70_q6"
+                f"KVARN_NATIVE_XPU_SPLIT_POLICY={policy}"
             )
         return policy, 32
 
@@ -281,11 +296,20 @@ def validate_kvarn_native_factory_selection(
             f"KVarN kernel variant {kernel_variant_name!r} requires "
             f"KVARN_NATIVE_XPU_CACHE_LAYOUT={KVARN_CACHE_LAYOUT_XE2_DPAS}"
         )
-    if (
-        split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6
-        and kernel_variant not in _KVARN_NATIVE_Q6_KERNEL_VARIANTS
+    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES and (
+        kernel_variant not in _KVARN_NATIVE_Q6_KERNEL_VARIANTS
     ):
-        raise ValueError("KVarN split policy 'b70_q6' requires a Q6 kernel variant")
+        raise ValueError(
+            f"KVarN split policy {split_policy!r} requires a Q6 kernel variant"
+        )
+    if (
+        split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2
+        and kernel_variant != KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH
+    ):
+        raise ValueError(
+            "KVarN split policy 'b70_q6_v2' requires kernel variant "
+            "'q6_next_page_prefetch'(12)"
+        )
 
 
 @functools.lru_cache(maxsize=256)
@@ -297,15 +321,24 @@ def _kvarn_native_split_count_cached(
     kernel_variant: int,
 ) -> int:
     splits = max_splits
-    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6:
+    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES:
         if not 1 <= batch_size <= _KVARN_NATIVE_MAX_BATCH:
-            raise ValueError("b70_q6 split policy supports batch sizes 1 through 12")
+            raise ValueError(
+                f"{split_policy} split policy supports batch sizes 1 through 12"
+            )
         if batch_size == 1:
             splits = 32
         elif batch_size == 2:
             splits = 16
-        elif batch_size <= 4:
+        elif batch_size == 3:
             splits = 8
+        elif batch_size == 4:
+            splits = (
+                32
+                if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2
+                and max_seq_len > _KVARN_NATIVE_B70_Q6_V2_B4_SPLIT32_AFTER
+                else 8
+            )
         elif batch_size <= 8:
             splits = 4
         else:
@@ -343,8 +376,8 @@ def kvarn_native_split_count(
         split_policy = KVARN_NATIVE_SPLIT_POLICY_FIXED
     if split_policy not in _KVARN_NATIVE_SPLIT_POLICIES:
         raise ValueError(f"unknown KVarN native split policy: {split_policy}")
-    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6 and max_splits != 32:
-        raise ValueError("b70_q6 split policy requires max_splits=32")
+    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES and max_splits != 32:
+        raise ValueError(f"{split_policy} split policy requires max_splits=32")
     return _kvarn_native_split_count_cached(
         max_seq_len, max_splits, batch_size, split_policy, kernel_variant
     )
@@ -358,9 +391,9 @@ def kvarn_native_split_scratch_count(
 ) -> int:
     """Return persistent scratch capacity for the engine-lifetime policy."""
     _kvarn_native_work_unit_tokens(kernel_variant)
-    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6:
+    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES:
         if max_splits != 32:
-            raise ValueError("b70_q6 split policy requires max_splits=32")
+            raise ValueError(f"{split_policy} split policy requires max_splits=32")
         return max_splits
     return kvarn_native_split_count(
         max_seq_len,

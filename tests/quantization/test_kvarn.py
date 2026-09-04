@@ -1022,14 +1022,24 @@ def test_fused_qkv_frontend_layer_filter_freezes_topology(
     assert not impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
 
 
-def test_b70_q6_split_policy_is_frozen_and_reported(
+@pytest.mark.parametrize(
+    ("policy", "kernel_name", "kernel_id"),
+    [
+        ("b70_q6", "q6_scalar", 2),
+        ("b70_q6_v2", "q6_next_page_prefetch", 12),
+    ],
+)
+def test_b70_q6_split_policies_are_frozen_and_reported(
     monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+    kernel_name: str,
+    kernel_id: int,
 ) -> None:
     monkeypatch.setenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", "xe2_dpas")
     monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6")
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", policy)
     monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", "q6_scalar")
+    monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", kernel_name)
     KVarNAttentionImpl.reset_process_state()
     try:
         with (
@@ -1047,17 +1057,17 @@ def test_b70_q6_split_policy_is_frozen_and_reported(
                 kv_cache_dtype="kvarn_k4v4_g128",
             )
 
-        assert impl._kvarn_native_split_policy == "b70_q6"
+        assert impl._kvarn_native_split_policy == policy
         assert impl._kvarn_native_max_splits == 32
         marker.assert_any_call(
             "[KVARN_FACTORY] selected_cache_layout=%s; "
             "selected_kernel_variant=%s(%d); max_decode_splits=%d; "
             "selected_split_policy=%s; immutable for engine lifetime",
             "xe2_dpas",
-            "q6_scalar",
-            2,
+            kernel_name,
+            kernel_id,
             32,
-            "b70_q6",
+            policy,
         )
     finally:
         KVarNAttentionImpl.reset_process_state()
