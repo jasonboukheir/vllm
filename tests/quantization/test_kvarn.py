@@ -18,6 +18,7 @@ from vllm.platforms.xpu import XPUPlatform
 from vllm.v1.attention.backends.kvarn_attn import (
     KVarNAttentionBackend,
     KVarNAttentionImpl,
+    KVarNMetadata,
     KVarNMetadataBuilder,
     _can_elide_fa_cu_seqlens,
     _cast_kvarn_activations,
@@ -304,7 +305,7 @@ def test_cached_prefill_materializer_selection_is_frozen_and_logged(
         marker.assert_called_once_with(
             "[KVARN_FACTORY] selected_cached_prefill_materializer=%s; "
             "selectors=KVARN_NATIVE_XPU,KVARN_NATIVE_XPU_MATERIALIZE; "
-            "fallback=reference; immutable for engine lifetime",
+            "eligibility_fallback=reference; immutable for engine lifetime",
             "native_xe2",
         )
     finally:
@@ -416,13 +417,9 @@ def test_cached_prefill_native_dispatch_reuses_builder_metadata_without_sync(
     }
     marker.assert_called_once_with(
         "[KVARN_PREFILL_MATERIALIZER] active=native_xe2; layer=%s; "
-        "native_op=kvarn_materialize_packed_kv; query_tokens=%d; "
-        "context_tokens=%d; max_seq_len=%d; cache_layout=%s; "
-        "fallback=reference",
+        "native_op=kvarn_materialize_packed_kv; cache_layout=%s; "
+        "eligibility_fallback=reference",
         "model.layers.0.self_attn",
-        17,
-        1792,
-        1535,
         "xe2_dpas",
     )
 
@@ -569,14 +566,122 @@ def test_cached_prefill_native_selection_falls_back_and_counts_reason(
     }
     marker.assert_called_once_with(
         "[KVARN_PREFILL_MATERIALIZER] selected=native_xe2; "
-        "active=reference; layer=%s; reason=%s; query_tokens=%d; "
-        "context_tokens=%d; cache_layout=%s",
+        "active=reference; layer=%s; cache_layout=%s; "
+        "eligibility_fallback=reference",
         "model.layers.0.self_attn",
-        "unsupported_cache_abi",
-        17,
-        1792,
         "xe2_dpas",
     )
+
+
+def test_mixed_cached_prefill_reuses_sliced_builder_metadata_without_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    impl = _cached_prefill_impl()
+    impl.num_heads = 24
+    impl._max_model_len = 2048
+    cache = torch.empty(16, 4, 35_072, dtype=torch.uint8)
+    query = torch.empty(18, 24, 256, dtype=torch.float16)
+    key = torch.empty(18, 4, 256, dtype=torch.float16)
+    value = torch.empty_like(key)
+    prefill_cu_k = torch.tensor([0, 513, 1537], dtype=torch.int32)
+    metadata = KVarNMetadata(
+        seq_lens=torch.tensor([257, 513, 1024], dtype=torch.int32),
+        slot_mapping=torch.arange(18, dtype=torch.int64),
+        block_table=torch.zeros(3, 16, dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1, 7, 18], dtype=torch.int32),
+        num_actual_tokens=18,
+        max_query_len=11,
+        max_seq_len=1024,
+        is_prefill=True,
+        num_decodes=1,
+        num_decode_tokens=1,
+        has_cached_multiquery=True,
+        prefill_has_cached_multiquery=True,
+        seq_lens_cpu=[257, 513, 1024],
+        fa_cu_seqlens_k=torch.tensor([0, 257, 770, 1794], dtype=torch.int32),
+        prefill_fa_cu_seqlens_k=prefill_cu_k,
+    )
+    launch = Mock()
+    materialized_metadata = None
+    cumsum_calls = []
+    real_cumsum = torch.cumsum
+
+    def record_cumsum(*args, **kwargs):
+        cumsum_calls.append(args[0].shape)
+        return real_cumsum(*args, **kwargs)
+
+    def cached_prefill(q, kv_cache, md):
+        nonlocal materialized_metadata
+        materialized_metadata = md
+        impl._materialize_cached_prefill_kv(q, kv_cache, md)
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(torch, "cumsum", record_cumsum)
+    monkeypatch.setattr(kvarn_attn.logger, "info_once", Mock())
+    monkeypatch.setattr(
+        torch.Tensor,
+        "item",
+        Mock(side_effect=AssertionError("prefill materializer synchronized")),
+    )
+    monkeypatch.setattr(impl, "_decode_path", lambda q, *_: torch.zeros_like(q))
+    monkeypatch.setattr(impl, "_cached_multiquery_path", cached_prefill)
+    monkeypatch.setattr(
+        impl,
+        "_native_cached_prefill_materializer_eligibility",
+        lambda *args, **kwargs: (True, "eligible"),
+    )
+    monkeypatch.setattr(impl, "_launch_native_cached_prefill_materializer", launch)
+    monkeypatch.setattr(
+        impl,
+        "_launch_reference_cached_prefill_materializer",
+        Mock(side_effect=AssertionError("reference materializer executed")),
+    )
+
+    output = impl._mixed_batch_path(query, key, value, cache, metadata)
+
+    assert output.shape == query.shape
+    assert materialized_metadata is not None
+    assert materialized_metadata.has_cached_multiquery
+    assert materialized_metadata.seq_lens_cpu == [513, 1024]
+    assert materialized_metadata.fa_cu_seqlens_k.data_ptr() == prefill_cu_k.data_ptr()
+    assert cumsum_calls == [torch.Size([1])]
+    launch.assert_called_once()
+    assert launch.call_args.args[3].data_ptr() == prefill_cu_k.data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("seq_lens_cpu", "max_seq_len", "message"),
+    [
+        ([-1, 1535], 1535, "negative sequence length"),
+        ([257, 1535], 1024, "max sequence length is inconsistent"),
+    ],
+)
+def test_cached_prefill_rejects_inconsistent_cpu_extents_without_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens_cpu: list[int],
+    max_seq_len: int,
+    message: str,
+) -> None:
+    impl = _cached_prefill_impl()
+    metadata = _cached_prefill_metadata()
+    metadata.seq_lens_cpu = seq_lens_cpu
+    metadata.max_seq_len = max_seq_len
+    cache = torch.empty(16, 4, 35_072, dtype=torch.uint8)
+    query = torch.empty(17, 24, 256, dtype=torch.float16)
+    native = Mock()
+    reference = Mock()
+    monkeypatch.setattr(impl, "_launch_native_cached_prefill_materializer", native)
+    monkeypatch.setattr(
+        impl, "_launch_reference_cached_prefill_materializer", reference
+    )
+
+    with pytest.raises(ValueError, match=message):
+        impl._materialize_cached_prefill_kv(query, cache, metadata)
+
+    native.assert_not_called()
+    reference.assert_not_called()
 
 
 def test_native_prefill_scatter_eligibility_fails_closed(

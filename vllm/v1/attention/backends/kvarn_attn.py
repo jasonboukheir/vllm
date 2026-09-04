@@ -862,6 +862,11 @@ class KVarNMetadata(AttentionMetadata):
     # assumes a fresh prompt, cached_len == 0). Computed once in build() from
     # CPU arrays (no GPU sync).
     has_cached_multiquery: bool = False
+    # Mixed batches need the same classification and prefix sums for the
+    # prefill-only view built in ``_mixed_batch_path``.  Keep these builder-owned
+    # so every layer reuses one metadata transfer instead of deriving them on
+    # device in the attention hot path.
+    prefill_has_cached_multiquery: bool = False
     # Precomputed once per batch in the metadata builder and reused across all
     # 28+ layer forward calls. Saves 28× .tolist() syncs per decode token.
     seq_lens_cpu: list[int] | None = None
@@ -875,6 +880,7 @@ class KVarNMetadata(AttentionMetadata):
     fa_cu_seqlens_k: torch.Tensor | None = (
         None  # [B+1] int32 (persistent prefix sum of seq_lens)
     )
+    prefill_fa_cu_seqlens_k: torch.Tensor | None = None
     fa_max_blocks_per_req: int = 0  # ceil(max_model_len / group): grid dim
     fa_max_seqlen_k_fixed: int = 0  # = max_model_len; fixed FA grid bound
     # Verify (spec-as-decode) plan: one virtual kernel row per decode-portion
@@ -977,6 +983,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # Persistent cu_seqlens buffers (allocated lazily in build()).
         self._cu_seqlens_q_buf: torch.Tensor = None  # type: ignore[assignment]
         self._cu_seqlens_k_buf: torch.Tensor = None  # type: ignore[assignment]
+        self._prefill_cu_seqlens_k_buf: torch.Tensor = None  # type: ignore[assignment]
         # Default async scheduling can start preparing the next generation
         # while this generation's non-blocking H2D copies remain in flight.
         # Rotate pinned host sources and fence each slot before CPU reuse.
@@ -987,6 +994,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         self._has_built_cudagraph_metadata = False
         self._cu_seqlens_q_host: torch.Tensor = None  # type: ignore[assignment]
         self._cu_seqlens_k_host: torch.Tensor = None  # type: ignore[assignment]
+        self._prefill_cu_seqlens_k_host: torch.Tensor = None  # type: ignore[assignment]
         # Persistent verify-plan buffers (allocated lazily in build()).
         self._vq_req_buf: torch.Tensor = None  # type: ignore[assignment]
         self._vq_seqlen_buf: torch.Tensor = None  # type: ignore[assignment]
@@ -1407,6 +1415,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         )
         stage = None
         fa_cu_seqlens_q = fa_cu_seqlens_k = None
+        prefill_fa_cu_seqlens_k = None
         if not elide_fa_cu_seqlens:
             cu_seqlens_k_h = [0]
             for sl in seq_lens_cpu:
@@ -1423,10 +1432,25 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 self._cu_seqlens_k_buf = torch.empty(
                     new_cap, dtype=torch.int32, device=device
                 )
+                self._prefill_cu_seqlens_k_buf = torch.empty(
+                    new_cap, dtype=torch.int32, device=device
+                )
                 self._cu_seqlens_q_host = torch.empty(
                     (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
                 )
                 self._cu_seqlens_k_host = torch.empty(
+                    (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
+                )
+                self._prefill_cu_seqlens_k_host = torch.empty(
+                    (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
+                )
+            elif self._prefill_cu_seqlens_k_buf is None:
+                self._metadata_stages.drain()
+                new_cap = self._cu_seqlens_k_buf.shape[0]
+                self._prefill_cu_seqlens_k_buf = torch.empty(
+                    new_cap, dtype=torch.int32, device=device
+                )
+                self._prefill_cu_seqlens_k_host = torch.empty(
                     (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
                 )
             q_host = self._cu_seqlens_q_host[stage]
@@ -1438,6 +1462,18 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             fa_cu_seqlens_k = self._cu_seqlens_k_buf[: B + 1]
             fa_cu_seqlens_q.copy_(q_host[: B + 1], non_blocking=True)
             fa_cu_seqlens_k.copy_(k_host[: B + 1], non_blocking=True)
+            if 0 < num_decodes < B:
+                prefill_count = B - num_decodes
+                prefill_k_host = self._prefill_cu_seqlens_k_host[stage]
+                prefill_base = cu_seqlens_k_h[num_decodes]
+                for i in range(prefill_count + 1):
+                    prefill_k_host[i] = cu_seqlens_k_h[num_decodes + i] - prefill_base
+                prefill_fa_cu_seqlens_k = self._prefill_cu_seqlens_k_buf[
+                    : prefill_count + 1
+                ]
+                prefill_fa_cu_seqlens_k.copy_(
+                    prefill_k_host[: prefill_count + 1], non_blocking=True
+                )
 
         # ── Verify (spec-as-decode) plan ─────────────────────────────────
         # When the decode portion carries multi-token queries (an MTP verify
@@ -1510,10 +1546,12 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # Detected here from CPU arrays (no GPU sync) so forward() can route it
         # to the context-aware path. Fresh first-chunk prefill has
         # seq_len == query_len on every row → flag stays False.
-        has_cached_multiquery = any(
+        cached_multiquery_rows = [
             query_lens_cpu[b] > 1 and seq_lens_cpu[b] > query_lens_cpu[b]
             for b in range(min(B, len(query_lens_cpu)))
-        )
+        ]
+        has_cached_multiquery = any(cached_multiquery_rows)
+        prefill_has_cached_multiquery = any(cached_multiquery_rows[num_decodes:])
 
         return KVarNMetadata(
             seq_lens=cam.seq_lens,
@@ -1527,12 +1565,14 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             has_cached_multiquery=has_cached_multiquery,
+            prefill_has_cached_multiquery=prefill_has_cached_multiquery,
             seq_lens_cpu=seq_lens_cpu,
             # not consumed downstream; build() uses block_table_np
             block_table_cpu=None,
             slot_mapping_cpu=None,
             fa_cu_seqlens_q=fa_cu_seqlens_q,
             fa_cu_seqlens_k=fa_cu_seqlens_k,
+            prefill_fa_cu_seqlens_k=prefill_fa_cu_seqlens_k,
             fa_max_blocks_per_req=max_blocks_per_req,
             fa_max_seqlen_k_fixed=self._max_model_len,
             vq_req=vq_req_t,
@@ -1727,7 +1767,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             logger.info_once(
                 "[KVARN_FACTORY] selected_cached_prefill_materializer=%s; "
                 "selectors=KVARN_NATIVE_XPU,KVARN_NATIVE_XPU_MATERIALIZE; "
-                "fallback=reference; immutable for engine lifetime",
+                "eligibility_fallback=reference; immutable for engine lifetime",
                 cls._cached_prefill_materializer,
             )
         return cls._cached_prefill_materializer
@@ -4398,14 +4438,20 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cu_seqlens_k = cu_seqlens_k[: batch_size + 1]
 
         seq_lens_cpu = getattr(md, "seq_lens_cpu", None)
+        cpu_seq_lens: list[int] | None = None
         if seq_lens_cpu is not None and len(seq_lens_cpu) >= batch_size:
-            total_k = sum(int(length) for length in seq_lens_cpu[:batch_size])
+            cpu_seq_lens = [int(length) for length in seq_lens_cpu[:batch_size]]
+            if any(length < 0 for length in cpu_seq_lens):
+                raise ValueError("cached prefill has a negative sequence length")
+            total_k = sum(cpu_seq_lens)
         else:
             total_k = int(cu_seqlens_k[-1].item())
         if total_k <= 0 or total_k > self._fa_K_buf.shape[0]:
             raise ValueError("cached prefill exceeds KVarN materialization scratch")
 
         max_seq_len = int(md.max_seq_len)
+        if cpu_seq_lens and max(cpu_seq_lens) > max_seq_len:
+            raise ValueError("cached prefill max sequence length is inconsistent")
         block_table = md.block_table[:batch_size]
         key_output = self._fa_K_buf
         value_output = self._fa_V_buf
@@ -4440,13 +4486,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             )
             logger.info_once(
                 "[KVARN_PREFILL_MATERIALIZER] active=native_xe2; layer=%s; "
-                "native_op=kvarn_materialize_packed_kv; query_tokens=%d; "
-                "context_tokens=%d; max_seq_len=%d; cache_layout=%s; "
-                "fallback=reference",
+                "native_op=kvarn_materialize_packed_kv; cache_layout=%s; "
+                "eligibility_fallback=reference",
                 getattr(self, "layer_name", ""),
-                q.shape[0],
-                total_k,
-                max_seq_len,
                 self._kvarn_cache_layout,
             )
         else:
@@ -4477,27 +4519,31 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 )
                 logger.info_once(
                     "[KVARN_PREFILL_MATERIALIZER] selected=native_xe2; "
-                    "active=reference; layer=%s; reason=%s; query_tokens=%d; "
-                    "context_tokens=%d; cache_layout=%s",
+                    "active=reference; layer=%s; cache_layout=%s; "
+                    "eligibility_fallback=reference",
                     getattr(self, "layer_name", ""),
-                    reason,
-                    q.shape[0],
-                    total_k,
                     self._kvarn_cache_layout,
                 )
             else:
                 logger.info_once(
                     "[KVARN_PREFILL_MATERIALIZER] active=reference; layer=%s; "
-                    "query_tokens=%d; context_tokens=%d; cache_layout=%s",
+                    "cache_layout=%s",
                     getattr(self, "layer_name", ""),
-                    q.shape[0],
-                    total_k,
                     self._kvarn_cache_layout,
                 )
         counters = cls.cached_prefill_materializer_counters()
         logger.debug(
-            "[KVARN_PREFILL_MATERIALIZER_COUNTER] calls=%d; native_launches=%d; "
+            "[KVARN_PREFILL_MATERIALIZER_EXTENT] active=%s; reason=%s; "
+            "layer=%s; query_tokens=%d; context_tokens=%d; max_seq_len=%d; "
+            "cache_layout=%s; calls=%d; native_launches=%d; "
             "reference_launches=%d; selected_native_fallbacks=%d",
+            "native_xe2" if eligible else "reference",
+            reason,
+            getattr(self, "layer_name", ""),
+            q.shape[0],
+            total_k,
+            max_seq_len,
+            self._kvarn_cache_layout,
             counters["calls"],
             counters["native_launches"],
             counters["reference_launches"],
@@ -4663,9 +4709,20 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             # upper bound for the prefill kernel
             max_seq_len=attn_metadata.max_seq_len,
             is_prefill=True,
+            has_cached_multiquery=getattr(
+                attn_metadata,
+                "prefill_has_cached_multiquery",
+                attn_metadata.has_cached_multiquery,
+            ),
+            seq_lens_cpu=(
+                attn_metadata.seq_lens_cpu[num_decodes:]
+                if attn_metadata.seq_lens_cpu is not None
+                else None
+            ),
+            fa_cu_seqlens_k=getattr(attn_metadata, "prefill_fa_cu_seqlens_k", None),
             causal=getattr(attn_metadata, "causal", True),
         )
-        if attn_metadata.has_cached_multiquery:
+        if prefill_meta.has_cached_multiquery:
             # The multi-query (prefill-classified) requests here are speculative
             # -decode verify steps / chunked-prefill continuations with cached
             # history — attend over the cached K/V, not just the new tokens.
