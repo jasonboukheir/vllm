@@ -125,6 +125,24 @@ if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_scatter"):
         return
 
 
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_qkv_scatter"):
+
+    @register_fake("_vllm_fa2_C::kvarn_hadamard_qkv_scatter")
+    def _kvarn_hadamard_qkv_scatter_fake(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        query_output: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        group: int,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
 if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard"):
 
     @register_fake("_vllm_fa2_C::kvarn_hadamard")
