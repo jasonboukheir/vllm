@@ -8,33 +8,99 @@ import torch
 from torch._dynamo.variables.torch import TorchInGraphFunctionVariable
 
 from vllm.v1.worker.xpu_model_runner import _torch_cuda_wrapper
-from vllm.v1.worker.xpu_worker import _enable_kvarn_onednn_determinism
+from vllm.v1.worker.xpu_worker import _configure_kvarn_onednn_determinism
 
 
 @pytest.mark.parametrize(
-    ("cache_dtype", "initial", "expected_enabled", "expected_deterministic"),
+    ("cache_dtype", "initial", "expected_selection", "expected_deterministic"),
     [
         ("kvarn_k4v4_g128_compact", False, True, True),
         ("kvarn_mla_k4v4_g128", False, True, True),
-        ("auto", False, False, False),
-        (None, False, False, False),
-        ("auto", True, False, True),
+        ("auto", False, None, False),
+        (None, False, None, False),
+        ("auto", True, None, True),
     ],
 )
-def test_enable_kvarn_onednn_determinism(
+def test_configure_kvarn_onednn_determinism_safe_default(
+    monkeypatch: pytest.MonkeyPatch,
     cache_dtype: str | None,
     initial: bool,
-    expected_enabled: bool,
+    expected_selection: bool | None,
     expected_deterministic: bool,
 ) -> None:
+    monkeypatch.delenv("KVARN_ONEDNN_DETERMINISTIC", raising=False)
     previous = torch.backends.mkldnn.deterministic
     try:
         torch.backends.mkldnn.deterministic = initial
-        enabled = _enable_kvarn_onednn_determinism(cache_dtype)
-        assert enabled is expected_enabled
+        selection = _configure_kvarn_onednn_determinism(cache_dtype)
+        assert selection is expected_selection
         assert torch.backends.mkldnn.deterministic is expected_deterministic
     finally:
         torch.backends.mkldnn.deterministic = previous
+
+
+@pytest.mark.parametrize(("raw_value", "expected"), [("0", False), ("1", True)])
+def test_configure_kvarn_onednn_determinism_explicit_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("KVARN_ONEDNN_DETERMINISTIC", raw_value)
+    previous = torch.backends.mkldnn.deterministic
+    try:
+        torch.backends.mkldnn.deterministic = not expected
+        assert (
+            _configure_kvarn_onednn_determinism("kvarn_k4v4_g128_compact") is expected
+        )
+        assert torch.backends.mkldnn.deterministic is expected
+    finally:
+        torch.backends.mkldnn.deterministic = previous
+
+
+@pytest.mark.parametrize("raw_value", ["", "false", "2", " 0"])
+def test_configure_kvarn_onednn_determinism_rejects_invalid_value(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str,
+) -> None:
+    monkeypatch.setenv("KVARN_ONEDNN_DETERMINISTIC", raw_value)
+    previous = torch.backends.mkldnn.deterministic
+    try:
+        torch.backends.mkldnn.deterministic = True
+        with pytest.raises(
+            ValueError,
+            match="KVARN_ONEDNN_DETERMINISTIC must be exactly '0' or '1'",
+        ):
+            _configure_kvarn_onednn_determinism("kvarn_k4v4_g128_compact")
+        assert torch.backends.mkldnn.deterministic is True
+    finally:
+        torch.backends.mkldnn.deterministic = previous
+
+
+def test_configure_kvarn_onednn_determinism_logs_factory_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KVARN_ONEDNN_DETERMINISTIC", "0")
+    calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        "vllm.v1.worker.xpu_worker.logger.info_once",
+        lambda message, value, source: calls.append((message, value, source)),
+    )
+    previous = torch.backends.mkldnn.deterministic
+    try:
+        _configure_kvarn_onednn_determinism("kvarn_k4v4_g128_compact")
+    finally:
+        torch.backends.mkldnn.deterministic = previous
+
+    assert calls == [
+        (
+            (
+                "[KVARN_FACTORY] selected_onednn_deterministic=%s; "
+                "selector_source=%s; immutable for engine lifetime"
+            ),
+            "false",
+            "KVARN_ONEDNN_DETERMINISTIC",
+        )
+    ]
 
 
 # Child process: patched torch.cuda must not leak to other tests in the session.
