@@ -1116,6 +1116,7 @@ def test_flush_writer_selection_is_frozen_and_logged(
         ({"value_bits": 2}, False),
         ({"num_kv_heads": 8}, False),
         ({"record_bytes": 35_071}, False),
+        ({"record_bytes": 35_074}, False),
         ({"op_available": False}, False),
         ({"rtn_quantile": 0.005}, False),
     ],
@@ -1175,14 +1176,14 @@ def test_batched_flush_native_writer_bypasses_reference_record_assembly(
         kvarn_config=cfg,
         num_kv_heads=4,
         _group_key=group_key,
-        _tail_K_pool=torch.zeros(1, 128, 4, 256, dtype=torch.float16),
-        _tail_V_pool=torch.zeros(1, 128, 4, 256, dtype=torch.float16),
-        _tails={3: object()},
+        _tail_K_pool=torch.zeros(2, 128, 4, 256, dtype=torch.float16),
+        _tail_V_pool=torch.zeros(2, 128, 4, 256, dtype=torch.float16),
+        _tails={3: object(), 1: object()},
         _kvarn_cache_layout="xe2_dpas",
         _kvarn_flush_writer="native_xe2",
     )
     cache = torch.full((4, 4, 65_536), 0xA5, dtype=torch.uint8)
-    KVarNAttentionImpl._block_to_slot_dict[group_key] = {3: 0}
+    KVarNAttentionImpl._block_to_slot_dict[group_key] = {3: 0, 1: 1}
     balanced = tuple(torch.empty(0) for _ in range(6))
     launch = Mock()
 
@@ -1196,13 +1197,16 @@ def test_batched_flush_native_writer_bypasses_reference_record_assembly(
             ),
             patch.object(kvarn_attn, "_launch_kvarn_native_balanced_writer", launch),
         ):
-            KVarNAttentionImpl._batched_flush([(impl, 3, cache)])
+            KVarNAttentionImpl._batched_flush([(impl, 3, cache), (impl, 1, cache)])
 
         assert not impl._tails
         launch.assert_called_once()
         args = launch.call_args.args
         assert args[0] is balanced
-        assert args[1].tolist() == [3]
+        selected_block_ids = args[1].tolist()
+        assert selected_block_ids == [3, 1]
+        assert len(selected_block_ids) == len(set(selected_block_ids))
+        assert all(0 <= block < cache.shape[0] for block in selected_block_ids)
         assert args[2] is cache
     finally:
         KVarNAttentionImpl.reset_process_state()

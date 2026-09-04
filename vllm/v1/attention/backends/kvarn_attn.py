@@ -397,7 +397,7 @@ def _kvarn_native_balanced_writer_supported(
         and value_bits == 4
         and num_kv_heads == 4
         and record_bytes >= 35_072
-        and record_bytes % 2 == 0
+        and record_bytes % 4 == 0
         and rtn_quantile == 0.0
         and op_available
     )
@@ -408,7 +408,13 @@ def _launch_kvarn_native_balanced_writer(
     block_ids: torch.Tensor,
     packed_cache: torch.Tensor,
 ) -> None:
-    """Write balanced full pages directly into xe2_dpas cache records."""
+    """Write balanced full pages directly into xe2_dpas cache records.
+
+    ``block_ids`` comes from the builder's per-step ``flush_seen`` schedule and
+    must contain unique IDs in ``[0, packed_cache.shape[0])``.  That host-side
+    construction is the no-synchronization proof required by the native op;
+    validating a device index tensor here would stall the flush hot path.
+    """
     torch.ops._vllm_fa2_C.kvarn_pack_balanced_kv(
         *balanced,
         block_ids,
@@ -1170,6 +1176,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             # sinks are handled by the reclaim below). Idempotent under prefix
             # sharing: a co-owner finds the block already queued (or slotless)
             # and stops — no per-request state to collide.
+            # flush_seen is both the ownership deduplicator and the native
+            # writer's one-workgroup-family-per-record uniqueness proof.
             flush_block_ids: list[int] = []
             flush_seen: set[int] = set()
             window_flush_ids: set[int] = set()
