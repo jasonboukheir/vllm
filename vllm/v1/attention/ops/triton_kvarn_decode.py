@@ -38,7 +38,25 @@ _KVARN_CACHE_LAYOUTS = frozenset(
     {KVARN_CACHE_LAYOUT_NATURAL, KVARN_CACHE_LAYOUT_XE2_DPAS}
 )
 KVARN_NATIVE_KERNEL_BASELINE = 0
-_KVARN_NATIVE_KERNEL_VARIANTS = {"baseline": KVARN_NATIVE_KERNEL_BASELINE}
+KVARN_NATIVE_KERNEL_QK_I8U4 = 1
+KVARN_NATIVE_KERNEL_Q6_SCALAR = 2
+KVARN_NATIVE_KERNEL_Q8_VECTOR = 3
+KVARN_NATIVE_KERNEL_Q6_VECTOR = 4
+_KVARN_NATIVE_KERNEL_VARIANTS = {
+    "baseline": KVARN_NATIVE_KERNEL_BASELINE,
+    "qk_i8u4": KVARN_NATIVE_KERNEL_QK_I8U4,
+    "q6_scalar": KVARN_NATIVE_KERNEL_Q6_SCALAR,
+    "q8_vector": KVARN_NATIVE_KERNEL_Q8_VECTOR,
+    "q6_vector": KVARN_NATIVE_KERNEL_Q6_VECTOR,
+}
+_KVARN_NATIVE_DPAS_ONLY_KERNEL_VARIANTS = frozenset(
+    {
+        KVARN_NATIVE_KERNEL_QK_I8U4,
+        KVARN_NATIVE_KERNEL_Q6_SCALAR,
+        KVARN_NATIVE_KERNEL_Q8_VECTOR,
+        KVARN_NATIVE_KERNEL_Q6_VECTOR,
+    }
+)
 
 
 def kvarn_native_feature_enabled(feature: str) -> bool:
@@ -144,6 +162,20 @@ def kvarn_native_kernel_variant_requested() -> tuple[str, int]:
         raise ValueError(
             f"KVARN_NATIVE_XPU_KERNEL_VARIANT must be one of: {choices}"
         ) from exc
+
+
+def validate_kvarn_native_factory_selection(
+    cache_layout: str, kernel_variant_name: str, kernel_variant: int
+) -> None:
+    """Fail before cache allocation when a kernel/layout ABI is incompatible."""
+    if (
+        kernel_variant in _KVARN_NATIVE_DPAS_ONLY_KERNEL_VARIANTS
+        and cache_layout != KVARN_CACHE_LAYOUT_XE2_DPAS
+    ):
+        raise ValueError(
+            f"KVarN kernel variant {kernel_variant_name!r} requires "
+            f"KVARN_NATIVE_XPU_CACHE_LAYOUT={KVARN_CACHE_LAYOUT_XE2_DPAS}"
+        )
 
 
 @functools.lru_cache(maxsize=256)

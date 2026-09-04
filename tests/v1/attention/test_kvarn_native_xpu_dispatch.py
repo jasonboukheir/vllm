@@ -25,6 +25,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_problem_supported,
     kvarn_native_split_count,
     kvarn_native_store_supported,
+    validate_kvarn_native_factory_selection,
 )
 
 
@@ -211,6 +212,37 @@ def test_native_kernel_variant_selection_is_named_and_fail_closed(
     monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", "unknown")
     with pytest.raises(ValueError, match="must be one of"):
         kvarn_native_kernel_variant_requested()
+
+
+@pytest.mark.parametrize(
+    ("name", "variant"),
+    [
+        ("baseline", 0),
+        ("qk_i8u4", 1),
+        ("q6_scalar", 2),
+        ("q8_vector", 3),
+        ("q6_vector", 4),
+    ],
+)
+def test_native_kernel_variant_factory_ids_are_stable(
+    monkeypatch: pytest.MonkeyPatch, name: str, variant: int
+) -> None:
+    monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", name)
+    assert kvarn_native_kernel_variant_requested() == (name, variant)
+
+
+@pytest.mark.parametrize(
+    ("name", "variant"),
+    [("qk_i8u4", 1), ("q6_scalar", 2), ("q8_vector", 3), ("q6_vector", 4)],
+)
+def test_native_experimental_variants_require_dpas_cache_layout(
+    name: str, variant: int
+) -> None:
+    validate_kvarn_native_factory_selection("xe2_dpas", name, variant)
+    with pytest.raises(ValueError, match="requires.*xe2_dpas"):
+        validate_kvarn_native_factory_selection("natural", name, variant)
+
+    validate_kvarn_native_factory_selection("natural", "baseline", 0)
 
 
 def test_native_layer_filter_matches_components() -> None:
