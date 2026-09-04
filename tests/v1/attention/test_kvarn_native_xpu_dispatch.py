@@ -294,6 +294,10 @@ def test_native_kernel_variant_selection_is_named_and_fail_closed(
     with pytest.raises(ValueError, match="must be one of"):
         kvarn_native_kernel_variant_requested()
 
+    monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", "q6_b1_short_last_producer")
+    with pytest.raises(ValueError, match="must be one of"):
+        kvarn_native_kernel_variant_requested()
+
 
 @pytest.mark.parametrize(
     ("name", "variant"),
@@ -316,6 +320,8 @@ def test_native_kernel_variant_selection_is_named_and_fail_closed(
         ("q6_current_half_v_prefetch", 16),
         ("q6_page_record_cursor", 17),
         ("q6_prefetch_record_cursor", 18),
+        ("q6_page_metadata_cursor", 20),
+        ("q6_paired_nibble_half2", 21),
     ],
 )
 def test_native_kernel_variant_factory_ids_are_stable(
@@ -345,6 +351,8 @@ def test_native_kernel_variant_factory_ids_are_stable(
         ("q6_current_half_v_prefetch", 16),
         ("q6_page_record_cursor", 17),
         ("q6_prefetch_record_cursor", 18),
+        ("q6_page_metadata_cursor", 20),
+        ("q6_paired_nibble_half2", 21),
     ],
 )
 def test_native_experimental_variants_require_dpas_cache_layout(
@@ -375,6 +383,8 @@ def test_native_experimental_variants_require_dpas_cache_layout(
         ("q6_current_half_v_prefetch", 16),
         ("q6_page_record_cursor", 17),
         ("q6_prefetch_record_cursor", 18),
+        ("q6_page_metadata_cursor", 20),
+        ("q6_paired_nibble_half2", 21),
     ],
 )
 def test_b70_q6_split_policy_requires_q6_kernel(name: str, variant: int) -> None:
@@ -405,6 +415,22 @@ def test_b70_q6_v2_split_policy_requires_profiled_kernels(
     ):
         validate_kvarn_native_factory_selection(
             "xe2_dpas", "q6_scalar", 2, split_policy="b70_q6_v2"
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "variant"),
+    [
+        ("q6_page_metadata_cursor", 20),
+        ("q6_paired_nibble_half2", 21),
+    ],
+)
+def test_round6_variants_do_not_expand_b70_q6_v2(name: str, variant: int) -> None:
+    with pytest.raises(
+        ValueError, match="requires kernel variant.*q6_next_page_prefetch"
+    ):
+        validate_kvarn_native_factory_selection(
+            "xe2_dpas", name, variant, split_policy="b70_q6_v2"
         )
 
 
@@ -507,6 +533,8 @@ def test_page_pair_split_count_matches_cpp_k128_boundaries() -> None:
         kvarn_decode.KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
         kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
         kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
+        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAGE_METADATA_CURSOR,
+        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAIRED_NIBBLE_HALF2,
     ],
 )
 def test_k64_variants_keep_established_split_boundaries(kernel_variant: int) -> None:
