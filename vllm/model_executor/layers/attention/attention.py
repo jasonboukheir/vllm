@@ -534,6 +534,9 @@ class Attention(nn.Module, AttentionLayerBase):
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
         kv_cache_dummy_dep = None
+        use_qkv_cache_update = bool(
+            getattr(self.impl, "use_fused_qkv_cache_update", False)
+        )
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
             if (
@@ -542,9 +545,14 @@ class Attention(nn.Module, AttentionLayerBase):
                 and key is not None
                 and value is not None
             ):
-                kv_cache_dummy_dep = unified_kv_cache_update(
-                    key, value, self.layer_name
-                )
+                if use_qkv_cache_update:
+                    kv_cache_dummy_dep = unified_qkv_cache_update(
+                        query, key, value, self.layer_name
+                    )
+                else:
+                    kv_cache_dummy_dep = unified_kv_cache_update(
+                        key, value, self.layer_name
+                    )
             unified_attention_with_output(
                 query,
                 key,
@@ -562,9 +570,14 @@ class Attention(nn.Module, AttentionLayerBase):
                 and key is not None
                 and value is not None
             ):
-                kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
-                    key, value, encoded
-                )
+                if use_qkv_cache_update:
+                    kv_cache_dummy_dep = torch.ops.vllm.unified_qkv_cache_update(
+                        query, key, value, encoded
+                    )
+                else:
+                    kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
+                        key, value, encoded
+                    )
             torch.ops.vllm.unified_attention_with_output(
                 query,
                 key,
@@ -742,6 +755,48 @@ direct_register_custom_op(
     op_name="unified_kv_cache_update",
     op_func=unified_kv_cache_update,
     fake_impl=unified_kv_cache_update_fake,
+    mutates_args=[],
+)
+
+
+def unified_qkv_cache_update(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """KVarN-only Q rotation plus K/V cache update dependency."""
+    layer_name = _resolve_layer_name(layer_name)
+    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    if layer_slot_mapping is not None:
+        assert hasattr(attn_layer.impl, "do_qkv_cache_update"), (
+            f"{attn_layer.impl.__class__.__name__} does not support QKV cache update"
+        )
+        attn_layer.impl.do_qkv_cache_update(  # type: ignore[attr-defined]
+            attn_layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            layer_slot_mapping,
+        )
+
+    return key.new_empty(0)
+
+
+def unified_qkv_cache_update_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.empty(0, device=key.device, dtype=key.dtype)
+
+
+direct_register_custom_op(
+    op_name="unified_qkv_cache_update",
+    op_func=unified_qkv_cache_update,
+    fake_impl=unified_qkv_cache_update_fake,
     mutates_args=[],
 )
 

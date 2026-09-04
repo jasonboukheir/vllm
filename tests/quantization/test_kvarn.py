@@ -3,7 +3,7 @@
 
 import os
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -121,6 +121,192 @@ def test_native_store_requires_a_pure_qlen1_decode(override, expected):
     values.update(override)
 
     assert _is_pure_kvarn_decode_step(SimpleNamespace(**values), 4) is expected
+
+
+def _fused_frontend_impl() -> KVarNAttentionImpl:
+    impl = object.__new__(KVarNAttentionImpl)
+    impl.use_fused_qkv_cache_update = True
+    impl._pending_fused_qkv_signature = None
+    impl.num_heads = 24
+    impl.num_kv_heads = 4
+    impl.head_size = 256
+    impl.sliding_window = 0
+    impl.layer_name = "model.layers.0.self_attn"
+    impl._kvarn_dpas_layout = True
+    impl._kvarn_cache_layout = "xe2_dpas"
+    impl.kvarn_config = SimpleNamespace(
+        group=128,
+        key_bits=4,
+        value_bits=4,
+        record_bytes=35_072,
+    )
+    impl._block_to_slot_t = torch.zeros(2, dtype=torch.int32)
+    impl._tail_K_pool = torch.empty(2, 128, 4, 256, dtype=torch.float16)
+    impl._tail_V_pool = torch.empty_like(impl._tail_K_pool)
+    impl._q_rot_fp16_buf = torch.empty(48, 256, dtype=torch.float16)
+    return impl
+
+
+def _pure_decode_metadata(tokens: int = 2) -> SimpleNamespace:
+    return SimpleNamespace(
+        is_prefill=False,
+        max_query_len=1,
+        num_decodes=tokens,
+        num_decode_tokens=tokens,
+        num_actual_tokens=tokens,
+    )
+
+
+def test_fused_qkv_frontend_eligibility_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    impl = _fused_frontend_impl()
+    metadata = _pure_decode_metadata()
+    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
+    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    slots = torch.tensor([0, 129], dtype=torch.int64)
+    layer = SimpleNamespace()
+
+    monkeypatch.setattr(kvarn_attn, "kvarn_native_store_supported", lambda **_: True)
+    monkeypatch.setattr(kvarn_attn, "kvarn_native_decode_abi_supported", lambda _: True)
+    monkeypatch.setattr(kvarn_attn, "kvarn_native_layout_abi_supported", lambda _: True)
+    monkeypatch.setattr(kvarn_attn, "kvarn_native_layer_selected", lambda *_: True)
+
+    assert impl._native_qkv_scatter_eligible(layer, query, key, value, slots, metadata)
+    assert not impl._native_qkv_scatter_eligible(
+        layer, query.to(torch.float16), key, value, slots, metadata
+    )
+    assert not impl._native_qkv_scatter_eligible(
+        layer, query, key, value, slots, _pure_decode_metadata(tokens=1)
+    )
+    impl._q_rot_fp16_buf = torch.empty(47, 256, dtype=torch.float16)
+    assert not impl._native_qkv_scatter_eligible(
+        layer, query, key, value, slots, metadata
+    )
+
+
+def test_fused_qkv_frontend_dispatches_once_and_consumes_exact_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    impl = _fused_frontend_impl()
+    metadata = _pure_decode_metadata()
+    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
+    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    slots = torch.tensor([0, 129], dtype=torch.int64)
+    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
+    layer = SimpleNamespace()
+    launch = Mock()
+
+    monkeypatch.setattr(kvarn_attn, "_active_kvarn_metadata", lambda _: metadata)
+    monkeypatch.setattr(impl, "_ensure_pool", Mock())
+    monkeypatch.setattr(impl, "_native_qkv_scatter_eligible", lambda *_: True)
+    monkeypatch.setattr(impl, "_launch_native_qkv_scatter", launch)
+
+    impl.do_qkv_cache_update(layer, query, key, value, cache, slots)
+
+    launch.assert_called_once_with(query, key, value, slots)
+    assert impl._consume_fused_qkv_rotation(query, metadata)
+    assert not impl._consume_fused_qkv_rotation(query, metadata)
+
+
+def test_fused_qkv_frontend_unsupported_step_uses_reference_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    impl = _fused_frontend_impl()
+    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
+    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    slots = torch.tensor([0, 129], dtype=torch.int64)
+    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
+    layer = SimpleNamespace()
+    reference_store = Mock()
+
+    monkeypatch.setattr(kvarn_attn, "_active_kvarn_metadata", lambda _: None)
+    monkeypatch.setattr(impl, "_ensure_pool", Mock())
+    monkeypatch.setattr(impl, "_native_qkv_scatter_eligible", lambda *_: False)
+    monkeypatch.setattr(impl, "do_kv_cache_update", reference_store)
+
+    impl.do_qkv_cache_update(layer, query, key, value, cache, slots)
+
+    reference_store.assert_called_once_with(layer, key, value, cache, slots)
+    assert impl._pending_fused_qkv_signature is None
+
+
+def test_unified_qkv_cache_update_passes_query_without_changing_cache_abi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.attention.attention as attention_module
+
+    update = Mock()
+    layer = SimpleNamespace(impl=SimpleNamespace(do_qkv_cache_update=update))
+    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
+    slots = torch.tensor([0, 129], dtype=torch.int64)
+    monkeypatch.setattr(
+        attention_module,
+        "get_attention_context",
+        lambda _: (object(), layer, cache, slots),
+    )
+    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
+    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+
+    dependency = attention_module.unified_qkv_cache_update(
+        query, key, value, "model.layers.0.self_attn"
+    )
+
+    update.assert_called_once_with(layer, query, key, value, cache, slots)
+    assert dependency.shape == (0,)
+    assert dependency.dtype == key.dtype
+
+
+def test_attention_routes_selected_frontend_through_qkv_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.attention.attention as attention_module
+
+    attention = object.__new__(attention_module.Attention)
+    torch.nn.Module.__init__(attention)
+    attention.query_quant = None
+    attention.num_heads = 24
+    attention.num_kv_heads = 4
+    attention.head_size = 256
+    attention.head_size_v = 256
+    attention.impl = SimpleNamespace(use_fused_qkv_cache_update=True)
+    attention.use_direct_call = True
+    attention.attn_backend = SimpleNamespace(forward_includes_kv_cache_update=False)
+    attention.kv_sharing_target_layer_name = None
+    attention.layer_name = "model.layers.0.self_attn"
+    dependency = torch.empty(0)
+    fused_update = Mock(return_value=dependency)
+    reference_update = Mock(side_effect=AssertionError("reference update selected"))
+    attention_forward = Mock()
+    monkeypatch.setattr(attention_module, "unified_qkv_cache_update", fused_update)
+    monkeypatch.setattr(attention_module, "unified_kv_cache_update", reference_update)
+    monkeypatch.setattr(
+        attention_module, "unified_attention_with_output", attention_forward
+    )
+    query = torch.empty(2, 24 * 256, dtype=torch.bfloat16)
+    key = torch.empty(2, 4 * 256, dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+
+    result = attention.forward(query, key, value)
+
+    assert result.shape == query.shape
+    fused_update.assert_called_once()
+    q_arg, k_arg, v_arg, layer_name = fused_update.call_args.args
+    assert q_arg.shape == (2, 24, 256)
+    assert k_arg.shape == v_arg.shape == (2, 4, 256)
+    assert layer_name == attention.layer_name
+    reference_update.assert_not_called()
+    assert attention_forward.call_args.kwargs["kv_cache_dummy_dep"] is dependency
 
 
 @pytest.mark.parametrize(
@@ -483,6 +669,7 @@ def test_cache_layout_is_frozen_at_attention_initialization(
     monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
     monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
     monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_FRONTEND", raising=False)
     KVarNAttentionImpl.reset_process_state()
     try:
         with patch(
@@ -502,16 +689,63 @@ def test_cache_layout_is_frozen_at_attention_initialization(
         assert impl._kvarn_native_max_splits == 16
         assert impl._kvarn_native_kernel_variant_name == "baseline"
         assert impl._kvarn_native_kernel_variant == 0
+        assert impl._kvarn_frontend_variant == "reference"
+        assert not impl.use_fused_qkv_cache_update
 
         monkeypatch.setenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", "xe2_dpas")
         monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "32")
         monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", "unknown")
+        monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter")
         assert impl._kvarn_cache_layout == "natural"
         assert not impl._kvarn_dpas_layout
         assert impl._kvarn_native_split_policy == "fixed"
         assert impl._kvarn_native_max_splits == 16
         assert impl._kvarn_native_kernel_variant_name == "baseline"
         assert impl._kvarn_native_kernel_variant == 0
+        assert impl._kvarn_frontend_variant == "reference"
+        assert not impl.use_fused_qkv_cache_update
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_fused_qkv_frontend_is_frozen_and_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
+    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
+    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
+    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter")
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        with (
+            patch(
+                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
+                return_value=2,
+            ),
+            patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker,
+        ):
+            impl = KVarNAttentionImpl(
+                num_heads=24,
+                head_size=256,
+                scale=1.0 / 16.0,
+                num_kv_heads=4,
+                kv_cache_dtype="kvarn_k4v4_g128",
+            )
+
+        assert impl._kvarn_frontend_variant == "qkv_scatter"
+        assert impl.use_fused_qkv_cache_update
+        marker.assert_any_call(
+            "[KVARN_FRONTEND] selected=%s; native_op=%s; "
+            "fallback=reference; immutable for engine lifetime",
+            "qkv_scatter",
+            "kvarn_hadamard_qkv_scatter",
+        )
+
+        monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "reference")
+        assert impl._kvarn_frontend_variant == "qkv_scatter"
+        assert impl.use_fused_qkv_cache_update
     finally:
         KVarNAttentionImpl.reset_process_state()
 

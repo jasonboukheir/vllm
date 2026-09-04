@@ -42,6 +42,11 @@ KVARN_CACHE_LAYOUT_XE2_DPAS = "xe2_dpas"
 _KVARN_CACHE_LAYOUTS = frozenset(
     {KVARN_CACHE_LAYOUT_NATURAL, KVARN_CACHE_LAYOUT_XE2_DPAS}
 )
+KVARN_FRONTEND_REFERENCE = "reference"
+KVARN_FRONTEND_QKV_SCATTER = "qkv_scatter"
+_KVARN_FRONTEND_VARIANTS = frozenset(
+    {KVARN_FRONTEND_REFERENCE, KVARN_FRONTEND_QKV_SCATTER}
+)
 KVARN_NATIVE_KERNEL_BASELINE = 0
 KVARN_NATIVE_KERNEL_QK_I8U4 = 1
 KVARN_NATIVE_KERNEL_Q6_SCALAR = 2
@@ -147,6 +152,15 @@ def kvarn_cache_layout_requested() -> str:
 def kvarn_dpas_layout_requested() -> bool:
     """Compatibility predicate for the named cache-layout selector."""
     return kvarn_cache_layout_requested() == KVARN_CACHE_LAYOUT_XE2_DPAS
+
+
+def kvarn_frontend_variant_requested() -> str:
+    """Resolve the immutable Q/K/V transform/store frontend selection."""
+    variant = os.environ.get("KVARN_NATIVE_XPU_FRONTEND", KVARN_FRONTEND_REFERENCE)
+    if variant not in _KVARN_FRONTEND_VARIANTS:
+        choices = ", ".join(sorted(_KVARN_FRONTEND_VARIANTS))
+        raise ValueError(f"KVARN_NATIVE_XPU_FRONTEND must be one of: {choices}")
+    return variant
 
 
 def _require_kvarn_dpas_reader(dpas_layout: bool, selected: bool, reader: str) -> None:
@@ -1330,6 +1344,7 @@ def kvarn_decode_attention(
     impl,  # KVarNAttentionImpl (has pool + scratch buffers)
     md,  # KVarNMetadata (carries the precomputed task plan)
     output: torch.Tensor | None = None,  # optional caller-owned [B, Hq, D] bf16
+    query_rotation_precomputed: bool = False,
 ) -> torch.Tensor:
     """Decode driver — dequant + FlashAttention.
 
@@ -1421,7 +1436,9 @@ def kvarn_decode_attention(
         and query.reshape(N, D).stride(1) == 1
     )
     with torch.profiler.record_function("kvarn_q_rotation"):
-        if use_native_hadamard:
+        if query_rotation_precomputed:
+            pass
+        elif use_native_hadamard:
             torch.ops._vllm_fa2_C.kvarn_hadamard(query.reshape(N, D), q_rot_fp16)
         else:
             q_input = query.reshape(N, D)

@@ -77,10 +77,12 @@ from vllm.v1.attention.ops.kvarn_store import (
 from vllm.v1.attention.ops.triton_kvarn_decode import (
     KVARN_CACHE_LAYOUT_NATURAL,
     KVARN_CACHE_LAYOUT_XE2_DPAS,
+    KVARN_FRONTEND_QKV_SCATTER,
     _kvarn_scatter_store_kernel,
     _require_kvarn_dpas_reader,
     kvarn_cache_layout_requested,
     kvarn_decode_attention,
+    kvarn_frontend_variant_requested,
     kvarn_native_decode_abi_supported,
     kvarn_native_kernel_variant_requested,
     kvarn_native_layer_selected,
@@ -1627,6 +1629,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._kvarn_dpas_layout = (
             self._kvarn_cache_layout == KVARN_CACHE_LAYOUT_XE2_DPAS
         )
+        self._kvarn_frontend_variant = kvarn_frontend_variant_requested()
+        self.use_fused_qkv_cache_update = (
+            self._kvarn_frontend_variant == KVARN_FRONTEND_QKV_SCATTER
+        )
+        self._pending_fused_qkv_signature: tuple | None = None
         (
             self._kvarn_native_split_policy,
             self._kvarn_native_max_splits,
@@ -1651,6 +1658,16 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             self._kvarn_native_kernel_variant,
             self._kvarn_native_max_splits,
             self._kvarn_native_split_policy,
+        )
+        logger.info_once(
+            "[KVARN_FRONTEND] selected=%s; native_op=%s; "
+            "fallback=reference; immutable for engine lifetime",
+            self._kvarn_frontend_variant,
+            (
+                "kvarn_hadamard_qkv_scatter"
+                if self.use_fused_qkv_cache_update
+                else "none"
+            ),
         )
         type(self)._select_flush_index_materialization()
 
@@ -2901,6 +2918,157 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
     # ── do_kv_cache_update ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _fused_qkv_signature(query: torch.Tensor, attn_metadata) -> tuple:
+        """Identify the exact eager Q tensor whose rotation was produced."""
+        return (
+            query.data_ptr(),
+            tuple(query.shape),
+            tuple(query.stride()),
+            query.dtype,
+            query.device,
+            id(attn_metadata),
+        )
+
+    def _consume_fused_qkv_rotation(self, query: torch.Tensor, attn_metadata) -> bool:
+        pending = getattr(self, "_pending_fused_qkv_signature", None)
+        self._pending_fused_qkv_signature = None
+        return pending == self._fused_qkv_signature(query, attn_metadata)
+
+    def _native_qkv_scatter_eligible(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata,
+    ) -> bool:
+        """Fail-closed eligibility for the narrow eager Xe2 fused frontend."""
+        N = slot_mapping.shape[0]
+        cfg = self.kvarn_config
+        q_rot = self._q_rot_fp16_buf
+        is_capturing = (
+            query.device.type == "xpu" and torch.xpu.is_current_stream_capturing()
+        )
+        return (
+            self.use_fused_qkv_cache_update
+            and _is_pure_kvarn_decode_step(attn_metadata, N)
+            and kvarn_native_store_supported(
+                device_type=query.device.type,
+                num_tokens=N,
+                num_query_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_size,
+                group=cfg.group,
+                key_bits=cfg.key_bits,
+                value_bits=cfg.value_bits,
+                record_bytes=cfg.record_bytes,
+                sliding_window=int(self.sliding_window or 0),
+                key_dtype=key.dtype,
+                value_dtype=value.dtype,
+                has_lookup=self._block_to_slot_t is not None,
+                has_tail_pool=(
+                    self._tail_K_pool is not None and self._tail_V_pool is not None
+                ),
+                is_capturing=is_capturing,
+                op_available=(
+                    kvarn_native_decode_abi_supported(False)
+                    and kvarn_native_layout_abi_supported("kvarn_hadamard_qkv_scatter")
+                ),
+            )
+            and kvarn_native_layer_selected(
+                getattr(self, "layer_name", ""),
+                os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
+            )
+            and query.dtype == key.dtype
+            and query.device == key.device == value.device
+            and query.ndim == 3
+            and query.shape[0] >= N
+            and query.shape[1:] == (self.num_heads, self.head_size)
+            and key.ndim == 3
+            and key.shape[0] >= N
+            and key.shape[1:] == (self.num_kv_heads, self.head_size)
+            and value.shape == key.shape
+            and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+            and slot_mapping.dtype == torch.int64
+            and slot_mapping.is_contiguous()
+            and self._block_to_slot_t.dtype == torch.int32
+            and self._block_to_slot_t.is_contiguous()
+            and self._block_to_slot_t.device == query.device
+            and self._tail_K_pool.dtype == torch.float16
+            and self._tail_V_pool.dtype == torch.float16
+            and self._tail_K_pool.shape == self._tail_V_pool.shape
+            and self._tail_K_pool.shape[1:]
+            == (cfg.group, self.num_kv_heads, self.head_size)
+            and self._tail_K_pool.stride() == self._tail_V_pool.stride()
+            and self._tail_K_pool.stride(-1) == 1
+            and self._tail_K_pool.device == query.device
+            and self._tail_V_pool.device == query.device
+            and q_rot is not None
+            and q_rot.dtype == torch.float16
+            and q_rot.shape[0] >= N * self.num_heads
+            and q_rot.shape[1] == self.head_size
+            and q_rot.is_contiguous()
+            and q_rot.device == query.device
+        )
+
+    def _launch_native_qkv_scatter(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        N = slot_mapping.shape[0]
+        torch.ops._vllm_fa2_C.kvarn_hadamard_qkv_scatter(
+            query[:N],
+            key[:N],
+            value[:N],
+            slot_mapping[:N],
+            self._block_to_slot_t,
+            self._q_rot_fp16_buf[: N * self.num_heads].view(
+                N, self.num_heads, self.head_size
+            ),
+            self._tail_K_pool,
+            self._tail_V_pool,
+            self.kvarn_config.group,
+            self._kvarn_dpas_layout,
+        )
+
+    def do_qkv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Fuse eager qlen=1 Q rotation with native K/V tail scatter."""
+        self._pending_fused_qkv_signature = None
+        kv_cache = self._record_cache_view(kv_cache)
+        N = slot_mapping.shape[0]
+        if N <= 0:
+            return
+        self._ensure_pool(query.device, num_blocks_hint=kv_cache.shape[0])
+        attn_metadata = _active_kvarn_metadata(layer)
+        if self._native_qkv_scatter_eligible(
+            layer, query, key, value, slot_mapping, attn_metadata
+        ):
+            self._launch_native_qkv_scatter(query, key, value, slot_mapping)
+            self._pending_fused_qkv_signature = self._fused_qkv_signature(
+                query, attn_metadata
+            )
+            logger.info_once(
+                "[KVARN_FRONTEND] active=qkv_scatter; "
+                "native_op=kvarn_hadamard_qkv_scatter; qlen=1; cache_layout=%s",
+                self._kvarn_cache_layout,
+            )
+            return
+
+        self.do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -3063,6 +3231,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             )
         num_tokens = query.shape[0]
         device = query.device
+        query_rotation_precomputed = self._consume_fused_qkv_rotation(
+            query, attn_metadata
+        )
 
         if output is None:
             output = torch.zeros(
@@ -3124,9 +3295,18 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 direct_decode_output = direct_decode_output.view(
                     N, self.num_heads, self.head_size
                 )
-            attn_out = self._decode_path(
-                q, kv_cache, attn_metadata, output=direct_decode_output
-            )
+            if query_rotation_precomputed:
+                attn_out = self._decode_path(
+                    q,
+                    kv_cache,
+                    attn_metadata,
+                    output=direct_decode_output,
+                    query_rotation_precomputed=True,
+                )
+            else:
+                attn_out = self._decode_path(
+                    q, kv_cache, attn_metadata, output=direct_decode_output
+                )
         elif (
             attn_metadata.vq_seqlen is not None and attn_metadata.num_decode_tokens == N
         ):
@@ -3333,6 +3513,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         kv_cache: torch.Tensor,
         attn_metadata: KVarNMetadata,
         output: torch.Tensor | None = None,
+        query_rotation_precomputed: bool = False,
     ) -> torch.Tensor:
         """Triton-driven decode: in-kernel dequant + scoring + weighted V,
         with the in-progress fp16 tail buffers combined via LSE in PyTorch.
@@ -3361,6 +3542,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             impl=self,
             md=attn_metadata,
             output=output,
+            query_rotation_precomputed=query_rotation_precomputed,
         )
 
     def _decode_path_slow(

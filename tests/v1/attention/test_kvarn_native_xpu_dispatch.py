@@ -17,6 +17,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     _require_kvarn_dpas_reader,
     kvarn_cache_layout_requested,
     kvarn_dpas_layout_requested,
+    kvarn_frontend_variant_requested,
     kvarn_native_bf16_output_supported,
     kvarn_native_decode_abi_supported,
     kvarn_native_feature_enabled,
@@ -30,6 +31,20 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_store_supported,
     validate_kvarn_native_factory_selection,
 )
+
+
+def test_fused_qkv_frontend_requires_explicit_valid_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_NATIVE_XPU_FRONTEND", raising=False)
+    assert kvarn_frontend_variant_requested() == "reference"
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter")
+    assert kvarn_frontend_variant_requested() == "qkv_scatter"
+
+    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "automatic")
+    with pytest.raises(ValueError, match="KVARN_NATIVE_XPU_FRONTEND"):
+        kvarn_frontend_variant_requested()
 
 
 def _native_problem(**overrides) -> dict:
