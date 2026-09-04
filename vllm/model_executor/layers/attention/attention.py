@@ -440,6 +440,7 @@ class Attention(nn.Module, AttentionLayerBase):
         self.use_inline_qkv_cache_update = bool(
             getattr(self.impl, "use_inline_qkv_cache_update", False)
         )
+        self._inline_qkv_attention_active_logged = False
         self.backend = AttentionBackendEnum[self.attn_backend.get_name()]
         self.dtype = dtype
 
@@ -854,6 +855,13 @@ def unified_qkv_attention_with_output(
     attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
         layer_name
     )
+    if not attn_layer._inline_qkv_attention_active_logged:
+        logger.info(
+            "[KVARN_FRONTEND_INLINE] active=qkv_scatter_inline; "
+            "wrapper=unified_qkv_attention_with_output; layer=%s",
+            layer_name,
+        )
+        attn_layer._inline_qkv_attention_active_logged = True
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_qkv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support QKV cache update"
