@@ -2084,6 +2084,8 @@ def test_fused_qkv_frontend_layer_filter_freezes_topology(
     ("policy", "kernel_name", "kernel_id"),
     [
         ("b70_q6", "q6_scalar", 2),
+        ("b70_q6", "q6_page_metadata_cursor", 20),
+        ("b70_q6", "q6_paired_nibble_half2", 21),
         ("b70_q6_v2", "q6_next_page_prefetch", 12),
         (
             "b70_q6_v2",
