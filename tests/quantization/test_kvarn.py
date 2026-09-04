@@ -22,6 +22,7 @@ from vllm.v1.attention.backends.kvarn_attn import (
     _can_elide_fa_cu_seqlens,
     _cast_kvarn_activations,
     _defer_kvarn_prefill_history_blocks,
+    _is_pure_kvarn_cached_prefill_step,
     _is_pure_kvarn_decode_step,
     _is_pure_kvarn_prefill_step,
     _is_pure_qlen1_batch,
@@ -103,6 +104,22 @@ def test_non_decode_kvarn_casts_every_activation():
     cast = _cast_kvarn_activations(*tensors, query_only=False)
 
     assert all(tensor.dtype == torch.float16 for tensor in cast)
+
+
+def test_cached_prefill_cast_skips_unused_key_and_value():
+    query, key, value = (torch.randn(2, 3, dtype=torch.bfloat16) for _ in range(3))
+
+    cast_query, cast_key, cast_value = _cast_kvarn_activations(
+        query,
+        key,
+        value,
+        query_only=False,
+        key_value_unused=True,
+    )
+
+    assert cast_query.dtype == torch.float16
+    assert cast_key is key
+    assert cast_value is value
 
 
 @pytest.mark.parametrize(
@@ -195,6 +212,370 @@ def _pure_prefill_metadata(tokens: int = 4) -> SimpleNamespace:
         num_decodes=0,
         num_decode_tokens=0,
         num_actual_tokens=tokens,
+    )
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({}, True),
+        ({"has_cached_multiquery": False}, False),
+        ({"is_prefill": False}, False),
+        ({"max_query_len": 1}, False),
+        ({"num_decodes": 1}, False),
+        ({"num_actual_tokens": 16}, False),
+    ],
+)
+def test_native_materializer_requires_pure_cached_prefill(
+    override: dict, expected: bool
+) -> None:
+    values = vars(_pure_prefill_metadata(tokens=17)) | {
+        "max_query_len": 11,
+        "has_cached_multiquery": True,
+    }
+    values.update(override)
+
+    assert _is_pure_kvarn_cached_prefill_step(SimpleNamespace(**values), 17) is expected
+
+
+def _cached_prefill_impl() -> KVarNAttentionImpl:
+    impl = object.__new__(KVarNAttentionImpl)
+    impl.layer_name = "model.layers.0.self_attn"
+    impl.num_kv_heads = 4
+    impl.head_size = 256
+    impl.kvarn_config = KVarNConfig(
+        head_dim=256,
+        key_bits=4,
+        value_bits=4,
+        group=128,
+        compact_records=True,
+    )
+    impl._kvarn_cache_layout = "xe2_dpas"
+    impl._kvarn_dpas_layout = True
+    impl._kvarn_cached_prefill_materializer = "native_xe2"
+    impl._block_lookup_size = 16
+    impl._block_to_slot_t = torch.arange(16, dtype=torch.int32)
+    impl._tail_K_pool = torch.empty(16, 128, 4, 256, dtype=torch.float16)
+    impl._tail_V_pool = torch.empty_like(impl._tail_K_pool)
+    impl._fa_K_buf = torch.empty(2048, 4, 256, dtype=torch.float16)
+    impl._fa_V_buf = torch.empty_like(impl._fa_K_buf)
+    return impl
+
+
+def _cached_prefill_metadata() -> SimpleNamespace:
+    return SimpleNamespace(
+        is_prefill=True,
+        max_query_len=11,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_actual_tokens=17,
+        has_cached_multiquery=True,
+        seq_lens=torch.tensor([257, 1535], dtype=torch.int32),
+        seq_lens_cpu=[257, 1535],
+        fa_cu_seqlens_k=torch.tensor([0, 257, 1792], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 6, 17], dtype=torch.int32),
+        block_table=torch.zeros(2, 12, dtype=torch.int32),
+        max_seq_len=1535,
+        causal=True,
+    )
+
+
+def test_cached_prefill_materializer_selection_is_frozen_and_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        enabled = Mock(return_value=True)
+        marker = Mock()
+        monkeypatch.setattr(kvarn_attn, "kvarn_native_feature_enabled", enabled)
+        monkeypatch.setattr(kvarn_attn.logger, "info_once", marker)
+
+        assert KVarNAttentionImpl._select_cached_prefill_materializer() == (
+            "native_xe2"
+        )
+        enabled.return_value = False
+        assert KVarNAttentionImpl._select_cached_prefill_materializer() == (
+            "native_xe2"
+        )
+
+        enabled.assert_called_once_with("MATERIALIZE")
+        marker.assert_called_once_with(
+            "[KVARN_FACTORY] selected_cached_prefill_materializer=%s; "
+            "selectors=KVARN_NATIVE_XPU,KVARN_NATIVE_XPU_MATERIALIZE; "
+            "fallback=reference; immutable for engine lifetime",
+            "native_xe2",
+        )
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_native_cached_prefill_materializer_preserves_exact_op_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    impl = _cached_prefill_impl()
+    cache = torch.empty(16, 4, 35_072, dtype=torch.uint8)
+    metadata = _cached_prefill_metadata()
+    key_output = impl._fa_K_buf
+    value_output = impl._fa_V_buf
+    call = Mock()
+    fake_ops = SimpleNamespace(kvarn_materialize_packed_kv=call)
+    monkeypatch.setattr(kvarn_attn.torch.ops, "_vllm_fa2_C", fake_ops)
+
+    impl._launch_native_cached_prefill_materializer(
+        cache,
+        metadata.block_table,
+        metadata.seq_lens,
+        metadata.fa_cu_seqlens_k,
+        key_output,
+        value_output,
+        metadata.max_seq_len,
+    )
+
+    call.assert_called_once_with(
+        cache,
+        metadata.block_table,
+        metadata.seq_lens,
+        metadata.fa_cu_seqlens_k,
+        impl._block_to_slot_t,
+        impl._tail_K_pool,
+        impl._tail_V_pool,
+        key_output,
+        value_output,
+        1535,
+        True,
+    )
+
+
+def test_cached_prefill_native_dispatch_reuses_builder_metadata_without_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = _cached_prefill_impl()
+    metadata = _cached_prefill_metadata()
+    cache = torch.empty(16, 4, 35_072, dtype=torch.uint8)
+    query = torch.empty(17, 24, 256, dtype=torch.float16)
+    launch = Mock()
+
+    KVarNAttentionImpl._cached_prefill_materializer_counters.clear()
+    monkeypatch.setattr(
+        impl,
+        "_native_cached_prefill_materializer_eligibility",
+        lambda *args, **kwargs: (True, "eligible"),
+    )
+    monkeypatch.setattr(impl, "_launch_native_cached_prefill_materializer", launch)
+    monkeypatch.setattr(
+        impl,
+        "_launch_reference_cached_prefill_materializer",
+        Mock(side_effect=AssertionError("reference materializer executed")),
+    )
+    monkeypatch.setattr(
+        torch.Tensor,
+        "item",
+        Mock(side_effect=AssertionError("device scalar synchronized")),
+    )
+    monkeypatch.setattr(
+        torch,
+        "cumsum",
+        Mock(side_effect=AssertionError("cu-seqlens rebuilt")),
+    )
+    marker = Mock()
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    monkeypatch.setattr(kvarn_attn.logger, "info_once", marker)
+    monkeypatch.setattr(
+        kvarn_attn.F,
+        "pad",
+        Mock(side_effect=AssertionError("cu-seqlens padded")),
+    )
+
+    key_output, value_output, cu_k, total_k, max_seq_len = (
+        impl._materialize_cached_prefill_kv(query, cache, metadata)
+    )
+
+    assert key_output is impl._fa_K_buf
+    assert value_output is impl._fa_V_buf
+    assert cu_k.data_ptr() == metadata.fa_cu_seqlens_k.data_ptr()
+    assert (total_k, max_seq_len) == (1792, 1535)
+    launch.assert_called_once()
+    launch_args = launch.call_args.args
+    assert launch_args[0] is cache
+    assert launch_args[1].data_ptr() == metadata.block_table.data_ptr()
+    assert launch_args[2].data_ptr() == metadata.seq_lens.data_ptr()
+    assert launch_args[3].data_ptr() == metadata.fa_cu_seqlens_k.data_ptr()
+    assert launch_args[4] is impl._fa_K_buf
+    assert launch_args[5] is impl._fa_V_buf
+    assert launch_args[6] == 1535
+    assert KVarNAttentionImpl.cached_prefill_materializer_counters() == {
+        "calls": 1,
+        "native_launches": 1,
+        "reference_launches": 0,
+        "selected_native_fallbacks": 0,
+    }
+    marker.assert_called_once_with(
+        "[KVARN_PREFILL_MATERIALIZER] active=native_xe2; layer=%s; "
+        "native_op=kvarn_materialize_packed_kv; query_tokens=%d; "
+        "context_tokens=%d; max_seq_len=%d; cache_layout=%s; "
+        "fallback=reference",
+        "model.layers.0.self_attn",
+        17,
+        1792,
+        1535,
+        "xe2_dpas",
+    )
+
+
+def test_native_cached_prefill_materializer_eligibility_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    impl = _cached_prefill_impl()
+    metadata = _cached_prefill_metadata()
+    cache = torch.empty(16, 4, 35_072, dtype=torch.uint8)
+    args = (
+        cache,
+        metadata.block_table,
+        metadata.seq_lens,
+        metadata.fa_cu_seqlens_k,
+        impl._fa_K_buf,
+        impl._fa_V_buf,
+        metadata,
+    )
+    kwargs = {
+        "num_query_tokens": 17,
+        "total_k": 1792,
+        "max_seq_len": 1535,
+    }
+
+    impl._kvarn_cached_prefill_materializer = "reference"
+    assert impl._native_cached_prefill_materializer_eligibility(*args, **kwargs) == (
+        False,
+        "selected_reference",
+    )
+    impl._kvarn_cached_prefill_materializer = "native_xe2"
+    metadata.has_cached_multiquery = False
+    assert impl._native_cached_prefill_materializer_eligibility(*args, **kwargs) == (
+        False,
+        "not_pure_cached_prefill",
+    )
+    metadata.has_cached_multiquery = True
+    impl._block_to_slot_t = None
+    assert impl._native_cached_prefill_materializer_eligibility(*args, **kwargs) == (
+        False,
+        "missing_tensor",
+    )
+    impl._block_to_slot_t = torch.arange(16, dtype=torch.int32)
+    impl._kvarn_cache_layout = "natural"
+    assert impl._native_cached_prefill_materializer_eligibility(*args, **kwargs) == (
+        False,
+        "unsupported_cache_abi",
+    )
+    impl._kvarn_cache_layout = "xe2_dpas"
+    monkeypatch.setattr(kvarn_attn, "kvarn_native_layer_selected", lambda *_: True)
+    monkeypatch.setattr(
+        kvarn_attn, "kvarn_native_layout_abi_supported", lambda *_: False
+    )
+    assert impl._native_cached_prefill_materializer_eligibility(*args, **kwargs) == (
+        False,
+        "native_op_unavailable",
+    )
+
+
+def test_final_ragged_cached_prefill_routes_materialized_history_to_flash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    impl = _cached_prefill_impl()
+    impl.num_heads = 24
+    impl._H_fp16 = torch.eye(256, dtype=torch.float16)
+    metadata = _cached_prefill_metadata()
+    cache = torch.empty(16, 4, 35_072, dtype=torch.uint8)
+    query = torch.zeros(17, 24, 256, dtype=torch.float16)
+    materialize = Mock(
+        return_value=(
+            impl._fa_K_buf,
+            impl._fa_V_buf,
+            metadata.fa_cu_seqlens_k,
+            1792,
+            1535,
+        )
+    )
+    flash = Mock(side_effect=lambda query, *args, **kwargs: query)
+
+    monkeypatch.setattr(kvarn_attn, "_HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(kvarn_attn, "_use_kvarn_fused_verify", lambda **_: False)
+    monkeypatch.setattr(impl, "_materialize_cached_prefill_kv", materialize)
+    monkeypatch.setattr(impl, "_flash_varlen", flash)
+
+    output = impl._cached_multiquery_path(query, cache, metadata)
+
+    materialize.assert_called_once_with(query, cache, metadata)
+    assert output.shape == query.shape
+    flash.assert_called_once()
+    call = flash.call_args
+    assert call.args[0].shape == query.shape
+    assert call.args[1].shape == (1792, 4, 256)
+    assert call.args[2].shape == (1792, 4, 256)
+    assert call.kwargs["cu_q"].data_ptr() == metadata.query_start_loc.data_ptr()
+    assert call.kwargs["cu_k"].data_ptr() == metadata.fa_cu_seqlens_k.data_ptr()
+    assert call.kwargs["max_q"] == 11
+    assert call.kwargs["max_k"] == 1535
+    assert call.kwargs["causal"] is True
+
+
+def test_cached_prefill_native_selection_falls_back_and_counts_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    impl = _cached_prefill_impl()
+    metadata = _cached_prefill_metadata()
+    cache = torch.empty(16, 4, 35_072, dtype=torch.uint8)
+    query = torch.empty(17, 24, 256, dtype=torch.float16)
+    reference = Mock()
+    marker = Mock()
+
+    KVarNAttentionImpl._cached_prefill_materializer_counters.clear()
+    monkeypatch.setattr(
+        impl,
+        "_native_cached_prefill_materializer_eligibility",
+        lambda *args, **kwargs: (False, "unsupported_cache_abi"),
+    )
+    monkeypatch.setattr(
+        impl,
+        "_launch_native_cached_prefill_materializer",
+        Mock(side_effect=AssertionError("native materializer executed")),
+    )
+    monkeypatch.setattr(
+        impl, "_launch_reference_cached_prefill_materializer", reference
+    )
+    monkeypatch.setattr(kvarn_attn.logger, "info_once", marker)
+
+    impl._materialize_cached_prefill_kv(query, cache, metadata)
+
+    reference.assert_called_once()
+    assert reference.call_args.args[3].data_ptr() == (
+        metadata.fa_cu_seqlens_k.data_ptr()
+    )
+    assert KVarNAttentionImpl.cached_prefill_materializer_counters() == {
+        "calls": 1,
+        "native_launches": 0,
+        "reference_launches": 1,
+        "selected_native_fallbacks": 1,
+    }
+    marker.assert_called_once_with(
+        "[KVARN_PREFILL_MATERIALIZER] selected=native_xe2; "
+        "active=reference; layer=%s; reason=%s; query_tokens=%d; "
+        "context_tokens=%d; cache_layout=%s",
+        "model.layers.0.self_attn",
+        "unsupported_cache_abi",
+        17,
+        1792,
+        "xe2_dpas",
     )
 
 

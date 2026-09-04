@@ -85,6 +85,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_decode_attention,
     kvarn_frontend_variant_requested,
     kvarn_native_decode_abi_supported,
+    kvarn_native_feature_enabled,
     kvarn_native_kernel_variant_requested,
     kvarn_native_layer_selected,
     kvarn_native_layout_abi_supported,
@@ -111,12 +112,20 @@ _KVARN_FLUSH_WRITER_ENV = "KVARN_FLUSH_WRITER"
 _KVARN_FLUSH_WRITER_REFERENCE = "reference"
 _KVARN_FLUSH_WRITER_NATIVE_XE2 = "native_xe2"
 _KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2 = "sinkhorn_pack_xe2"
+_KVARN_CACHED_PREFILL_MATERIALIZER_REFERENCE = "reference"
+_KVARN_CACHED_PREFILL_MATERIALIZER_NATIVE_XE2 = "native_xe2"
 _KVARN_FLUSH_INDEX_COUNTER_KEYS = (
     "flush_calls",
     "layer_batches",
     "schedule_groups",
     "device_index_tensor_materializations",
     "shared_layer_reuses",
+)
+_KVARN_CACHED_PREFILL_MATERIALIZER_COUNTER_KEYS = (
+    "calls",
+    "native_launches",
+    "reference_launches",
+    "selected_native_fallbacks",
 )
 
 
@@ -167,19 +176,23 @@ def _cast_kvarn_activations(
     value: torch.Tensor,
     *,
     query_only: bool,
+    key_value_unused: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Cast activations still consumed by the fp16 fallback paths.
 
     Pure qlen=1 decode can feed bf16 Q/K/V directly to the native H256
-    transforms, which write their persistent fp16 scratch themselves.  Keep
-    those inputs untouched here; the decode driver performs a local Q cast if
-    it ultimately has to fall back to the dense fp16 transform.
+    transforms, which write their persistent fp16 scratch themselves.  A pure
+    cached-prefill continuation consumes K/V from cache after the cache update,
+    so it only casts Q.  The decode driver performs a local Q cast if it
+    ultimately has to fall back to the dense fp16 transform.
     """
     if query_only:
         return query, key, value
     if query.dtype == torch.float16:
         return query, key, value
     query = query.to(torch.float16)
+    if key_value_unused:
+        return query, key, value
     key = key.to(torch.float16)
     value = value.to(torch.float16)
     return query, key, value
@@ -207,6 +220,13 @@ def _is_pure_kvarn_prefill_step(attn_metadata, num_tokens: int) -> bool:
         and getattr(attn_metadata, "num_decode_tokens", -1) == 0
         and getattr(attn_metadata, "num_actual_tokens", -1) == num_tokens
         and num_tokens > 1
+    )
+
+
+def _is_pure_kvarn_cached_prefill_step(attn_metadata, num_tokens: int) -> bool:
+    """Return whether this is a pure chunked-prefill continuation."""
+    return _is_pure_kvarn_prefill_step(attn_metadata, num_tokens) and bool(
+        getattr(attn_metadata, "has_cached_multiquery", False)
     )
 
 
@@ -1617,6 +1637,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _flush_index_materialization: ClassVar[str | None] = None
     _flush_writer: ClassVar[str | None] = None
     _flush_index_counters: ClassVar[dict[str, int]] = {}
+    _cached_prefill_materializer: ClassVar[str | None] = None
+    _cached_prefill_materializer_counters: ClassVar[dict[str, int]] = {}
 
     # Registry of impls so the builder can enumerate per-layer pools when
     # it needs to update sink markers / trigger flushes.
@@ -1655,6 +1677,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls._flush_index_materialization = None
         cls._flush_writer = None
         cls._flush_index_counters.clear()
+        cls._cached_prefill_materializer = None
+        cls._cached_prefill_materializer_counters.clear()
         cls._all_impls.clear()
         cls._tiles_dumped = False
 
@@ -1691,6 +1715,30 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 source,
             )
         return cls._flush_writer
+
+    @classmethod
+    def _select_cached_prefill_materializer(cls) -> str:
+        if cls._cached_prefill_materializer is None:
+            cls._cached_prefill_materializer = (
+                _KVARN_CACHED_PREFILL_MATERIALIZER_NATIVE_XE2
+                if kvarn_native_feature_enabled("MATERIALIZE")
+                else _KVARN_CACHED_PREFILL_MATERIALIZER_REFERENCE
+            )
+            logger.info_once(
+                "[KVARN_FACTORY] selected_cached_prefill_materializer=%s; "
+                "selectors=KVARN_NATIVE_XPU,KVARN_NATIVE_XPU_MATERIALIZE; "
+                "fallback=reference; immutable for engine lifetime",
+                cls._cached_prefill_materializer,
+            )
+        return cls._cached_prefill_materializer
+
+    @classmethod
+    def cached_prefill_materializer_counters(cls) -> dict[str, int]:
+        """Return materializer dispatch counters for the current model load."""
+        return {
+            key: cls._cached_prefill_materializer_counters.get(key, 0)
+            for key in _KVARN_CACHED_PREFILL_MATERIALIZER_COUNTER_KEYS
+        }
 
     @classmethod
     def _ensure_shared_q_output_scratch(
@@ -1828,6 +1876,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         )
         type(self)._select_flush_index_materialization()
         self._kvarn_flush_writer = type(self)._select_flush_writer()
+        self._kvarn_cached_prefill_materializer = type(
+            self
+        )._select_cached_prefill_materializer()
         if self._kvarn_flush_writer in {
             _KVARN_FLUSH_WRITER_NATIVE_XE2,
             _KVARN_FLUSH_WRITER_SINKHORN_PACK_XE2,
@@ -3713,8 +3764,14 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # Flush is now triggered from KVarNMetadataBuilder.build() between
         # captured graph replays — nothing to do here at the top of forward.
 
-        # KVarN compute is fp16 internally. Pure one-token decode reads K/V from
-        # the cache after its update, so only Q remains live on this path.
+        # KVarN compute is fp16 internally. Pure one-token decode and pure
+        # cached-prefill continuations read K/V from cache after its update, so
+        # the latter only needs its live Q cast here.
+        cached_prefill_kv_unused = (
+            attn_metadata.is_prefill
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.has_cached_multiquery
+        )
         query, key, value = _cast_kvarn_activations(
             query,
             key,
@@ -3722,6 +3779,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             query_only=(
                 not attn_metadata.is_prefill and attn_metadata.max_query_len <= 1
             ),
+            key_value_unused=cached_prefill_kv_unused,
         )
 
         q = query[:N].view(N, self.num_heads, self.head_size)
@@ -4132,6 +4190,321 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             max_ctx_blocks,
         )
 
+    def _native_cached_prefill_materializer_eligibility(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+        *,
+        num_query_tokens: int,
+        total_k: int,
+        max_seq_len: int,
+    ) -> tuple[bool, str]:
+        """Fail closed before dispatching the native continuation materializer."""
+        if (
+            self._kvarn_cached_prefill_materializer
+            != _KVARN_CACHED_PREFILL_MATERIALIZER_NATIVE_XE2
+        ):
+            return False, "selected_reference"
+        if not _is_pure_kvarn_cached_prefill_step(attn_metadata, num_query_tokens):
+            return False, "not_pure_cached_prefill"
+
+        cfg = self.kvarn_config
+        block_to_slot = self._block_to_slot_t
+        tail_key = self._tail_K_pool
+        tail_value = self._tail_V_pool
+        tensors = (
+            kv_cache,
+            block_table,
+            seq_lens,
+            cu_seqlens_k,
+            block_to_slot,
+            tail_key,
+            tail_value,
+            key_output,
+            value_output,
+        )
+        if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+            return False, "missing_tensor"
+        assert isinstance(block_to_slot, torch.Tensor)
+        assert isinstance(tail_key, torch.Tensor)
+        assert isinstance(tail_value, torch.Tensor)
+        if (
+            self._kvarn_cache_layout != KVARN_CACHE_LAYOUT_XE2_DPAS
+            or self.head_size != 256
+            or self.num_kv_heads != 4
+            or cfg.group != 128
+            or cfg.key_bits != 4
+            or cfg.value_bits != 4
+            or cfg.record_bytes < 35_072
+            or cfg.record_bytes % 4 != 0
+        ):
+            return False, "unsupported_cache_abi"
+        if not kvarn_native_layer_selected(
+            getattr(self, "layer_name", ""),
+            os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
+        ):
+            return False, "layer_not_selected"
+        if not kvarn_native_layout_abi_supported("kvarn_materialize_packed_kv"):
+            return False, "native_op_unavailable"
+        if kv_cache.device.type != "xpu":
+            return False, "not_xpu"
+        if torch.xpu.is_current_stream_capturing():
+            return False, "stream_capturing"
+        if not (
+            kv_cache.dtype == torch.uint8
+            and kv_cache.ndim == 3
+            and kv_cache.shape[1] == self.num_kv_heads
+            and kv_cache.shape[2] == cfg.record_bytes
+            and kv_cache.is_contiguous()
+            and block_table.dtype == torch.int32
+            and block_table.ndim == 2
+            and block_table.shape[0] == seq_lens.shape[0]
+            and block_table.is_contiguous()
+            and seq_lens.dtype == torch.int32
+            and seq_lens.ndim == 1
+            and seq_lens.is_contiguous()
+            and cu_seqlens_k.dtype == torch.int32
+            and cu_seqlens_k.shape == (seq_lens.shape[0] + 1,)
+            and cu_seqlens_k.is_contiguous()
+            and block_to_slot.dtype == torch.int32
+            and block_to_slot.ndim == 1
+            and block_to_slot.shape[0] >= kv_cache.shape[0]
+            and block_to_slot.is_contiguous()
+            and tail_key.dtype == torch.float16
+            and tail_key.ndim == 4
+            and tail_key.shape[1:] == (cfg.group, self.num_kv_heads, self.head_size)
+            and tail_key.is_contiguous()
+            and tail_value.dtype == torch.float16
+            and tail_value.shape == tail_key.shape
+            and tail_value.is_contiguous()
+            and key_output.dtype == torch.float16
+            and key_output.ndim == 3
+            and key_output.shape[0] >= total_k
+            and key_output.shape[1:] == (self.num_kv_heads, self.head_size)
+            and key_output.is_contiguous()
+            and value_output.dtype == torch.float16
+            and value_output.shape == key_output.shape
+            and value_output.is_contiguous()
+        ):
+            return False, "incompatible_tensor_abi"
+        anchor = kv_cache.device
+        if any(tensor.device != anchor for tensor in tensors[1:]):
+            return False, "device_mismatch"
+        if max_seq_len < 1 or max_seq_len > block_table.shape[1] * cfg.group:
+            return False, "invalid_extent"
+        return True, "eligible"
+
+    def _launch_native_cached_prefill_materializer(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        max_seq_len: int,
+    ) -> None:
+        torch.ops._vllm_fa2_C.kvarn_materialize_packed_kv(
+            kv_cache,
+            block_table,
+            seq_lens,
+            cu_seqlens_k,
+            self._block_to_slot_t,
+            self._tail_K_pool,
+            self._tail_V_pool,
+            key_output,
+            value_output,
+            max_seq_len,
+            self._kvarn_dpas_layout,
+        )
+
+    def _launch_reference_cached_prefill_materializer(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        max_seq_len: int,
+    ) -> None:
+        cfg = self.kvarn_config
+        group = cfg.group
+        max_blocks = min((max_seq_len + group - 1) // group, block_table.shape[1])
+        max_blocks = max(max_blocks, 1)
+        from vllm.v1.attention.ops.triton_kvarn_decode import (
+            _kvarn_build_packed_kv_kernel,
+        )
+
+        grid = (seq_lens.shape[0] * max_blocks, self.num_kv_heads)
+        _kvarn_build_packed_kv_kernel[grid](
+            block_table,
+            seq_lens,
+            cu_seqlens_k,
+            self._block_to_slot_t,
+            kv_cache,
+            self._tail_K_pool,
+            self._tail_V_pool,
+            key_output,
+            value_output,
+            block_table.stride(0),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            self._tail_K_pool.stride(0),
+            self._tail_K_pool.stride(1),
+            self._tail_K_pool.stride(2),
+            key_output.stride(0),
+            key_output.stride(1),
+            MAX_BLOCKS_PER_REQ=max_blocks,
+            D=self.head_size,
+            GROUP=group,
+            K_BITS=cfg.key_bits,
+            V_BITS=cfg.value_bits,
+            NUM_BLOCKS_LOOKUP=self._block_lookup_size,
+            K_PACKED_OFFSET=cfg.k_packed_offset,
+            K_S_COL_OFFSET=cfg.k_s_col_offset,
+            K_ZP_OFFSET=cfg.k_zp_offset,
+            K_S_ROW_OFFSET=cfg.k_s_row_offset,
+            V_PACKED_OFFSET=cfg.v_packed_offset,
+            V_S_COL_OFFSET=cfg.v_s_col_offset,
+            V_S_ROW_OFFSET=cfg.v_s_row_offset,
+            V_ZP_OFFSET=cfg.v_zp_offset,
+            DPAS_LAYOUT=self._kvarn_dpas_layout,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    def _materialize_cached_prefill_kv(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        """Materialize cached K/V using builder-owned metadata when available."""
+        md = attn_metadata
+        batch_size = md.block_table.shape[0]
+        seq_lens = md.seq_lens[:batch_size]
+        if seq_lens.dtype != torch.int32:
+            seq_lens = seq_lens.to(torch.int32)
+        cu_seqlens_k = md.fa_cu_seqlens_k
+        if cu_seqlens_k is None:
+            cu_seqlens_k = F.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0))
+        else:
+            cu_seqlens_k = cu_seqlens_k[: batch_size + 1]
+
+        seq_lens_cpu = getattr(md, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None and len(seq_lens_cpu) >= batch_size:
+            total_k = sum(int(length) for length in seq_lens_cpu[:batch_size])
+        else:
+            total_k = int(cu_seqlens_k[-1].item())
+        if total_k <= 0 or total_k > self._fa_K_buf.shape[0]:
+            raise ValueError("cached prefill exceeds KVarN materialization scratch")
+
+        max_seq_len = int(md.max_seq_len)
+        block_table = md.block_table[:batch_size]
+        key_output = self._fa_K_buf
+        value_output = self._fa_V_buf
+        eligible, reason = self._native_cached_prefill_materializer_eligibility(
+            kv_cache,
+            block_table,
+            seq_lens,
+            cu_seqlens_k,
+            key_output,
+            value_output,
+            md,
+            num_query_tokens=q.shape[0],
+            total_k=total_k,
+            max_seq_len=max_seq_len,
+        )
+        cls = type(self)
+        cls._cached_prefill_materializer_counters["calls"] = (
+            cls._cached_prefill_materializer_counters.get("calls", 0) + 1
+        )
+        if eligible:
+            self._launch_native_cached_prefill_materializer(
+                kv_cache,
+                block_table,
+                seq_lens,
+                cu_seqlens_k,
+                key_output,
+                value_output,
+                max_seq_len,
+            )
+            cls._cached_prefill_materializer_counters["native_launches"] = (
+                cls._cached_prefill_materializer_counters.get("native_launches", 0) + 1
+            )
+            logger.info_once(
+                "[KVARN_PREFILL_MATERIALIZER] active=native_xe2; layer=%s; "
+                "native_op=kvarn_materialize_packed_kv; query_tokens=%d; "
+                "context_tokens=%d; max_seq_len=%d; cache_layout=%s; "
+                "fallback=reference",
+                getattr(self, "layer_name", ""),
+                q.shape[0],
+                total_k,
+                max_seq_len,
+                self._kvarn_cache_layout,
+            )
+        else:
+            self._launch_reference_cached_prefill_materializer(
+                kv_cache,
+                block_table,
+                seq_lens,
+                cu_seqlens_k,
+                key_output,
+                value_output,
+                max_seq_len,
+            )
+            cls._cached_prefill_materializer_counters["reference_launches"] = (
+                cls._cached_prefill_materializer_counters.get("reference_launches", 0)
+                + 1
+            )
+            if (
+                self._kvarn_cached_prefill_materializer
+                == _KVARN_CACHED_PREFILL_MATERIALIZER_NATIVE_XE2
+            ):
+                cls._cached_prefill_materializer_counters[
+                    "selected_native_fallbacks"
+                ] = (
+                    cls._cached_prefill_materializer_counters.get(
+                        "selected_native_fallbacks", 0
+                    )
+                    + 1
+                )
+                logger.info_once(
+                    "[KVARN_PREFILL_MATERIALIZER] selected=native_xe2; "
+                    "active=reference; layer=%s; reason=%s; query_tokens=%d; "
+                    "context_tokens=%d; cache_layout=%s",
+                    getattr(self, "layer_name", ""),
+                    reason,
+                    q.shape[0],
+                    total_k,
+                    self._kvarn_cache_layout,
+                )
+            else:
+                logger.info_once(
+                    "[KVARN_PREFILL_MATERIALIZER] active=reference; layer=%s; "
+                    "query_tokens=%d; context_tokens=%d; cache_layout=%s",
+                    getattr(self, "layer_name", ""),
+                    q.shape[0],
+                    total_k,
+                    self._kvarn_cache_layout,
+                )
+        counters = cls.cached_prefill_materializer_counters()
+        logger.debug(
+            "[KVARN_PREFILL_MATERIALIZER_COUNTER] calls=%d; native_launches=%d; "
+            "reference_launches=%d; selected_native_fallbacks=%d",
+            counters["calls"],
+            counters["native_launches"],
+            counters["reference_launches"],
+            counters["selected_native_fallbacks"],
+        )
+        return key_output, value_output, cu_seqlens_k, total_k, max_seq_len
+
     def _cached_multiquery_path(
         self,
         q: torch.Tensor,
@@ -4141,8 +4514,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         """Multi-query tokens with cached history (a speculative-decode verify
         step or a chunked-prefill continuation), batched.
 
-        Builds the batch's rotated fp16 K/V with the ONE block_table-driven
-        Triton kernel (``_kvarn_build_packed_kv_kernel``) and runs a single
+        Builds the batch's rotated fp16 K/V with one native or Triton
+        block-table-driven materializer and runs a single
         ``flash_attn_varlen`` call. FA's varlen causal mask is bottom-right
         aligned when ``seqlen_q < seqlen_k``, i.e. query token ``t`` attends
         keys ``<= cached_len + t`` — exactly the spec-verify / continuation
@@ -4184,64 +4557,15 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             _require_kvarn_dpas_reader(dpas_layout, False, "slow multi-query decode")
             return self._decode_path_slow(q, kv_cache, md)
 
-        seq_lens = md.seq_lens[:B].to(torch.int32)
-        cu_k = F.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0))
-        total_k = int(cu_k[-1].item())
-        if total_k <= 0 or total_k > self._fa_K_buf.shape[0]:
+        try:
+            K_packed, V_packed, cu_k, total_k, max_k = (
+                self._materialize_cached_prefill_kv(q, kv_cache, md)
+            )
+        except ValueError:
             _require_kvarn_dpas_reader(dpas_layout, False, "slow multi-query decode")
             return self._decode_path_slow(q, kv_cache, md)
 
-        cfg = self.kvarn_config
-        group = cfg.group
         D = self.head_size
-        Hk = self.num_kv_heads
-        max_k = int(md.max_seq_len)
-        max_blocks = min((max_k + group - 1) // group, md.block_table.shape[1])
-        max_blocks = max(max_blocks, 1)
-
-        K_packed = self._fa_K_buf
-        V_packed = self._fa_V_buf
-        from vllm.v1.attention.ops.triton_kvarn_decode import (
-            _kvarn_build_packed_kv_kernel,
-        )
-
-        _kvarn_build_packed_kv_kernel[(B * max_blocks, Hk)](
-            md.block_table,
-            seq_lens,
-            cu_k,
-            self._block_to_slot_t,
-            kv_cache,
-            self._tail_K_pool,
-            self._tail_V_pool,
-            K_packed,
-            V_packed,
-            md.block_table.stride(0),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            self._tail_K_pool.stride(0),
-            self._tail_K_pool.stride(1),
-            self._tail_K_pool.stride(2),
-            K_packed.stride(0),
-            K_packed.stride(1),
-            MAX_BLOCKS_PER_REQ=max_blocks,
-            D=D,
-            GROUP=group,
-            K_BITS=cfg.key_bits,
-            V_BITS=cfg.value_bits,
-            NUM_BLOCKS_LOOKUP=self._block_lookup_size,
-            K_PACKED_OFFSET=cfg.k_packed_offset,
-            K_S_COL_OFFSET=cfg.k_s_col_offset,
-            K_ZP_OFFSET=cfg.k_zp_offset,
-            K_S_ROW_OFFSET=cfg.k_s_row_offset,
-            V_PACKED_OFFSET=cfg.v_packed_offset,
-            V_S_COL_OFFSET=cfg.v_s_col_offset,
-            V_S_ROW_OFFSET=cfg.v_s_row_offset,
-            V_ZP_OFFSET=cfg.v_zp_offset,
-            DPAS_LAYOUT=dpas_layout,
-            num_warps=4,
-            num_stages=2,
-        )
-
         # The packed K/V are in the rotated frame (the store path rotates before
         # quantizing / pooling), so rotate q in and un-rotate the output — same
         # fp16 Hadamard as the store side, so QK^T is invariant.
