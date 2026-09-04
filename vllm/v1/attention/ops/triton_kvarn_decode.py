@@ -483,6 +483,38 @@ def _kvarn_op_supports_argument(op: object, argument: str) -> bool:
     return any(schema_arg.name == argument for schema_arg in arguments)
 
 
+_KVARN_SINKHORN_WRITER_SCHEMA_ARGUMENTS = (
+    ("tail_key", "Tensor"),
+    ("tail_value", "Tensor"),
+    ("pool_slots", "Tensor"),
+    ("block_ids", "Tensor"),
+    ("packed_cache", "Tensor"),
+    ("sinkhorn_iterations", "int"),
+    ("dpas_layout", "bool"),
+)
+
+
+@functools.lru_cache(maxsize=1)
+def kvarn_native_sinkhorn_writer_abi_supported() -> bool:
+    """Require the complete fused-writer ABI, including argument order.
+
+    Unlike the older native operators, this selector has no compatible legacy
+    schema.  Checking only ``dpas_layout`` could therefore route a raw page to
+    an extension whose writer contract is incomplete or reordered.
+    """
+    op_name = "kvarn_sinkhorn_pack_kv"
+    if not hasattr(torch.ops._vllm_fa2_C, op_name):
+        return False
+    try:
+        schema = getattr(torch.ops._vllm_fa2_C, op_name).default._schema
+        arguments = schema.arguments
+        returns = schema.returns
+    except (AttributeError, RuntimeError):
+        return False
+    actual = tuple((argument.name, str(argument.type)) for argument in arguments)
+    return actual == _KVARN_SINKHORN_WRITER_SCHEMA_ARGUMENTS and not returns
+
+
 @functools.lru_cache(maxsize=8)
 def kvarn_native_layout_abi_supported(op_name: str) -> bool:
     """Require the immutable-layout ABI before selecting a native cache op."""
