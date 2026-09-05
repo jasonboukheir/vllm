@@ -1,0 +1,6457 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""KVarN attention backend.
+
+KV-cache compression by Hadamard rotation + iterative variance-normalization
+(Sinkhorn-like) + asymmetric RTN. K is quantized per-channel, V per-token —
+KIVI orientation. The variance-normalization tile equals the vLLM
+``block_size`` (default and only supported value in this PR: ``128``).
+
+Cache layout (per block, per kv-head, ``head_dim=128, k_bits=4, v_bits=4``):
+  17920 B = 8192 (K packed) + 256 + 256 + 256  (K absorbed scales + zp + s_row)
+          + 8192 (V packed) + 256 + 256 + 256  (V s_col + absorbed s_row + zp)
+
+vLLM-shape reinterpretation: ``(num_blocks, block_size=128, num_kv_heads, 140)``
+where ``140 = 17920 / 128``. The 128-slot middle dim has no semantic per-token
+meaning — KVarN treats each ``kv_cache[block, :, head, :].view(-1)`` as one
+flat 17920-byte tile record. The slot dim is preserved only to satisfy
+vLLM's KV-cache allocator (which expects 4D for non-MLA layouts) and to keep
+``slot_mapping`` arithmetic uniform with other backends.
+
+Implementation outline:
+  - `do_kv_cache_update` buffers incoming fp16 K/V in a per-block staging dict
+    (keyed by block_id). When a block fills to 128 tokens, it rotates by
+    Hadamard, calls `kvarn_store_tile_{k,v}` (Stage-3a validated), and writes
+    the packed 17920-byte record into the cache.
+  - `forward` has three branches: pure-prefill first chunk (raw K/V →
+    flash_attn_varlen), pure-decode (dequant cached blocks + un-rotate, concat
+    with fp16 tail buffers, run SDPA), mixed batch (split decode / prefill).
+  - The decode path is intentionally slow PyTorch — Stage 4 replaces it with
+    a Triton split-KV decode mirroring `triton_turboquant_decode.py`.
+"""
+
+from __future__ import annotations
+
+import functools
+import math
+import os
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
+from enum import Enum
+from typing import ClassVar, Protocol
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.kvarn.config import (
+    kvarn_decode_flush_scope,
+    kvarn_decode_fp16_low_water_blocks,
+    kvarn_decode_fp16_window_blocks,
+    kvarn_prefill_fp16_window_blocks,
+)
+from vllm.platforms import current_platform
+from vllm.utils.platform_utils import num_compute_units
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionImpl,
+    AttentionLayer,
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+    AttentionType,
+    CommonAttentionMetadata,
+    MultipleOf,
+)
+from vllm.v1.attention.backends.fa_utils import (
+    get_flash_attn_version,
+    is_flash_attn_varlen_func_available,
+)
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.ops.kvarn_decode import (
+    kvarn_dequant_tile_k,
+    kvarn_dequant_tile_v,
+)
+from vllm.v1.attention.ops.kvarn_store import (
+    kvarn_store_tile_k_batch_from_sinkhorn,
+    kvarn_store_tile_v_batch_from_sinkhorn,
+)
+from vllm.v1.attention.ops.triton_kvarn_decode import (
+    KVARN_CACHE_LAYOUT_NATURAL,
+    KVARN_CACHE_LAYOUT_XE2_DPAS,
+    KVARN_FRONTEND_QKV_SCATTER,
+    KVARN_FRONTEND_QKV_SCATTER_INLINE,
+    KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
+    KVARN_FRONTEND_REFERENCE,
+    KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1,
+    KVARN_NATIVE_SPLIT_POLICY_FIXED,
+    KVARN_PREFILL_STORE_HADAMARD_SCATTER,
+    KVARN_PREFILL_STORE_REFERENCE,
+    KVarNBoundNativeDecodePlanV2,
+    KVarNTrustedNativeDecodePlan,
+    _kvarn_scatter_store_kernel,
+    _require_kvarn_dpas_reader,
+    build_kvarn_trusted_native_decode_plan,
+    kvarn_cache_layout_requested,
+    kvarn_decode_attention,
+    kvarn_frontend_variant_requested,
+    kvarn_native_decode_abi_supported,
+    kvarn_native_feature_enabled,
+    kvarn_native_kernel_variant_requested,
+    kvarn_native_layer_selected,
+    kvarn_native_layout_abi_supported,
+    kvarn_native_prefill_store_supported,
+    kvarn_native_split_count,
+    kvarn_native_split_policy_requested,
+    kvarn_native_split_scratch_count,
+    kvarn_native_store_supported,
+    kvarn_prefill_store_variant_requested,
+    validate_kvarn_native_factory_selection,
+)
+from vllm.v1.attention.ops.triton_kvarn_sinkhorn import kvarn_sinkhorn_triton
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
+
+_HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
+if _HAS_FLASH_ATTN:
+    from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+logger = init_logger(__name__)
+
+_KVARN_FLUSH_INDEX_MATERIALIZATION_ENV = "KVARN_FLUSH_INDEX_MATERIALIZATION"
+_KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE = "per_layer"
+_KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED = "shared"
+_KVARN_FLUSH_WRITER_ENV = "KVARN_FLUSH_WRITER"
+_KVARN_FLUSH_WRITER_REFERENCE = "reference"
+_KVARN_FLUSH_WRITER_NATIVE_XE2 = "native_xe2"
+_KVARN_FORWARD_POOL_ENSURE_ENV = "KVARN_FORWARD_POOL_ENSURE"
+_KVARN_FORWARD_POOL_ENSURE_ALWAYS = "always"
+_KVARN_FORWARD_POOL_ENSURE_EPOCH_LATCH = "epoch_latch"
+_KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF = "fused_qkv_proof"
+_KVARN_QLEN1_INLINE_PLAN_ENV = "KVARN_QLEN1_INLINE_PLAN"
+_KVARN_QLEN1_INLINE_PLAN_REFERENCE = "reference"
+_KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE = "trusted_native"
+_KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2 = "bound_native_v2"
+_KVARN_CACHED_PREFILL_MATERIALIZER_REFERENCE = "reference"
+_KVARN_CACHED_PREFILL_MATERIALIZER_NATIVE_XE2 = "native_xe2"
+_KVARN_METADATA_LIFECYCLE_ENV = "KVARN_METADATA_LIFECYCLE"
+_KVARN_METADATA_LIFECYCLE_REFERENCE = "reference"
+_KVARN_METADATA_LIFECYCLE_INCREMENTAL_QLEN1 = "incremental_qlen1"
+_KVARN_XPU_BETA_CACHE_DTYPE = "kvarn_k4v4_g128_compact"
+_KVARN_XPU_BETA_DECODE_WINDOW = 4
+_KVARN_FLUSH_INDEX_COUNTER_KEYS = (
+    "flush_calls",
+    "layer_batches",
+    "schedule_groups",
+    "device_index_tensor_materializations",
+    "shared_layer_reuses",
+)
+_KVARN_CACHED_PREFILL_MATERIALIZER_COUNTER_KEYS = (
+    "calls",
+    "native_launches",
+    "reference_launches",
+    "selected_native_fallbacks",
+)
+
+
+class _KVarNQlen1MetadataKind(Enum):
+    REFERENCE = "reference"
+    EAGER_PURE_DECODE = "eager_pure_decode"
+
+
+def _kvarn_flush_index_materialization_requested(
+    default: str = _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE,
+) -> tuple[str, str]:
+    """Resolve the process-lifetime flush-index materialization policy."""
+    raw_value = os.environ.get(_KVARN_FLUSH_INDEX_MATERIALIZATION_ENV)
+    if raw_value is None:
+        source = (
+            "xpu-beta-default"
+            if default != _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE
+            else "reference-default"
+        )
+        return default, source
+    if raw_value not in {
+        _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE,
+        _KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED,
+    }:
+        raise ValueError(
+            f"{_KVARN_FLUSH_INDEX_MATERIALIZATION_ENV} must be exactly "
+            f"'{_KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE}' or "
+            f"'{_KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED}', got {raw_value!r}"
+        )
+    return raw_value, _KVARN_FLUSH_INDEX_MATERIALIZATION_ENV
+
+
+def _kvarn_flush_writer_requested(
+    default: str = _KVARN_FLUSH_WRITER_REFERENCE,
+) -> tuple[str, str]:
+    """Resolve the engine-lifetime full-page writer implementation."""
+    raw_value = os.environ.get(_KVARN_FLUSH_WRITER_ENV)
+    if raw_value is None:
+        source = (
+            "xpu-beta-default"
+            if default != _KVARN_FLUSH_WRITER_REFERENCE
+            else "reference-default"
+        )
+        return default, source
+    if raw_value not in {
+        _KVARN_FLUSH_WRITER_REFERENCE,
+        _KVARN_FLUSH_WRITER_NATIVE_XE2,
+    }:
+        raise ValueError(
+            f"{_KVARN_FLUSH_WRITER_ENV} must be exactly "
+            f"'{_KVARN_FLUSH_WRITER_REFERENCE}' or "
+            f"'{_KVARN_FLUSH_WRITER_NATIVE_XE2}', got {raw_value!r}"
+        )
+    return raw_value, _KVARN_FLUSH_WRITER_ENV
+
+
+def _kvarn_forward_pool_ensure_requested() -> tuple[str, str]:
+    """Resolve whether forward may consume a fused-update pool proof."""
+    raw_value = os.environ.get(_KVARN_FORWARD_POOL_ENSURE_ENV)
+    if raw_value is None:
+        return _KVARN_FORWARD_POOL_ENSURE_ALWAYS, "reference-default"
+    if raw_value not in {
+        _KVARN_FORWARD_POOL_ENSURE_ALWAYS,
+        _KVARN_FORWARD_POOL_ENSURE_EPOCH_LATCH,
+        _KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF,
+    }:
+        raise ValueError(
+            f"{_KVARN_FORWARD_POOL_ENSURE_ENV} must be exactly "
+            f"'{_KVARN_FORWARD_POOL_ENSURE_ALWAYS}' or "
+            f"'{_KVARN_FORWARD_POOL_ENSURE_EPOCH_LATCH}' or "
+            f"'{_KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF}', got "
+            f"{raw_value!r}"
+        )
+    return raw_value, _KVARN_FORWARD_POOL_ENSURE_ENV
+
+
+def _kvarn_qlen1_inline_plan_requested(
+    default: str = _KVARN_QLEN1_INLINE_PLAN_REFERENCE,
+) -> tuple[str, str]:
+    """Resolve the engine-lifetime eager qlen=1 inline execution plan."""
+    raw_value = os.environ.get(_KVARN_QLEN1_INLINE_PLAN_ENV)
+    if raw_value is None:
+        source = (
+            "xpu-beta-default"
+            if default != _KVARN_QLEN1_INLINE_PLAN_REFERENCE
+            else "reference-default"
+        )
+        return default, source
+    if raw_value not in {
+        _KVARN_QLEN1_INLINE_PLAN_REFERENCE,
+        _KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE,
+        _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2,
+    }:
+        raise ValueError(
+            f"{_KVARN_QLEN1_INLINE_PLAN_ENV} must be exactly "
+            f"'{_KVARN_QLEN1_INLINE_PLAN_REFERENCE}' or "
+            f"'{_KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE}' or "
+            f"'{_KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2}', got {raw_value!r}"
+        )
+    return raw_value, _KVARN_QLEN1_INLINE_PLAN_ENV
+
+
+def _kvarn_metadata_lifecycle_requested() -> tuple[str, str]:
+    """Resolve the engine-lifetime metadata lifecycle implementation."""
+    raw_value = os.environ.get(_KVARN_METADATA_LIFECYCLE_ENV)
+    if raw_value is None:
+        return _KVARN_METADATA_LIFECYCLE_REFERENCE, "reference-default"
+    if raw_value not in {
+        _KVARN_METADATA_LIFECYCLE_REFERENCE,
+        _KVARN_METADATA_LIFECYCLE_INCREMENTAL_QLEN1,
+    }:
+        raise ValueError(
+            f"{_KVARN_METADATA_LIFECYCLE_ENV} must be exactly "
+            f"'{_KVARN_METADATA_LIFECYCLE_REFERENCE}' or "
+            f"'{_KVARN_METADATA_LIFECYCLE_INCREMENTAL_QLEN1}', got "
+            f"{raw_value!r}"
+        )
+    return raw_value, _KVARN_METADATA_LIFECYCLE_ENV
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Hadamard cache (one D×D matrix per (head_dim, device))
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _cast_kvarn_activations(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    query_only: bool,
+    key_value_unused: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cast activations still consumed by the fp16 fallback paths.
+
+    Pure qlen=1 decode can feed bf16 Q/K/V directly to the native H256
+    transforms, which write their persistent fp16 scratch themselves.  A pure
+    cached-prefill continuation consumes K/V from cache after the cache update,
+    so it only casts Q.  The decode driver performs a local Q cast if it
+    ultimately has to fall back to the dense fp16 transform.
+    """
+    if query_only:
+        return query, key, value
+    if query.dtype == torch.float16:
+        return query, key, value
+    query = query.to(torch.float16)
+    if key_value_unused:
+        return query, key, value
+    key = key.to(torch.float16)
+    value = value.to(torch.float16)
+    return query, key, value
+
+
+def _is_pure_kvarn_decode_step(attn_metadata, num_tokens: int) -> bool:
+    """Return whether a cache update belongs to pure qlen=1 decode."""
+    return (
+        attn_metadata is not None
+        and not getattr(attn_metadata, "is_prefill", True)
+        and getattr(attn_metadata, "max_query_len", 0) <= 1
+        and getattr(attn_metadata, "num_decodes", 0) > 0
+        and getattr(attn_metadata, "num_decode_tokens", -1) == num_tokens
+        and getattr(attn_metadata, "num_actual_tokens", -1) == num_tokens
+    )
+
+
+def _is_pure_kvarn_prefill_step(attn_metadata, num_tokens: int) -> bool:
+    """Return whether every real token belongs to a multi-token prefill."""
+    return (
+        attn_metadata is not None
+        and getattr(attn_metadata, "is_prefill", False)
+        and getattr(attn_metadata, "max_query_len", 0) > 1
+        and getattr(attn_metadata, "num_decodes", -1) == 0
+        and getattr(attn_metadata, "num_decode_tokens", -1) == 0
+        and getattr(attn_metadata, "num_actual_tokens", -1) == num_tokens
+        and num_tokens > 1
+    )
+
+
+def _is_pure_kvarn_cached_prefill_step(attn_metadata, num_tokens: int) -> bool:
+    """Return whether this is a pure chunked-prefill continuation."""
+    return _is_pure_kvarn_prefill_step(attn_metadata, num_tokens) and bool(
+        getattr(attn_metadata, "has_cached_multiquery", False)
+    )
+
+
+def _is_pure_qlen1_batch(
+    *,
+    num_decodes: int,
+    num_prefills: int,
+    num_decode_tokens: int,
+    num_actual_tokens: int,
+    max_query_len: int,
+) -> bool:
+    """Return whether every real token is one qlen=1 decode request."""
+    return (
+        num_decodes > 0
+        and num_prefills == 0
+        and num_decode_tokens == num_decodes
+        and num_actual_tokens == num_decode_tokens
+        and max_query_len <= 1
+    )
+
+
+def _kvarn_block_table_numpy(common_attn_metadata) -> np.ndarray:
+    """Use the runner's authoritative CPU block table without a device sync."""
+    block_table_cpu = getattr(common_attn_metadata, "block_table_cpu", None)
+    if isinstance(block_table_cpu, np.ndarray):
+        return block_table_cpu
+    if isinstance(block_table_cpu, torch.Tensor):
+        if block_table_cpu.device.type != "cpu":
+            raise ValueError("CommonAttentionMetadata.block_table_cpu must be on CPU")
+        return block_table_cpu.numpy()
+    return common_attn_metadata.block_table_tensor.cpu().numpy()
+
+
+def _can_elide_fa_cu_seqlens(
+    *,
+    pure_qlen1: bool,
+    for_cudagraph_capture: bool,
+    has_built_cudagraph_metadata: bool,
+) -> bool:
+    """Elide metadata only when every possible consumer is cu-seqlens-free."""
+    return (
+        pure_qlen1
+        and not for_cudagraph_capture
+        and not has_built_cudagraph_metadata
+        and os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
+    )
+
+
+def _active_kvarn_metadata(layer: torch.nn.Module):
+    """Look up this layer's metadata from the active forward context."""
+    try:
+        from vllm.forward_context import get_forward_context
+
+        raw_metadata = get_forward_context().attn_metadata
+    except Exception:
+        return None
+
+    layer_name = getattr(layer, "layer_name", "")
+    if isinstance(raw_metadata, dict):
+        return raw_metadata.get(layer_name)
+    if isinstance(raw_metadata, list):
+        for entry in raw_metadata:
+            if isinstance(entry, dict) and layer_name in entry:
+                return entry[layer_name]
+        return None
+    return raw_metadata
+
+
+@functools.cache
+def _hadamard_cached(d: int, device_str: str) -> torch.Tensor:
+    """Sylvester Hadamard, normalised, cached per (d, device)."""
+    H = torch.ones(1, 1)
+    while H.shape[0] < d:
+        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+    return (H / math.sqrt(d)).to(torch.device(device_str)).float()
+
+
+def _build_hadamard(d: int, device: torch.device) -> torch.Tensor:
+    return _hadamard_cached(d, str(torch.device(device)))
+
+
+def _kvarn_xpu_beta_profile_enabled(cache_dtype: str) -> bool:
+    """Use the qualified B70 profile for the compact beta dtype on XPU."""
+    return current_platform.is_xpu() and cache_dtype == _KVARN_XPU_BETA_CACHE_DTYPE
+
+
+def _resolve_kvarn_cache_layout(cfg, *, beta_profile: bool = False) -> str:
+    """Resolve and validate the immutable packed-cache layout for an engine."""
+    layout = kvarn_cache_layout_requested(
+        KVARN_CACHE_LAYOUT_XE2_DPAS if beta_profile else KVARN_CACHE_LAYOUT_NATURAL
+    )
+    if layout == KVARN_CACHE_LAYOUT_NATURAL:
+        return layout
+    if layout != KVARN_CACHE_LAYOUT_XE2_DPAS:
+        raise RuntimeError(f"Unsupported KVarN cache layout: {layout}")
+    actual = (cfg.head_dim, cfg.group, cfg.key_bits, cfg.value_bits)
+    if actual != (256, 128, 4, 4):
+        raise RuntimeError(
+            "The xe2_dpas KVarN cache layout requires D256/G128/K4V4; "
+            f"got D{actual[0]}/G{actual[1]}/K{actual[2]}V{actual[3]}"
+        )
+    return layout
+
+
+def _use_kvarn_fused_verify(
+    *,
+    max_query_len: int,
+    max_seq_len: int,
+    group: int,
+    batch_size: int,
+    dpas_layout: bool,
+) -> bool:
+    """Route only natural-layout cached queries to the fused verify reader."""
+    return (
+        os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"
+        and not dpas_layout
+        and max_query_len <= int(os.environ.get("KVARN_FUSED_VERIFY_MAXQ", "8"))
+        and (max_seq_len + group - 1) // group
+        >= int(os.environ.get("KVARN_FUSED_VERIFY_MIN_BLOCKS", "64"))
+        and batch_size > 0
+    )
+
+
+def _sinkhorn_balance_kv(K_tiles, V_tiles, cfg):
+    """Sinkhorn-balance K/V tiles while preserving their independent axes."""
+    if K_tiles.shape[1:] == V_tiles.shape[1:]:
+        nk = K_tiles.shape[0]
+        balanced, sinkhorn_col, sinkhorn_row = kvarn_sinkhorn_triton(
+            torch.cat([K_tiles, V_tiles], dim=0),
+            iterations=cfg.sinkhorn_iters,
+        )
+        return (
+            balanced[:nk],
+            sinkhorn_col[:nk],
+            sinkhorn_row[:nk],
+            balanced[nk:],
+            sinkhorn_col[nk:],
+            sinkhorn_row[nk:],
+        )
+
+    key = kvarn_sinkhorn_triton(K_tiles, iterations=cfg.sinkhorn_iters)
+    value = kvarn_sinkhorn_triton(V_tiles, iterations=cfg.sinkhorn_iters)
+    return (*key, *value)
+
+
+def _sinkhorn_pack_kv(K_tiles, V_tiles, cfg, *, cache_layout: str):
+    """Sinkhorn-balance + reference-pack a batch of K/V tiles.
+
+    K_tiles is [N, D, group] (absorb axis = channel), V_tiles is [N, group, D]
+    (absorb axis = token). When D == group (head_dim 128) the two have the same
+    [R, C] shape, so we fuse them into ONE Triton Sinkhorn launch. When D != group
+    (e.g. head_dim 256, group 128) the tiles are non-square and have different
+    [R, C] — kvarn_sinkhorn_triton takes R, C as per-launch constexpr — so K and V
+    must be balanced in SEPARATE launches. (A single torch.cat here assumed square
+    and broke at head_dim=256.)"""
+    if cache_layout not in (
+        KVARN_CACHE_LAYOUT_NATURAL,
+        KVARN_CACHE_LAYOUT_XE2_DPAS,
+    ):
+        raise RuntimeError(f"Unsupported KVarN cache layout: {cache_layout}")
+    dpas_layout = cache_layout == KVARN_CACHE_LAYOUT_XE2_DPAS
+    kbal, ksc, ksr, vbal, vsc, vsr = _sinkhorn_balance_kv(K_tiles, V_tiles, cfg)
+    K_out = kvarn_store_tile_k_batch_from_sinkhorn(
+        kbal,
+        ksc,
+        ksr,
+        bits=cfg.key_bits,
+        dpas_layout=dpas_layout,
+    )
+    V_out = kvarn_store_tile_v_batch_from_sinkhorn(
+        vbal,
+        vsc,
+        vsr,
+        bits=cfg.value_bits,
+        dpas_layout=dpas_layout,
+    )
+    return K_out, V_out
+
+
+def _kvarn_native_balanced_writer_supported(
+    *,
+    cache_layout: str,
+    head_dim: int,
+    group: int,
+    key_bits: int,
+    value_bits: int,
+    num_kv_heads: int,
+    record_bytes: int,
+    op_available: bool,
+    rtn_quantile: float = 0.0,
+) -> bool:
+    """Pure eligibility predicate for the frozen Xe2 balanced-writer ABI."""
+    return (
+        cache_layout == KVARN_CACHE_LAYOUT_XE2_DPAS
+        and head_dim == 256
+        and group == 128
+        and key_bits == 4
+        and value_bits == 4
+        and num_kv_heads == 4
+        and record_bytes >= 35_072
+        and record_bytes % 4 == 0
+        and rtn_quantile == 0.0
+        and op_available
+    )
+
+
+def _launch_kvarn_native_balanced_writer(
+    balanced: tuple[torch.Tensor, ...],
+    block_ids: torch.Tensor,
+    packed_cache: torch.Tensor,
+) -> None:
+    """Write balanced full pages directly into xe2_dpas cache records.
+
+    ``block_ids`` comes from the builder's per-step ``flush_seen`` schedule and
+    must contain unique IDs in ``[0, packed_cache.shape[0])``.  That host-side
+    construction is the no-synchronization proof required by the native op;
+    validating a device index tensor here would stall the flush hot path.
+    """
+    torch.ops._vllm_fa2_C.kvarn_pack_balanced_kv(
+        *balanced,
+        block_ids,
+        packed_cache,
+        True,
+    )
+
+
+def _reconcile_kvarn_sink_ownership(
+    sinks: set[int],
+    retired_sinks: dict[int, None],
+    blocks_needed: set[int],
+    row0_set: set[int],
+    is_sink_t: torch.Tensor,
+) -> bool:
+    """Remove stale sink roles when block IDs are reused without an idle step."""
+    mutated = False
+    for bid in retired_sinks.keys() & blocks_needed:
+        retired_sinks.pop(bid)
+        mutated = True
+
+    for bid in sinks & blocks_needed - row0_set:
+        sinks.discard(bid)
+        mutated = True
+        if bid < is_sink_t.shape[0]:
+            is_sink_t[bid] = False
+    return mutated
+
+
+def _defer_kvarn_prefill_history_blocks(
+    row: Sequence[int],
+    *,
+    q_len: int,
+    committed_len: int,
+    group: int,
+    bt_cols: int,
+    resident_blocks: dict[int, int],
+    blocks_needed: set[int],
+    deferred_blocks: set[int] | None = None,
+) -> bool:
+    """Retain resident full history for a diagnostic continuation ablation.
+
+    Returning ``True`` tells the caller to skip this row's normal walk-back
+    flush. Adding each resident, fully committed history block to
+    ``blocks_needed`` also keeps it out of reclaim. Blocks already materialized
+    in int4 are deliberately ignored: allocating an empty fp16 slot for one
+    would corrupt a prefix-cache hit.
+
+    This is intentionally not a memory-scalable policy. It exists only to
+    isolate continuation-boundary flushing as a correctness/performance cause.
+    """
+    if (
+        os.environ.get("VLLM_KVARN_DEFER_PREFILL_FLUSH", "0") != "1"
+        or q_len <= 1
+        or committed_len <= 0
+    ):
+        return False
+
+    for k in range(min(committed_len // group, bt_cols)):
+        bid = int(row[k])
+        if bid >= 0 and bid in resident_blocks:
+            blocks_needed.add(bid)
+            if deferred_blocks is not None:
+                deferred_blocks.add(bid)
+    return True
+
+
+def _kvarn_prefill_fp16_window_blocks() -> int:
+    """Return the bounded continuation-history fp16 window size."""
+    return kvarn_prefill_fp16_window_blocks()
+
+
+def _kvarn_decode_fp16_window_blocks(default: int = 0) -> int:
+    """Return the bounded decode-history fp16 high-water mark."""
+    return kvarn_decode_fp16_window_blocks(default)
+
+
+def _kvarn_decode_fp16_low_water_blocks(high_water: int, default: int = 0) -> int:
+    """Return the bounded decode-history fp16 low-water mark."""
+    return kvarn_decode_fp16_low_water_blocks(high_water, default)
+
+
+def _kvarn_decode_flush_scope(default: str = "per_row") -> str:
+    """Return the qlen=1 decode flush coordination scope."""
+    return kvarn_decode_flush_scope(default)
+
+
+def _protect_kvarn_recent_history_blocks(
+    row: Sequence[int],
+    *,
+    committed_len: int,
+    group: int,
+    bt_cols: int,
+    window: int,
+    resident_blocks: dict[int, int],
+    blocks_needed: set[int],
+    protected_blocks: set[int],
+) -> bool:
+    """Protect the newest resident full non-sink history blocks."""
+    if window <= 0 or committed_len <= 0:
+        return False
+
+    full_blocks = min(committed_len // group, bt_cols)
+    first = max(1, full_blocks - window)
+    for k in range(first, full_blocks):
+        bid = int(row[k])
+        if bid >= 0 and bid in resident_blocks:
+            blocks_needed.add(bid)
+            protected_blocks.add(bid)
+    return True
+
+
+def _protect_kvarn_prefill_window_blocks(
+    row: Sequence[int],
+    *,
+    q_len: int,
+    committed_len: int,
+    group: int,
+    bt_cols: int,
+    window: int,
+    resident_blocks: dict[int, int],
+    blocks_needed: set[int],
+    protected_blocks: set[int],
+) -> bool:
+    """Protect the newest resident full history blocks for one continuation.
+
+    Block-table column zero is the fp16 sink and is protected independently by
+    the production sink policy, so it does not consume the bounded history
+    window. Already-materialized int4 blocks are ignored rather than assigned
+    empty fp16 slots.
+    """
+    if window <= 0 or q_len <= 1 or committed_len <= 0:
+        return False
+
+    return _protect_kvarn_recent_history_blocks(
+        row,
+        committed_len=committed_len,
+        group=group,
+        bt_cols=bt_cols,
+        window=window,
+        resident_blocks=resident_blocks,
+        blocks_needed=blocks_needed,
+        protected_blocks=protected_blocks,
+    )
+
+
+def _protect_kvarn_decode_window_blocks(
+    row: Sequence[int],
+    *,
+    q_len: int,
+    committed_len: int,
+    group: int,
+    bt_cols: int,
+    high_water: int,
+    low_water: int,
+    resident_blocks: dict[int, int],
+    blocks_needed: set[int],
+    protected_blocks: set[int],
+) -> tuple[bool, bool]:
+    """Batch decode flushes with bounded high/low-water hysteresis."""
+    if low_water < 0 or low_water > high_water:
+        raise ValueError("decode low-water mark must be between zero and high-water")
+    newest_resident = _kvarn_decode_resident_suffix(
+        row,
+        q_len=q_len,
+        committed_len=committed_len,
+        group=group,
+        bt_cols=bt_cols,
+        high_water=high_water,
+        resident_blocks=resident_blocks,
+    )
+    if not newest_resident:
+        return False, False
+
+    triggering_rows, _, _ = _coordinate_kvarn_decode_window_blocks(
+        {0: newest_resident},
+        high_water=high_water,
+        low_water=low_water,
+        flush_scope="per_row",
+        blocks_needed=blocks_needed,
+        protected_blocks=protected_blocks,
+    )
+    return True, bool(triggering_rows)
+
+
+def _kvarn_decode_resident_suffix(
+    row: Sequence[int],
+    *,
+    q_len: int,
+    committed_len: int,
+    group: int,
+    bt_cols: int,
+    high_water: int,
+    resident_blocks: dict[int, int],
+) -> list[int]:
+    """Return at most high-water plus one newest resident decode blocks."""
+    if q_len != 1 or high_water <= 0 or committed_len <= 0:
+        return []
+
+    full_blocks = min(committed_len // group, bt_cols)
+    newest_resident: list[int] = []
+    for k in range(full_blocks - 1, 0, -1):
+        bid = int(row[k])
+        if bid < 0 or bid not in resident_blocks:
+            break
+        newest_resident.append(bid)
+        if len(newest_resident) > high_water:
+            break
+    return newest_resident
+
+
+def _coordinate_kvarn_decode_window_blocks(
+    resident_blocks_by_row: dict[int, list[int]],
+    *,
+    high_water: int,
+    low_water: int,
+    flush_scope: str,
+    blocks_needed: set[int],
+    protected_blocks: set[int],
+) -> tuple[set[int], set[int], set[int]]:
+    """Apply per-row or batch-cohort decode high/low-water policy.
+
+    Returns the rows which crossed high-water, the rows whose flush should
+    remain deferred, and the rows with resident pages selected for flush.
+    """
+    if low_water < 0 or low_water > high_water:
+        raise ValueError("decode low-water mark must be between zero and high-water")
+    if flush_scope not in {"per_row", "batch_cohort"}:
+        raise ValueError("decode flush scope must be per_row or batch_cohort")
+
+    triggering_rows = {
+        row_index
+        for row_index, resident in resident_blocks_by_row.items()
+        if len(resident) > high_water
+    }
+    flush_cohort = flush_scope == "batch_cohort" and bool(triggering_rows)
+    deferred_rows: set[int] = set()
+    flushed_rows: set[int] = set()
+    for row_index, resident in resident_blocks_by_row.items():
+        flush_required = flush_cohort or row_index in triggering_rows
+        keep = low_water if flush_required else high_water
+        for bid in resident[:keep]:
+            blocks_needed.add(bid)
+            protected_blocks.add(bid)
+        if not flush_required:
+            deferred_rows.add(row_index)
+        elif len(resident) > keep:
+            flushed_rows.add(row_index)
+    return triggering_rows, deferred_rows, flushed_rows
+
+
+def _kvarn_walk_back_flush_blocks(
+    row: Sequence[int],
+    *,
+    committed_len: int,
+    group: int,
+    bt_cols: int,
+    resident_blocks: dict[int, int],
+    sinks: set[int],
+    flush_seen: set[int],
+    defer: bool,
+    deferred_blocks: set[int] | None = None,
+) -> list[int]:
+    """Return this row's normal ordered walk-back flush candidates."""
+    if defer:
+        return []
+    result: list[int] = []
+    k = min(committed_len // group - 1, bt_cols - 1)
+    while k >= 1:
+        bid = int(row[k])
+        if deferred_blocks is not None and bid in deferred_blocks:
+            # A bounded protected suffix must not terminate the walk: older
+            # resident history still has to flush to keep memory bounded.
+            k -= 1
+            continue
+        if bid < 0 or bid in flush_seen or bid in sinks or bid not in resident_blocks:
+            break
+        flush_seen.add(bid)
+        result.append(bid)
+        k -= 1
+    return result
+
+
+def _kvarn_reclaimable_block_ids(
+    resident_blocks: dict[int, int],
+    blocks_needed: set[int],
+    flush_seen: set[int],
+) -> list[int]:
+    """Return resident blocks not protected by the active step or walk-back."""
+    return [
+        bid
+        for bid in resident_blocks
+        if bid not in blocks_needed and bid not in flush_seen
+    ]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Backend metadata classes
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _rotate_kvarn_kv_into_scratch(
+    k_view: torch.Tensor,
+    v_view: torch.Tensor,
+    hadamard: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+) -> None:
+    """Rotate K/V through the reliable 2-D GEMM path into bounded views.
+
+    Intel XPU's batched ``matmul(out=...)`` path has been observed writing one
+    value beyond a bounded output view during real Qwen prefill. Flattening the
+    token and head dimensions is algebraically identical and uses the 2-D GEMM
+    writer, which does not have that corruption failure mode.
+    """
+    num_tokens, num_heads, head_dim = k_view.shape
+    num_rows = num_tokens * num_heads
+    torch.mm(
+        k_view.reshape(num_rows, head_dim),
+        hadamard,
+        out=k_out.reshape(num_rows, head_dim),
+    )
+    torch.mm(
+        v_view.reshape(num_rows, head_dim),
+        hadamard,
+        out=v_out.reshape(num_rows, head_dim),
+    )
+
+
+class _EventLike(Protocol):
+    def record(self) -> None: ...
+
+    def synchronize(self) -> None: ...
+
+
+class _KVarNMetadataStageRing:
+    """Keep pinned H2D sources alive and immutable until DMA consumes them."""
+
+    def __init__(self, depth: int = 256) -> None:
+        if depth <= 0:
+            raise ValueError("metadata stage depth must be positive")
+        self.depth = depth
+        self._index = 0
+        self._events: list[_EventLike | None] = [None] * depth
+
+    def acquire(self) -> int:
+        stage = self._index % self.depth
+        self._index += 1
+        event = self._events[stage]
+        if event is not None:
+            event.synchronize()
+        return stage
+
+    def release(
+        self, stage: int, event_factory: Callable[[], _EventLike]
+    ) -> _EventLike:
+        # Use a fresh event generation. Re-recording an event that may still be
+        # observed by another generation does not provide an ownership fence.
+        event = event_factory()
+        event.record()
+        self._events[stage] = event
+        return event
+
+    def drain(self) -> None:
+        """Wait for every staged source before replacing its backing tensor."""
+        for event in self._events:
+            if event is not None:
+                event.synchronize()
+        self._events = [None] * self.depth
+
+
+@dataclass(frozen=True)
+class _KVarNIncrementalDecodeState:
+    """Facts which must stay unchanged between incremental decode steps."""
+
+    request_ids: tuple[str, ...]
+    block_table_row_versions: tuple[int, ...]
+    seq_lens: tuple[int, ...]
+    tail_columns: tuple[int, ...]
+    sink_blocks: tuple[int, ...]
+    sink_membership: tuple[bool, ...]
+    tail_blocks: tuple[int, ...]
+    sink_slots: tuple[int | None, ...]
+    tail_slots: tuple[int, ...]
+    tail_fills: tuple[int, ...]
+    block_table_shape: tuple[int, int]
+    device: torch.device
+    group_impls: tuple[object, ...]
+    block_map_id: int
+    block_map_size: int
+    free_slots_id: int
+    free_slots_size: int
+    sinks_id: int
+    sinks_size: int
+    retired_sinks_size: int
+    block_fill_size: int
+    block_to_slot_tensor_id: int
+    sink_tensor_id: int
+    allocator_lifecycle_epoch: int
+    lifecycle_policy: tuple[int, int, int, str]
+
+
+class KVarNAttentionBackend(AttentionBackend):
+    """Attention backend using KVarN KV-cache compression."""
+
+    accept_output_buffer: bool = True
+    forward_includes_kv_cache_update: bool = False
+
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16,
+        torch.bfloat16,
+    ]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "kvarn_k4v4_g128",
+        "kvarn_k4v4_g128_compact",
+        "kvarn_k4v2_g128",
+        "kvarn_k4v4_g64",
+        "kvarn_k4v2_g64",
+    ]
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        """Store one packed KVarN record across each head's tile states."""
+        if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_kvarn:
+            return spec
+        from vllm.model_executor.layers.quantization.kvarn.config import (
+            KVarNConfig,
+        )
+
+        cfg = KVarNConfig.from_cache_dtype(
+            spec.kv_quant_mode.name.lower(), spec.head_size
+        )
+        return replace(
+            spec,
+            state_content_bytes=cfg.record_bytes,
+            tokens_per_state=cfg.group,
+        )
+
+    @staticmethod
+    def get_name() -> str:
+        return "KVARN"
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBHNC,)
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # One vLLM block == one KVarN tile (cfg.group). Supported tile sizes are
+        # the distinct `group` values across the registered presets (64, 128).
+        from vllm.config.vllm import get_current_vllm_config
+        from vllm.model_executor.layers.quantization.kvarn.config import (
+            KVARN_PRESETS,
+        )
+
+        try:
+            cache_dtype = get_current_vllm_config().cache_config.cache_dtype
+        except Exception:
+            cache_dtype = None
+        if isinstance(cache_dtype, str) and cache_dtype in KVARN_PRESETS:
+            return [KVARN_PRESETS[cache_dtype]["group"]]
+        return sorted({p["group"] for p in KVARN_PRESETS.values()})
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # The active preset pins the tile size (..._g64 / ..._g128), and
+        # get_kv_cache_shape asserts block_size == cfg.group. The generic
+        # fallback returns the MINIMUM supported size (64) whenever the
+        # framework default (16) is unsupported — which breaks any g128 preset
+        # run without an explicit --block-size (a g128 deployment then builds
+        # its cache with 64-token kernel blocks and dies on the assert, e.g.
+        # hybrid models without spec decode). Prefer the preset's group.
+        from vllm.config.vllm import get_current_vllm_config
+        from vllm.model_executor.layers.quantization.kvarn.config import (
+            KVARN_PRESETS,
+        )
+
+        try:
+            cache_dtype = get_current_vllm_config().cache_config.cache_dtype
+        except Exception:
+            cache_dtype = None
+        if isinstance(cache_dtype, str) and cache_dtype in KVARN_PRESETS:
+            return KVARN_PRESETS[cache_dtype]["group"]
+        return super().get_preferred_block_size(default_block_size)
+
+    @classmethod
+    def supports_attn_type(cls, attn_type: str) -> bool:
+        return attn_type == AttentionType.DECODER
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        # Causality is purely a masking choice; the KV quantization is
+        # independent of it. The per-token verify path attends each query row
+        # to [0, vq_seqlen[row]) — a flat full-context length per row gives
+        # bidirectional attention (used by DFlash cross-attention drafting).
+        return True
+
+    @classmethod
+    def supports_per_head_quant_scales(cls) -> bool:
+        return False
+
+    @staticmethod
+    def get_impl_cls() -> type[KVarNAttentionImpl]:
+        return KVarNAttentionImpl
+
+    @staticmethod
+    def get_builder_cls() -> type[KVarNMetadataBuilder]:
+        return KVarNMetadataBuilder
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        if kv_cache_dtype is None:
+            return False
+        return kv_cache_dtype.startswith("kvarn_") and not kv_cache_dtype.startswith(
+            "kvarn_mla"
+        )
+
+    @classmethod
+    def supports_head_size(cls, head_size: int) -> bool:
+        return head_size in (128, 256, 512)
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # Multimodal models (e.g. Gemma-4) set use_mm_prefix; text generation
+        # never materializes mm tokens so KVarN decode is unaffected. (Image/audio
+        # prefix full-attention correctness is unverified — text-only validated.)
+        return True
+
+
+@dataclass
+class KVarNMetadata(AttentionMetadata):
+    """Metadata for KVarN attention (mirrors ``TurboQuantMetadata``)."""
+
+    seq_lens: torch.Tensor
+    slot_mapping: torch.Tensor
+    block_table: torch.Tensor
+    query_start_loc: torch.Tensor
+    num_actual_tokens: int = 0
+    max_query_len: int = 0
+    max_seq_len: int = 0
+    is_prefill: bool = False
+    num_decodes: int = 0
+    num_decode_tokens: int = 0
+    qlen1_dispatch_kind: _KVarNQlen1MetadataKind = _KVarNQlen1MetadataKind.REFERENCE
+    # True if any multi-query request (query_len > 1) also has cached context
+    # (seq_len > query_len): a speculative-decode verify step or a chunked-
+    # prefill continuation. Such steps MUST attend over the cached K/V, so they
+    # route to the context-aware path rather than _prefill_first_chunk (which
+    # assumes a fresh prompt, cached_len == 0). Computed once in build() from
+    # CPU arrays (no GPU sync).
+    has_cached_multiquery: bool = False
+    # Mixed batches need the same classification and prefix sums for the
+    # prefill-only view built in ``_mixed_batch_path``.  Keep these builder-owned
+    # so every layer reuses one metadata transfer instead of deriving them on
+    # device in the attention hot path.
+    prefill_has_cached_multiquery: bool = False
+    # Precomputed once per batch in the metadata builder and reused across all
+    # 28+ layer forward calls. Saves 28× .tolist() syncs per decode token.
+    seq_lens_cpu: list[int] | None = None
+    block_table_cpu: list[list[int]] | None = None
+    slot_mapping_cpu: list[int] | None = None
+    # Stage α-2 capture-correct decode metadata. The block_table-driven
+    # build-packed-KV kernel reads block_table / seq_lens / fa_cu_seqlens_k
+    # directly (all PERSISTENT buffers updated in-place by the builder), so a
+    # captured CUDA graph sees fresh data on every replay.
+    fa_cu_seqlens_q: torch.Tensor | None = None  # [B+1] int32 (persistent)
+    fa_cu_seqlens_k: torch.Tensor | None = (
+        None  # [B+1] int32 (persistent prefix sum of seq_lens)
+    )
+    prefill_fa_cu_seqlens_k: torch.Tensor | None = None
+    fa_max_blocks_per_req: int = 0  # ceil(max_model_len / group): grid dim
+    fa_max_seqlen_k_fixed: int = 0  # = max_model_len; fixed FA grid bound
+    # Verify (spec-as-decode) plan: one virtual kernel row per decode-portion
+    # query token. Persistent buffers (pointers baked into captured graphs),
+    # filled CPU-side in build(). None when the decode portion is single-token.
+    vq_req: torch.Tensor | None = None  # [num_decode_tokens] int32 block-table row
+    vq_seqlen: torch.Tensor | None = None  # [num_decode_tokens] int32 causal length
+    vq_qlen: int = 0  # uniform decode query len (>=2), else 0
+    # Non-causal (bidirectional) attention: each query row attends to the full
+    # context (no bottom-right causal staircase). Set by DFlash cross-attention
+    # drafting via CommonAttentionMetadata.causal=False. When False, the verify
+    # plan stores a flat full-context length per row instead of committed+j+1.
+    causal: bool = True
+
+
+class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
+    """Builds ``KVarNMetadata`` from scheduler output."""
+
+    # UNIFORM_BATCH: spec-decode verify steps (uniform query length
+    # 1 + num_spec) are graph-capturable via the fused verify kernel — the
+    # whole MTP step replays as ONE full graph like vanilla FA, instead of
+    # ~num_layers eager attention calls between piecewise segments per step
+    # (the dominant MTP overhead once the materialize round-trip was gone;
+    # the gap to vanilla was 0.65-0.85x and worse under TP). All Python
+    # state mutation (slot allocation, sink marking, tile-boundary flush,
+    # the vq verify plan) happens in KVarNMetadataBuilder.build() between
+    # captured graph replays; the forward is pure tensor ops.
+    # KVARN_FUSED_VERIFY=0 reverts to single-token-only support.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_BATCH
+        if os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"
+        else AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # spec-as-decode: verify steps (query_len <= 1 + num_spec) classify
+        # as decodes and carry a vq plan (see build()) for the fused verify
+        # kernel; the threshold is derived from speculative_config by the
+        # base helper.
+        self._init_reorder_batch_threshold(
+            1,
+            supports_spec_as_decode=(os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"),
+        )
+        # KV-cache-group key, must match KVarNAttentionImpl._group_key for this
+        # group's layers so the builder mutates the right group's slot allocator.
+        # (head_size, num_kv_heads, sliding_window) — see impl._group_key.
+        # TRUE per-group identity = this builder's exact layer set. A config
+        # proxy (head,kv,sw) is NOT enough: vLLM splits same-config layers into
+        # multiple groups (Gemma-4's repeating pattern -> 5 sliding groups all
+        # head256/16kv/1024), each with its own block_id space. The builder tags
+        # its impls with this key in build() (impls don't reliably carry a name).
+        self._layer_names = list(layer_names)
+        self._layer_names_set = set(self._layer_names)
+        self._group_key = tuple(sorted(self._layer_names))
+        # Stage α-2: per-block fill tracking — block_id -> tokens present in
+        # the pool for that block after the current step. Keyed by PHYSICAL
+        # block (never by request or by the sink block id): vLLM's prefix
+        # caching shares physical blocks across live requests and recycles ids
+        # across finished ones, so any request-identity proxy collides under
+        # sharing (the repetition-collapse / stale-tile class). A
+        # partial block has exactly one writer, so the value has a single
+        # source. Drives flush-on-reclaim: a finished request's complete block
+        # must be flushed (a future prefix-cache hit may read it), a partial
+        # one is safe to discard (vLLM never prefix-caches partial blocks).
+        self._block_fill: dict[int, int] = {}
+        # Retired sinks: finished requests' sink blocks, kept RESIDENT in the
+        # fp16 pool (insertion order = retirement order) instead of flushed on
+        # reclaim. A prefix-cache hit re-adopts the block with its fp16 data
+        # byte-identical — preserving KVarN's fp16-sink accuracy on multi-turn
+        # traffic, where every follow-up turn reuses the previous turn's first
+        # block. Evicted (flushed to int4, so later cache hits still find a
+        # valid tile) lazily, oldest first, only when slot allocation runs
+        # dry — residency therefore never shrinks live capacity.
+        self._retired_sinks: dict[int, None] = {}
+
+        # Max model length (for the fixed FA grid bound + max_blocks_per_req).
+        try:
+            self._max_model_len = vllm_config.model_config.max_model_len
+        except Exception:
+            self._max_model_len = 4096
+
+        # KVarN tile / group size (= vLLM block size). Sourced from the configured
+        # kv-cache dtype so non-128 groups (e.g. g64) drive the flush + slot math
+        # in build() correctly. Every storage / kernel path already reads
+        # cfg.group; this is the one place the builder needs it without an impl
+        # handle. Falls back to 128 if it cannot be parsed.
+        self._group = 128
+        try:
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+
+            _cd = vllm_config.cache_config.cache_dtype
+            _hd = vllm_config.model_config.get_head_size()
+            self._group = KVarNConfig.from_cache_dtype(_cd, _hd).group
+        except Exception:
+            self._group = 128
+        self._kvarn_xpu_beta_profile = _kvarn_xpu_beta_profile_enabled(
+            vllm_config.cache_config.cache_dtype
+        )
+
+        # Persistent cu_seqlens buffers (allocated lazily in build()).
+        self._cu_seqlens_q_buf: torch.Tensor = None  # type: ignore[assignment]
+        self._cu_seqlens_k_buf: torch.Tensor = None  # type: ignore[assignment]
+        self._prefill_cu_seqlens_k_buf: torch.Tensor = None  # type: ignore[assignment]
+        # Default async scheduling can start preparing the next generation
+        # while this generation's non-blocking H2D copies remain in flight.
+        # Rotate pinned host sources and fence each slot before CPU reuse.
+        self._metadata_stages = _KVarNMetadataStageRing()
+        # Sticky once this builder has produced metadata for any captured graph.
+        # Ordinary build() calls refresh the same persistent buffers used on
+        # replay, so they must never elide cu-seqlens after this flips true.
+        self._has_built_cudagraph_metadata = False
+        self._cu_seqlens_q_host: torch.Tensor = None  # type: ignore[assignment]
+        self._cu_seqlens_k_host: torch.Tensor = None  # type: ignore[assignment]
+        self._prefill_cu_seqlens_k_host: torch.Tensor = None  # type: ignore[assignment]
+        # Persistent verify-plan buffers (allocated lazily in build()).
+        self._vq_req_buf: torch.Tensor = None  # type: ignore[assignment]
+        self._vq_seqlen_buf: torch.Tensor = None  # type: ignore[assignment]
+        self._vq_req_host: torch.Tensor = None  # type: ignore[assignment]
+        self._vq_seqlen_host: torch.Tensor = None  # type: ignore[assignment]
+        (
+            self._metadata_lifecycle_variant,
+            metadata_lifecycle_source,
+        ) = _kvarn_metadata_lifecycle_requested()
+        self._metadata_lifecycle_policy = (
+            self._read_incremental_lifecycle_policy()
+            if self._incremental_metadata_enabled()
+            else None
+        )
+        self._metadata_lifecycle_fused_decode = (
+            os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
+            if self._incremental_metadata_enabled()
+            else None
+        )
+        self._incremental_decode_state: _KVarNIncrementalDecodeState | None = None
+        self._metadata_lifecycle_counters = {
+            "incremental_hits": 0,
+            "full_builds": 0,
+        }
+        logger.info_once(
+            "[KVARN_FACTORY] selected_metadata_lifecycle=%s; "
+            "selector_source=%s; fallback=reference; immutable for engine lifetime",
+            self._metadata_lifecycle_variant,
+            metadata_lifecycle_source,
+        )
+
+    def _incremental_metadata_enabled(self) -> bool:
+        return (
+            getattr(
+                self,
+                "_metadata_lifecycle_variant",
+                _KVARN_METADATA_LIFECYCLE_REFERENCE,
+            )
+            == _KVARN_METADATA_LIFECYCLE_INCREMENTAL_QLEN1
+        )
+
+    @staticmethod
+    def _incremental_row_identity(cam, batch_size: int):
+        request_ids = getattr(cam, "request_ids", None)
+        versions = getattr(cam, "block_table_row_versions", None)
+        if request_ids is None or versions is None or len(request_ids) != batch_size:
+            return None
+        if isinstance(versions, torch.Tensor):
+            if versions.device.type != "cpu":
+                return None
+            versions = versions.numpy()
+        if len(versions) != batch_size:
+            return None
+        request_ids = tuple(request_ids)
+        if any(not isinstance(request_id, str) for request_id in request_ids):
+            return None
+        return request_ids, tuple(int(version) for version in versions)
+
+    def _read_incremental_lifecycle_policy(self) -> tuple[int, int, int, str]:
+        prefill_window = _kvarn_prefill_fp16_window_blocks()
+        beta_profile = getattr(self, "_kvarn_xpu_beta_profile", False)
+        decode_window = _kvarn_decode_fp16_window_blocks(
+            _KVARN_XPU_BETA_DECODE_WINDOW if beta_profile else 0
+        )
+        decode_low_water = (
+            _kvarn_decode_fp16_low_water_blocks(decode_window, 0)
+            if decode_window
+            else 0
+        )
+        decode_flush_scope = (
+            _kvarn_decode_flush_scope("batch_cohort" if beta_profile else "per_row")
+            if decode_window
+            else "per_row"
+        )
+        return (
+            prefill_window,
+            decode_window,
+            decode_low_water,
+            decode_flush_scope,
+        )
+
+    def _incremental_lifecycle_policy(self) -> tuple[int, int, int, str]:
+        policy = getattr(self, "_metadata_lifecycle_policy", None)
+        if policy is not None:
+            return policy
+        return self._read_incremental_lifecycle_policy()
+
+    def _incremental_fused_decode_enabled(self) -> bool:
+        frozen = getattr(self, "_metadata_lifecycle_fused_decode", None)
+        if frozen is not None:
+            return frozen
+        return os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
+
+    def _try_incremental_decode_lifecycle(
+        self,
+        *,
+        cam,
+        seq_lens_cpu: list[int],
+        block_table_np: np.ndarray,
+        pure_qlen1: bool,
+        for_cudagraph_capture: bool,
+    ) -> bool:
+        if not self._incremental_metadata_enabled():
+            return False
+
+        state = self._incremental_decode_state
+        batch_size = len(seq_lens_cpu)
+        row_identity = self._incremental_row_identity(cam, batch_size)
+        if (
+            state is None
+            or not pure_qlen1
+            or for_cudagraph_capture
+            or getattr(self, "_has_built_cudagraph_metadata", False)
+            or not self._incremental_fused_decode_enabled()
+            or row_identity is None
+            or block_table_np.ndim != 2
+            or tuple(block_table_np.shape) != state.block_table_shape
+            or cam.seq_lens.device != state.device
+        ):
+            self._incremental_decode_state = None
+            return False
+
+        request_ids, row_versions = row_identity
+        if (
+            request_ids != state.request_ids
+            or row_versions != state.block_table_row_versions
+            or tuple(seq_lens_cpu) != tuple(previous + 1 for previous in state.seq_lens)
+            or self._incremental_lifecycle_policy() != state.lifecycle_policy
+        ):
+            self._incremental_decode_state = None
+            return False
+
+        from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
+
+        group_key = self._group_key
+        map_key = (state.device, group_key)
+        block_map = KVarNAttentionImpl._block_to_slot_dict.get(group_key)
+        free_slots = KVarNAttentionImpl._free_slots.get(group_key)
+        sinks = KVarNAttentionImpl._global_sink_blocks.get(group_key)
+        block_to_slot_t = KVarNAttentionImpl._block_to_slot_t_per_device.get(map_key)
+        is_sink_t = KVarNAttentionImpl._is_sink_t_per_device.get(map_key)
+        allocator_lifecycle_epoch = KVarNAttentionImpl._allocator_lifecycle_epochs.get(
+            group_key
+        )
+        if (
+            block_map is None
+            or free_slots is None
+            or sinks is None
+            or block_to_slot_t is None
+            or is_sink_t is None
+            or allocator_lifecycle_epoch != state.allocator_lifecycle_epoch
+            or id(block_map) != state.block_map_id
+            or len(block_map) != state.block_map_size
+            or id(free_slots) != state.free_slots_id
+            or len(free_slots) != state.free_slots_size
+            or id(sinks) != state.sinks_id
+            or len(sinks) != state.sinks_size
+            or len(self._retired_sinks) != state.retired_sinks_size
+            or len(self._block_fill) != state.block_fill_size
+            or id(block_to_slot_t) != state.block_to_slot_tensor_id
+            or id(is_sink_t) != state.sink_tensor_id
+            or any(
+                impl not in KVarNAttentionImpl._all_impls
+                or getattr(impl, "_group_key", None) != group_key
+                for impl in state.group_impls
+            )
+        ):
+            self._incremental_decode_state = None
+            return False
+
+        tail_updates: list[tuple[int, int]] = []
+        for row_index, seq_len in enumerate(seq_lens_cpu):
+            if seq_len <= 0:
+                self._incremental_decode_state = None
+                return False
+            tail_column = (seq_len - 1) // self._group
+            if tail_column != state.tail_columns[row_index]:
+                self._incremental_decode_state = None
+                return False
+            sink_block = int(block_table_np[row_index, 0])
+            tail_block = int(block_table_np[row_index, tail_column])
+            if (
+                sink_block != state.sink_blocks[row_index]
+                or tail_block != state.tail_blocks[row_index]
+                or block_map.get(sink_block) != state.sink_slots[row_index]
+                or block_map.get(tail_block) != state.tail_slots[row_index]
+                or self._block_fill.get(tail_block) != state.tail_fills[row_index]
+                or (sink_block in sinks) != state.sink_membership[row_index]
+            ):
+                self._incremental_decode_state = None
+                return False
+            tail_fill = seq_len - tail_column * self._group
+            tail_updates.append((tail_block, tail_fill))
+
+        # Validation is deliberately transactional. A later ragged row can
+        # invalidate the receipt, so no lifecycle state changes until every
+        # row has passed all checks.
+        for tail_block, tail_fill in tail_updates:
+            self._block_fill[tail_block] = tail_fill
+
+        self._incremental_decode_state = replace(
+            state,
+            seq_lens=tuple(seq_lens_cpu),
+            tail_fills=tuple(tail_fill for _, tail_fill in tail_updates),
+        )
+        counters = getattr(self, "_metadata_lifecycle_counters", None)
+        if counters is not None:
+            counters["incremental_hits"] += 1
+        logger.info_once(
+            "[KVARN_METADATA_LIFECYCLE] active=incremental_qlen1; "
+            "action=elide_full_lifecycle_scan"
+        )
+        return True
+
+    def _capture_incremental_decode_state(
+        self,
+        *,
+        cam,
+        seq_lens_cpu: list[int],
+        block_table_np: np.ndarray,
+        pure_qlen1: bool,
+        for_cudagraph_capture: bool,
+        group_impls: Sequence[object],
+    ) -> None:
+        self._incremental_decode_state = None
+        if (
+            not self._incremental_metadata_enabled()
+            or not pure_qlen1
+            or for_cudagraph_capture
+            or getattr(self, "_has_built_cudagraph_metadata", False)
+            or not self._incremental_fused_decode_enabled()
+            or not group_impls
+            or block_table_np.ndim != 2
+        ):
+            return
+
+        batch_size = len(seq_lens_cpu)
+        row_identity = self._incremental_row_identity(cam, batch_size)
+        if row_identity is None or block_table_np.shape[0] < batch_size:
+            return
+
+        from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
+
+        group_key = self._group_key
+        device = cam.seq_lens.device
+        map_key = (device, group_key)
+        block_map = KVarNAttentionImpl._block_to_slot_dict.get(group_key)
+        free_slots = KVarNAttentionImpl._free_slots.get(group_key)
+        sinks = KVarNAttentionImpl._global_sink_blocks.get(group_key)
+        block_to_slot_t = KVarNAttentionImpl._block_to_slot_t_per_device.get(map_key)
+        is_sink_t = KVarNAttentionImpl._is_sink_t_per_device.get(map_key)
+        allocator_lifecycle_epoch = KVarNAttentionImpl._allocator_lifecycle_epochs.get(
+            group_key
+        )
+        if any(
+            value is None
+            for value in (
+                block_map,
+                free_slots,
+                sinks,
+                block_to_slot_t,
+                is_sink_t,
+                allocator_lifecycle_epoch,
+            )
+        ):
+            return
+        assert block_map is not None
+        assert free_slots is not None
+        assert sinks is not None
+        assert block_to_slot_t is not None
+        assert is_sink_t is not None
+        assert allocator_lifecycle_epoch is not None
+
+        tail_columns: list[int] = []
+        sink_blocks: list[int] = []
+        sink_membership: list[bool] = []
+        tail_blocks: list[int] = []
+        sink_slots: list[int | None] = []
+        tail_slots: list[int] = []
+        tail_fills: list[int] = []
+        for row_index, seq_len in enumerate(seq_lens_cpu):
+            if seq_len <= 0:
+                return
+            tail_column = (seq_len - 1) // self._group
+            if tail_column >= block_table_np.shape[1]:
+                return
+            sink_block = int(block_table_np[row_index, 0])
+            tail_block = int(block_table_np[row_index, tail_column])
+            tail_slot = block_map.get(tail_block)
+            tail_fill = self._block_fill.get(tail_block)
+            if (
+                sink_block < 0
+                or tail_block < 0
+                or tail_slot is None
+                or tail_fill is None
+            ):
+                return
+            tail_columns.append(tail_column)
+            sink_blocks.append(sink_block)
+            sink_membership.append(sink_block in sinks)
+            tail_blocks.append(tail_block)
+            sink_slots.append(block_map.get(sink_block))
+            tail_slots.append(tail_slot)
+            tail_fills.append(tail_fill)
+
+        request_ids, row_versions = row_identity
+        self._incremental_decode_state = _KVarNIncrementalDecodeState(
+            request_ids=request_ids,
+            block_table_row_versions=row_versions,
+            seq_lens=tuple(seq_lens_cpu),
+            tail_columns=tuple(tail_columns),
+            sink_blocks=tuple(sink_blocks),
+            sink_membership=tuple(sink_membership),
+            tail_blocks=tuple(tail_blocks),
+            sink_slots=tuple(sink_slots),
+            tail_slots=tuple(tail_slots),
+            tail_fills=tuple(tail_fills),
+            block_table_shape=tuple(block_table_np.shape),
+            device=device,
+            group_impls=tuple(group_impls),
+            block_map_id=id(block_map),
+            block_map_size=len(block_map),
+            free_slots_id=id(free_slots),
+            free_slots_size=len(free_slots),
+            sinks_id=id(sinks),
+            sinks_size=len(sinks),
+            retired_sinks_size=len(self._retired_sinks),
+            block_fill_size=len(self._block_fill),
+            block_to_slot_tensor_id=id(block_to_slot_t),
+            sink_tensor_id=id(is_sink_t),
+            allocator_lifecycle_epoch=allocator_lifecycle_epoch,
+            lifecycle_policy=self._incremental_lifecycle_policy(),
+        )
+
+    def _build_incremental_decode_metadata(
+        self,
+        cam,
+        *,
+        seq_lens_cpu: list[int],
+        num_decodes: int,
+        num_decode_tokens: int,
+    ) -> KVarNMetadata:
+        return KVarNMetadata(
+            seq_lens=cam.seq_lens,
+            slot_mapping=cam.slot_mapping,
+            block_table=cam.block_table_tensor,
+            query_start_loc=cam.query_start_loc,
+            num_actual_tokens=cam.num_actual_tokens,
+            max_query_len=cam.max_query_len,
+            max_seq_len=cam.max_seq_len,
+            is_prefill=False,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            qlen1_dispatch_kind=_KVarNQlen1MetadataKind.EAGER_PURE_DECODE,
+            has_cached_multiquery=False,
+            prefill_has_cached_multiquery=False,
+            seq_lens_cpu=seq_lens_cpu,
+            block_table_cpu=None,
+            slot_mapping_cpu=None,
+            fa_cu_seqlens_q=None,
+            fa_cu_seqlens_k=None,
+            prefill_fa_cu_seqlens_k=None,
+            fa_max_blocks_per_req=(self._max_model_len + self._group - 1)
+            // self._group,
+            fa_max_seqlen_k_fixed=self._max_model_len,
+            vq_req=None,
+            vq_seqlen=None,
+            vq_qlen=0,
+            causal=getattr(cam, "causal", True),
+        )
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> KVarNMetadata:
+        self._has_built_cudagraph_metadata = True
+        return self.build(0, common_attn_metadata, _for_cudagraph_capture=True)
+
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        fast_build=False,
+        *,
+        _for_cudagraph_capture=False,
+    ):
+        cam = common_attn_metadata
+        assert self.reorder_batch_threshold is not None
+        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
+            cam, decode_threshold=self.reorder_batch_threshold
+        )
+        # Pre-materialise CPU views ONCE per batch. Every layer's forward()
+        # would otherwise re-issue these syncs (28+ syncs/token for Qwen3-0.6B).
+        # Use the framework's cached CPU copy of seq_lens (cam.seq_lens_cpu) to
+        # avoid an extra GPU->CPU sync per step (build-overhead reduction).
+        _slc = getattr(cam, "seq_lens_cpu", None)
+        seq_lens_cpu = _slc.tolist() if _slc is not None else cam.seq_lens.tolist()
+        # Per-request query length this step (already on CPU; no extra sync).
+        # query_len > 1 for prefill chunks and for speculative-decode verify
+        # steps (MTP / draft). Used by flush detection to compute the COMMITTED
+        # token count (seq_len - query_len) so speculative tokens that may still
+        # be rejected are never quantized into the permanent int4 cache.
+        _qsl = getattr(cam, "query_start_loc_cpu", None)
+        if _qsl is not None:
+            _qsl_l = _qsl.tolist()
+            query_lens_cpu = [_qsl_l[i + 1] - _qsl_l[i] for i in range(len(_qsl_l) - 1)]
+        else:
+            query_lens_cpu = [1] * len(seq_lens_cpu)
+        # block_table as a numpy 2-D array (C-backed, lazy element access) rather
+        # than .tolist(): the full B×max_blocks nested-list build was ~7 ms/step
+        # at B=256 and dominated build() once the flush was vectorized.
+        # We only touch column 0 (sinks) + a few per-request entries, so numpy's
+        # O(1) indexing avoids materializing ~8k Python ints every step.
+        block_table_np = _kvarn_block_table_numpy(cam)
+        bt_rows = block_table_np.shape[0]
+        bt_cols = block_table_np.shape[1] if block_table_np.ndim == 2 else 0
+        device = cam.seq_lens.device
+
+        # ── Stage α-2: capture-correct metadata ──────────────────────────
+        # The decode driver uses ONE block_table-driven kernel that reads the
+        # PERSISTENT block_table / seq_lens / cu_seqlens directly, so no
+        # per-step derived task tensors (which would be stale under graph
+        # replay). We only need cu_seqlens_k (prefix sum of seq_lens) and
+        # cu_seqlens_q (= arange(B+1)), both kept in PERSISTENT buffers and
+        # updated in place so captured graphs see fresh values.
+        B = len(seq_lens_cpu)
+        GROUP = self._group  # KVarN tile size (= block size); 64 or 128
+        pure_qlen1 = _is_pure_qlen1_batch(
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            num_actual_tokens=cam.num_actual_tokens,
+            max_query_len=cam.max_query_len,
+        )
+        if self._try_incremental_decode_lifecycle(
+            cam=cam,
+            seq_lens_cpu=seq_lens_cpu,
+            block_table_np=block_table_np,
+            pure_qlen1=pure_qlen1,
+            for_cudagraph_capture=_for_cudagraph_capture,
+        ):
+            return self._build_incremental_decode_metadata(
+                cam,
+                seq_lens_cpu=seq_lens_cpu,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+        counters = getattr(self, "_metadata_lifecycle_counters", None)
+        if counters is not None:
+            counters["full_builds"] += 1
+
+        # ── Stage α-2: assign pool slots for every block_id touched this
+        # step. The allocator state is class-level on KVarNAttentionImpl
+        # and we mutate it here (in the builder, outside any captured
+        # region). do_kv_cache_update then only READS block_to_slot_t.
+        from vllm.v1.attention.backends.kvarn_attn import (
+            KVarNAttentionImpl,
+        )  # local import
+
+        # Pool slots are needed ONLY for blocks that physically live in the fp16
+        # tail pool: each request's sink (block_table[r][0], kept fp16 for the
+        # request's lifetime) and the blocks receiving writes THIS step —
+        # tokens committed..seq_len-1 land in do_kv_cache_update after the
+        # builder. Flushed history blocks live in the int4 cache, carry
+        # pool_slot=-1, and are dequantized in-kernel.
+        #
+        # Sharing-safe lifecycle (prefix caching + chunked prefill + spec
+        # decode): everything below derives from per-step facts —
+        #   committed = seq_len - query_len   (tokens written BEFORE this step)
+        #   dict_map membership = "block is unflushed" (ground truth: a flush
+        #     frees the slot, so a slot-holding block below the committed
+        #     boundary is exactly a full-but-unflushed block)
+        #   _block_fill[bid] = tokens the pool holds for bid after this step
+        # A cache-hit request's context blocks receive no writes, so they
+        # correctly need no slots (their tiles are already int4). Anything in
+        # the allocator NOT needed this step belongs to a finished request and
+        # is reclaimed below: complete blocks are FLUSHED (a future prefix-
+        # cache hit must find a valid int4 tile), partial ones discarded.
+        blocks_needed: set[int] = set()
+        for b in range(B):
+            if b >= bt_rows:
+                break
+            sl = seq_lens_cpu[b]
+            if bt_cols == 0 or sl <= 0:
+                continue
+            row = block_table_np[b]
+            q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+            committed = max(sl - q_len, 0)
+            # Blocks written this step. Record how full each will be AFTER the
+            # step: if its owner finishes on the step that fills it, the
+            # reclaim below must flush it (not discard).
+            for k in range(committed // GROUP, min((sl - 1) // GROUP, bt_cols - 1) + 1):
+                bid = int(row[k])
+                if bid >= 0:
+                    blocks_needed.add(bid)
+                    self._block_fill[bid] = min(sl, (k + 1) * GROUP) - k * GROUP
+        gk = self._group_key
+        # Claim THIS group's impls by layer name (set on the impl in
+        # Attention.__init__) and tag them with the true group key, so their
+        # _ensure_pool / store paths use this group's slot allocator + mirror.
+        group_impls = [
+            impl
+            for impl in KVarNAttentionImpl._all_impls
+            if getattr(impl, "layer_name", None) in self._layer_names_set
+        ]
+        for impl in group_impls:
+            if getattr(impl, "use_bound_qlen1_inline_plan_v2", False):
+                impl._bind_bound_qlen1_inline_v2_group(gk)
+            else:
+                impl._group_key = gk
+        if group_impls:
+            impl0 = group_impls[0]
+            # Ensure pool + lookup tensors exist for this device.
+            impl0._ensure_pool(
+                device, num_blocks_hint=max(blocks_needed, default=0) + 1
+            )
+            mkey = (device, gk)
+            b2s_t = KVarNAttentionImpl._block_to_slot_t_per_device[mkey]
+            is_sink_t = KVarNAttentionImpl._is_sink_t_per_device[mkey]
+            dict_map = KVarNAttentionImpl._block_to_slot_dict[gk]
+            free_slots = KVarNAttentionImpl._free_slots[gk]
+            sinks = KVarNAttentionImpl._global_sink_blocks[gk]
+
+            # Full defer is an unbounded diagnostic ablation. Bounded prefill
+            # and decode policies retain only the newest non-sink history while
+            # walk-back skips past it to flush older resident history. Adding
+            # retained blocks to blocks_needed also protects them from reclaim.
+            (
+                prefill_window,
+                decode_window,
+                decode_low_water,
+                decode_flush_scope,
+            ) = self._incremental_lifecycle_policy()
+            deferred_prefill_rows: set[int] = set()
+            deferred_prefill_blocks: set[int] = set()
+            window_prefill_rows: set[int] = set()
+            window_prefill_blocks: set[int] = set()
+            window_decode_rows: set[int] = set()
+            window_decode_blocks: set[int] = set()
+            decode_resident_blocks_by_row: dict[int, list[int]] = {}
+            for b in range(B):
+                if b >= bt_rows or bt_cols == 0:
+                    break
+                sl = seq_lens_cpu[b]
+                if sl <= 0:
+                    continue
+                q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+                committed_len = max(sl - q_len, 0)
+                if _defer_kvarn_prefill_history_blocks(
+                    block_table_np[b],
+                    q_len=q_len,
+                    committed_len=committed_len,
+                    group=GROUP,
+                    bt_cols=bt_cols,
+                    resident_blocks=dict_map,
+                    blocks_needed=blocks_needed,
+                    deferred_blocks=deferred_prefill_blocks,
+                ):
+                    deferred_prefill_rows.add(b)
+                elif _protect_kvarn_prefill_window_blocks(
+                    block_table_np[b],
+                    q_len=q_len,
+                    committed_len=committed_len,
+                    group=GROUP,
+                    bt_cols=bt_cols,
+                    window=prefill_window,
+                    resident_blocks=dict_map,
+                    blocks_needed=blocks_needed,
+                    protected_blocks=window_prefill_blocks,
+                ):
+                    window_prefill_rows.add(b)
+                else:
+                    decode_resident = _kvarn_decode_resident_suffix(
+                        block_table_np[b],
+                        q_len=q_len,
+                        committed_len=committed_len,
+                        group=GROUP,
+                        bt_cols=bt_cols,
+                        high_water=decode_window,
+                        resident_blocks=dict_map,
+                    )
+                    if decode_resident:
+                        window_decode_rows.add(b)
+                        decode_resident_blocks_by_row[b] = decode_resident
+            (
+                decode_triggering_rows,
+                deferred_decode_rows,
+                decode_window_flushed_rows,
+            ) = _coordinate_kvarn_decode_window_blocks(
+                decode_resident_blocks_by_row,
+                high_water=decode_window,
+                low_water=decode_low_water,
+                flush_scope=decode_flush_scope,
+                blocks_needed=blocks_needed,
+                protected_blocks=window_decode_blocks,
+            )
+            deferred_block_count = len(deferred_prefill_blocks)
+            if deferred_block_count:
+                logger.warning_once(
+                    "VLLM_KVARN_DEFER_PREFILL_FLUSH=1 retained %d resident "
+                    "full history block(s) across %d continuation row(s); "
+                    "this diagnostic ablation is not memory-scalable.",
+                    deferred_block_count,
+                    len(deferred_prefill_rows),
+                )
+
+            # ORDER MATTERS: mark sinks → FLUSH (frees just-completed blocks'
+            # slots) → ALLOCATE (the new tails, reusing the freed slots). Doing
+            # the flush before allocation caps the live-slot peak at 2·B
+            # (one sink + one in-progress tail per request). Allocating first
+            # would transiently need 3·B when every request crosses a block
+            # boundary in lockstep (sink + pending-flush full block + new tail)
+            # → "pool exhausted" at large batch.
+
+            # (1) Mark per-request sink blocks (block_table[r][0]). A block is
+            # an fp16 sink only while its data lives in the pool: a fresh
+            # prefill writes block 0 this step (it is in blocks_needed) and
+            # keeps it fp16 for the request's lifetime; an existing sink keeps
+            # its slot via blocks_needed. A prefix-cache-hit request whose
+            # block 0 was already reclaimed (flushed to int4) must NOT re-mark
+            # it: its data lives in the int4 tile (slot -1) and every kernel
+            # reads it there like any history block. Re-marking would allocate
+            # an EMPTY pool slot that is never written (cache hits skip those
+            # tokens) and attention would read garbage for the whole first
+            # block — repetition-loops on multi-turn chat.
+            row0_set: set[int] = set()
+            for b in range(B):
+                if b >= bt_rows or bt_cols == 0:
+                    break
+                s0 = int(block_table_np[b, 0])
+                if s0 < 0:
+                    continue
+                row0_set.add(s0)
+                if s0 in sinks:
+                    blocks_needed.add(s0)  # live/retired sink keeps its slot
+                elif s0 in blocks_needed:  # written this step → fresh sink
+                    sinks.add(s0)
+                    KVarNAttentionImpl._bump_allocator_lifecycle_epoch(gk)
+                    if s0 < is_sink_t.shape[0]:
+                        is_sink_t[s0] = True
+
+            # Un-retire any retired block named this step: a prefix-cache hit
+            # re-adopting a retired sink (its fp16 data is intact and byte-
+            # identical), or vLLM recycling the id for a fresh write. Either
+            # way the block is live again and must not be evicted under it.
+            # A finished request's blocks can be freed and LIFO-reused by a new
+            # request before the builder observes a step where they are absent.
+            # In that case its old sink never entered _retired_sinks. Reconcile
+            # every actively-written block against the current row-zero set so
+            # a recycled sink used as ordinary history cannot stop walk-back
+            # flushing and make quantization depend on prior request ordering.
+            if _reconcile_kvarn_sink_ownership(
+                sinks,
+                self._retired_sinks,
+                blocks_needed,
+                row0_set,
+                is_sink_t,
+            ):
+                KVarNAttentionImpl._bump_allocator_lifecycle_epoch(gk)
+
+            # (2) Flush detection (Stage α-2 Step B).
+            # CRITICAL timing: token (k+1)*GROUP-1 (the one that completes
+            # block k) is written during THIS step's do_kv_cache_update, which
+            # runs AFTER the builder. So at builder time the pool only holds
+            # tokens already committed before this step. That committed count is
+            # `seq_len - query_len` (this step's query tokens are written later),
+            # i.e. exactly num_computed_tokens. We flush against THAT, never the
+            # full `sl`.
+            #
+            # Why not the full `sl` (or the previous step's `sl`): under
+            # speculative decoding (MTP / draft) a step appends `num_spec+1`
+            # tokens at once and seq_len jumps by a VARIABLE accepted amount,
+            # with later-rejected speculative tokens sitting in the pool until
+            # they are overwritten next step. Quantizing a block to int4 is
+            # PERMANENT, so flushing a block that still contains a speculative
+            # (rejectable) token freezes wrong KV → progressive corruption →
+            # repetition-collapse / garbage. Using the committed length means we
+            # only ever quantize blocks whose tokens are all accepted.
+            #
+            # Walk each row BACKWARD from the committed boundary while blocks
+            # still hold pool slots — those are exactly the full-but-unflushed
+            # blocks. The walk stops at the first slotless block (flushes
+            # happen in order, so everything earlier is already int4) and never
+            # touches k=0 (a live request's sink stays fp16; finished requests'
+            # sinks are handled by the reclaim below). Idempotent under prefix
+            # sharing: a co-owner finds the block already queued (or slotless)
+            # and stops — no per-request state to collide.
+            # flush_seen is both the ownership deduplicator and the native
+            # writer's one-workgroup-family-per-record uniqueness proof.
+            flush_block_ids: list[int] = []
+            flush_seen: set[int] = set()
+            prefill_window_flush_ids: set[int] = set()
+            decode_window_flush_ids: set[int] = set()
+            protected_history_blocks = (
+                deferred_prefill_blocks | window_prefill_blocks | window_decode_blocks
+            )
+            for b in range(B):
+                if b >= bt_rows or bt_cols == 0:
+                    break
+                sl = seq_lens_cpu[b]
+                row = block_table_np[b]
+                if sl <= 0:
+                    continue
+                q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+                committed_len = max(sl - q_len, 0)  # tokens already in pool & accepted
+                row_flush_ids = _kvarn_walk_back_flush_blocks(
+                    row,
+                    committed_len=committed_len,
+                    group=GROUP,
+                    bt_cols=bt_cols,
+                    resident_blocks=dict_map,
+                    sinks=sinks,
+                    flush_seen=flush_seen,
+                    defer=b in deferred_prefill_rows or b in deferred_decode_rows,
+                    deferred_blocks=protected_history_blocks,
+                )
+                flush_block_ids.extend(row_flush_ids)
+                if b in window_prefill_rows:
+                    prefill_window_flush_ids.update(row_flush_ids)
+                elif b in window_decode_rows:
+                    decode_window_flush_ids.update(row_flush_ids)
+
+            if window_prefill_blocks:
+                logger.info_once(
+                    "KVARN_PREFILL_FP16_WINDOW_BLOCKS=%d protected %d recent "
+                    "resident full history block(s) and queued %d older block(s) "
+                    "for flush across %d continuation row(s).",
+                    prefill_window,
+                    len(window_prefill_blocks),
+                    len(prefill_window_flush_ids),
+                    len(window_prefill_rows),
+                )
+            if window_decode_rows:
+                logger.info_once(
+                    "KVARN_DECODE_FP16_WINDOW_BLOCKS=%d low_water=%d scope=%s "
+                    "protected %d recent resident full history block(s) and "
+                    "queued %d older block(s) for flush across %d decode row(s).",
+                    decode_window,
+                    decode_low_water,
+                    decode_flush_scope,
+                    len(window_decode_blocks),
+                    len(decode_window_flush_ids),
+                    len(window_decode_rows),
+                )
+            if decode_window_flush_ids:
+                logger.info_once(
+                    "[KVARN_DECODE_FLUSH_BATCH] scope=%s; high_water=%d; "
+                    "low_water=%d; triggering_rows=%d; flushed_rows=%d; "
+                    "flushed_pages=%d",
+                    decode_flush_scope,
+                    decode_window,
+                    decode_low_water,
+                    len(decode_triggering_rows),
+                    len(decode_window_flushed_rows),
+                    len(decode_window_flush_ids),
+                )
+
+            # (2b) Reclaim slot-holding blocks neither written this step nor
+            # queued above: they belong to finished (or preempted) requests.
+            # A COMPLETE sink is RETIRED — kept fp16-resident so a prefix-
+            # cache hit (every follow-up chat turn) re-adopts it byte-
+            # identically; the old discard destroyed its fp16-only data
+            # outright, garbling every multi-turn cache hit.
+            # Any other COMPLETE block is FLUSHED — vLLM's prefix cache may
+            # hand it to a future request, which must find a valid int4 tile
+            # (the old discard left stale tile bytes). A PARTIAL block is
+            # discarded: vLLM never prefix-caches partial blocks.
+            discard_ids: list[int] = []
+            for bid in _kvarn_reclaimable_block_ids(
+                dict_map, blocks_needed, flush_seen
+            ):
+                full = self._block_fill.get(bid, 0) >= GROUP
+                if full and bid in sinks:
+                    if bid not in self._retired_sinks:
+                        self._retired_sinks[bid] = None
+                        KVarNAttentionImpl._bump_allocator_lifecycle_epoch(gk)
+                    continue
+                if full:
+                    flush_seen.add(bid)
+                    flush_block_ids.append(bid)
+                else:
+                    discard_ids.append(bid)
+                if bid in sinks:  # finished request's partial sink
+                    sinks.discard(bid)
+                    KVarNAttentionImpl._bump_allocator_lifecycle_epoch(gk)
+                    if bid < is_sink_t.shape[0]:
+                        is_sink_t[bid] = False
+
+            # Trigger the flush on every layer's pool. Each impl quantises its
+            # own pool[slot] into its own kv_cache (ref cached on first
+            # forward), then frees the slot below. Runs eagerly here, before
+            # the captured forward replay.
+            if flush_block_ids:
+                # One batched Sinkhorn + RTN over ALL (layer, block) flush tiles
+                # — replaces 48×N_blocks individual launches. Numerically
+                # identical (per-tile-independent ops) → no accuracy change.
+                flush_pairs = []
+                for impl in group_impls:
+                    kvc = getattr(impl, "_kv_cache_ref", None)
+                    if kvc is None:
+                        continue
+                    for bid in flush_block_ids:
+                        flush_pairs.append((impl, bid, kvc))
+                KVarNAttentionImpl._batched_flush(flush_pairs)
+                # Free the flushed blocks' slots so the allocation below can
+                # reuse them (they now live in int4; pool_slot → -1).
+                for bid in flush_block_ids:
+                    slot = dict_map.pop(bid, None)
+                    self._block_fill.pop(bid, None)
+                    if slot is not None:
+                        free_slots.append(slot)
+                        KVarNAttentionImpl._bump_allocator_lifecycle_epoch(gk)
+                        if bid < b2s_t.shape[0]:
+                            b2s_t[bid] = -1
+
+            # Free the discarded (partial, never-cacheable) blocks' slots.
+            for bid in discard_ids:
+                slot = dict_map.pop(bid)
+                self._block_fill.pop(bid, None)
+                free_slots.append(slot)
+                KVarNAttentionImpl._bump_allocator_lifecycle_epoch(gk)
+                if bid < b2s_t.shape[0]:
+                    b2s_t[bid] = -1
+
+            # (3) Allocate slots for any new block_ids (sinks + new tails).
+            for bid in blocks_needed:
+                if bid not in dict_map:
+                    if not free_slots and self._retired_sinks:
+                        # Evict the oldest retired sink: flush it to int4 so a
+                        # later prefix-cache hit still finds a valid tile, then
+                        # hand its slot to the live allocation.
+                        old = next(iter(self._retired_sinks))
+                        self._retired_sinks.pop(old)
+                        KVarNAttentionImpl._bump_allocator_lifecycle_epoch(gk)
+                        evict_pairs = [
+                            (impl, old, impl._kv_cache_ref)
+                            for impl in group_impls
+                            if getattr(impl, "_kv_cache_ref", None) is not None
+                        ]
+                        KVarNAttentionImpl._batched_flush(evict_pairs)
+                        old_slot = dict_map.pop(old, None)
+                        if old_slot is not None:
+                            KVarNAttentionImpl._bump_allocator_lifecycle_epoch(gk)
+                        self._block_fill.pop(old, None)
+                        if old in sinks:
+                            sinks.discard(old)
+                            KVarNAttentionImpl._bump_allocator_lifecycle_epoch(gk)
+                        if old < is_sink_t.shape[0]:
+                            is_sink_t[old] = False
+                        if old < b2s_t.shape[0]:
+                            b2s_t[old] = -1
+                        if old_slot is not None:
+                            free_slots.append(old_slot)
+                    if not free_slots:
+                        raise RuntimeError(
+                            f"KVarN pool exhausted "
+                            f"({KVarNAttentionImpl._allocator_pool_size.get(gk)} slots)"
+                        )
+                    slot = free_slots.pop()
+                    dict_map[bid] = slot
+                    KVarNAttentionImpl._bump_allocator_lifecycle_epoch(gk)
+                    if bid < b2s_t.shape[0]:
+                        b2s_t[bid] = slot
+                    KVarNAttentionImpl._max_known_block_id[gk] = max(
+                        KVarNAttentionImpl._max_known_block_id.get(gk, 0), bid
+                    )
+
+        self._capture_incremental_decode_state(
+            cam=cam,
+            seq_lens_cpu=seq_lens_cpu,
+            block_table_np=block_table_np,
+            pure_qlen1=pure_qlen1,
+            for_cudagraph_capture=_for_cudagraph_capture,
+            group_impls=group_impls,
+        )
+
+        # ── Persistent cu_seqlens buffers (in-place updated) ─────────────
+        # A captured graph bakes in tensor addresses, so cu_seqlens MUST live
+        # in fixed buffers updated in place — not recreated each step.
+        elide_fa_cu_seqlens = _can_elide_fa_cu_seqlens(
+            pure_qlen1=pure_qlen1,
+            for_cudagraph_capture=_for_cudagraph_capture,
+            has_built_cudagraph_metadata=getattr(
+                self, "_has_built_cudagraph_metadata", False
+            ),
+        )
+        stage = None
+        fa_cu_seqlens_q = fa_cu_seqlens_k = None
+        prefill_fa_cu_seqlens_k = None
+        if not elide_fa_cu_seqlens:
+            cu_seqlens_k_h = [0]
+            for sl in seq_lens_cpu:
+                cu_seqlens_k_h.append(cu_seqlens_k_h[-1] + sl)
+            cap = B + 1
+            stage = self._metadata_stages.acquire()
+            stage_depth = self._metadata_stages.depth
+            if self._cu_seqlens_q_buf is None or self._cu_seqlens_q_buf.shape[0] < cap:
+                self._metadata_stages.drain()
+                new_cap = max(cap, 257)  # default max_num_seqs headroom
+                self._cu_seqlens_q_buf = torch.empty(
+                    new_cap, dtype=torch.int32, device=device
+                )
+                self._cu_seqlens_k_buf = torch.empty(
+                    new_cap, dtype=torch.int32, device=device
+                )
+                self._prefill_cu_seqlens_k_buf = torch.empty(
+                    new_cap, dtype=torch.int32, device=device
+                )
+                self._cu_seqlens_q_host = torch.empty(
+                    (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
+                )
+                self._cu_seqlens_k_host = torch.empty(
+                    (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
+                )
+                self._prefill_cu_seqlens_k_host = torch.empty(
+                    (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
+                )
+            elif self._prefill_cu_seqlens_k_buf is None:
+                self._metadata_stages.drain()
+                new_cap = self._cu_seqlens_k_buf.shape[0]
+                self._prefill_cu_seqlens_k_buf = torch.empty(
+                    new_cap, dtype=torch.int32, device=device
+                )
+                self._prefill_cu_seqlens_k_host = torch.empty(
+                    (stage_depth, new_cap), dtype=torch.int32, pin_memory=True
+                )
+            q_host = self._cu_seqlens_q_host[stage]
+            k_host = self._cu_seqlens_k_host[stage]
+            for i in range(B + 1):
+                q_host[i] = i
+                k_host[i] = cu_seqlens_k_h[i]
+            fa_cu_seqlens_q = self._cu_seqlens_q_buf[: B + 1]
+            fa_cu_seqlens_k = self._cu_seqlens_k_buf[: B + 1]
+            fa_cu_seqlens_q.copy_(q_host[: B + 1], non_blocking=True)
+            fa_cu_seqlens_k.copy_(k_host[: B + 1], non_blocking=True)
+            if 0 < num_decodes < B:
+                prefill_count = B - num_decodes
+                prefill_k_host = self._prefill_cu_seqlens_k_host[stage]
+                prefill_base = cu_seqlens_k_h[num_decodes]
+                for i in range(prefill_count + 1):
+                    prefill_k_host[i] = cu_seqlens_k_h[num_decodes + i] - prefill_base
+                prefill_fa_cu_seqlens_k = self._prefill_cu_seqlens_k_buf[
+                    : prefill_count + 1
+                ]
+                prefill_fa_cu_seqlens_k.copy_(
+                    prefill_k_host[: prefill_count + 1], non_blocking=True
+                )
+
+        # ── Verify (spec-as-decode) plan ─────────────────────────────────
+        # When the decode portion carries multi-token queries (an MTP verify
+        # step; query_len <= reorder threshold), build one virtual kernel row
+        # per decode token: its block-table row and its bottom-right causal
+        # length (committed + idx + 1). Persistent buffers, CPU-filled here,
+        # so the fused verify kernel is CUDA-graph-capturable (pointers stay
+        # stable across replays; only values change).
+        vq_req_t = vq_seqlen_t = None
+        vq_qlen = 0
+        if num_decodes > 0 and num_decode_tokens > num_decodes:
+            if (
+                self._vq_req_buf is None
+                or self._vq_req_buf.shape[0] < num_decode_tokens
+            ):
+                self._metadata_stages.drain()
+                vq_cap = max(num_decode_tokens, 4096)
+                self._vq_req_buf = torch.empty(vq_cap, dtype=torch.int32, device=device)
+                self._vq_seqlen_buf = torch.empty(
+                    vq_cap, dtype=torch.int32, device=device
+                )
+                self._vq_req_host = torch.empty(
+                    (stage_depth, vq_cap), dtype=torch.int32, pin_memory=True
+                )
+                self._vq_seqlen_host = torch.empty(
+                    (stage_depth, vq_cap), dtype=torch.int32, pin_memory=True
+                )
+            req_host = self._vq_req_host[stage]
+            seqlen_host = self._vq_seqlen_host[stage]
+            # Non-causal (DFlash cross-attention): every query row attends to
+            # the full context, so its per-row limit is the whole seq_len, not
+            # the bottom-right causal staircase committed+j+1.
+            non_causal = not getattr(cam, "causal", True)
+            i = 0
+            uniform = query_lens_cpu[0] if num_decodes else 0
+            for b in range(num_decodes):
+                ql = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+                if ql != uniform:
+                    uniform = 0
+                committed = max(seq_lens_cpu[b] - ql, 0)
+                full = committed + ql
+                for j in range(ql):
+                    req_host[i] = b
+                    seqlen_host[i] = full if non_causal else committed + j + 1
+                    i += 1
+            # Uniform query length -> the shared-dequant verify kernel (the
+            # request's tokens share each block's dequant); this is always the
+            # case under uniform-batch graph capture. The shared kernel bakes
+            # the bottom-right causal staircase internally, so non-causal must
+            # fall back to the per-token path (which honours the flat per-row
+            # limit above) — force vq_qlen=0 in that case.
+            vq_qlen = uniform if (uniform >= 2 and not non_causal) else 0
+            vq_req_t = self._vq_req_buf[:num_decode_tokens]
+            vq_seqlen_t = self._vq_seqlen_buf[:num_decode_tokens]
+            vq_req_t.copy_(req_host[:num_decode_tokens], non_blocking=True)
+            vq_seqlen_t.copy_(seqlen_host[:num_decode_tokens], non_blocking=True)
+
+        # The event is recorded after every H2D copy issued above on the current
+        # stream. The corresponding host slot cannot be refilled until acquire()
+        # observes completion. This is required even when MTP is disabled because
+        # cu_seqlens are copied on every generation.
+        if stage is not None:
+            self._metadata_stages.release(stage, torch.xpu.Event)
+
+        max_blocks_per_req = (self._max_model_len + GROUP - 1) // GROUP
+
+        # A multi-query request with cached context (seq_len > query_len) is a
+        # speculative-decode verify step or a chunked-prefill continuation —
+        # its query tokens must attend over the cached K/V, not just each other.
+        # Detected here from CPU arrays (no GPU sync) so forward() can route it
+        # to the context-aware path. Fresh first-chunk prefill has
+        # seq_len == query_len on every row → flag stays False.
+        cached_multiquery_rows = [
+            query_lens_cpu[b] > 1 and seq_lens_cpu[b] > query_lens_cpu[b]
+            for b in range(min(B, len(query_lens_cpu)))
+        ]
+        has_cached_multiquery = any(cached_multiquery_rows)
+        prefill_has_cached_multiquery = any(cached_multiquery_rows[num_decodes:])
+
+        return KVarNMetadata(
+            seq_lens=cam.seq_lens,
+            slot_mapping=cam.slot_mapping,
+            block_table=cam.block_table_tensor,
+            query_start_loc=cam.query_start_loc,
+            num_actual_tokens=cam.num_actual_tokens,
+            max_query_len=cam.max_query_len,
+            max_seq_len=cam.max_seq_len,
+            is_prefill=(cam.max_query_len > 1),
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            qlen1_dispatch_kind=(
+                _KVarNQlen1MetadataKind.EAGER_PURE_DECODE
+                if elide_fa_cu_seqlens
+                else _KVarNQlen1MetadataKind.REFERENCE
+            ),
+            has_cached_multiquery=has_cached_multiquery,
+            prefill_has_cached_multiquery=prefill_has_cached_multiquery,
+            seq_lens_cpu=seq_lens_cpu,
+            # not consumed downstream; build() uses block_table_np
+            block_table_cpu=None,
+            slot_mapping_cpu=None,
+            fa_cu_seqlens_q=fa_cu_seqlens_q,
+            fa_cu_seqlens_k=fa_cu_seqlens_k,
+            prefill_fa_cu_seqlens_k=prefill_fa_cu_seqlens_k,
+            fa_max_blocks_per_req=max_blocks_per_req,
+            fa_max_seqlen_k_fixed=self._max_model_len,
+            vq_req=vq_req_t,
+            vq_seqlen=vq_seqlen_t,
+            vq_qlen=vq_qlen,
+            causal=getattr(cam, "causal", True),
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-block fp16 tail buffer (in-progress tile staging)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class _BlockTail:
+    """In-progress fp16 K/V for one cache block.
+
+    Reset whenever a token with ``position_in_block == 0`` arrives for this
+    block_id (handles vLLM's block recycling on request preemption). Evicted
+    immediately after a 128-token flush.
+    """
+
+    K: torch.Tensor  # [group, num_kv_heads, head_dim] fp16
+    V: torch.Tensor  # [group, num_kv_heads, head_dim] fp16
+    filled_mask: torch.Tensor = field(repr=False)  # [group] bool — which slots written
+    filled_count: int = 0  # CPU-side counter (avoid .all() sync)
+
+
+@dataclass(frozen=True)
+class _KVarNFlushDeviceIndices:
+    """Own one flush schedule's device indices for an entire flush call."""
+
+    block_ids: torch.Tensor
+    pool_slots: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _KVarNTrustedInlinePoolReceipt:
+    """Pool bindings proven when the trusted eager route is first bound."""
+
+    mirror_key: tuple
+    shared_key: tuple
+    mirror_epoch: int
+    shared_epoch: int
+    runtime_policy: tuple[str | None, str | None]
+    lookup_capacity: int
+    block_to_slot: torch.Tensor
+    is_sink: torch.Tensor
+    tail_key: torch.Tensor
+    tail_value: torch.Tensor
+    q_rot_fp16: torch.Tensor
+    fused_output: torch.Tensor
+    native_output_fp16: torch.Tensor
+    native_scratch_key: tuple | None
+    native_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+
+
+@dataclass(frozen=True)
+class _KVarNTrustedQlen1InlinePlan:
+    """Cached invariants for one engine's opt-in eager qlen=1 route."""
+
+    process_generation: int
+    cache_owner: torch.Tensor
+    cache_view: torch.Tensor
+    device: torch.device
+    activation_dtype: torch.dtype
+    native_decode: KVarNTrustedNativeDecodePlan
+    pool_receipt: _KVarNTrustedInlinePoolReceipt | None = None
+
+
+@dataclass(frozen=True)
+class _KVarNBoundQlen1InlinePlanV2:
+    """Once-qualified bindings for the lean eager qlen=1 route.
+
+    One ``Attention`` instance fixes head geometry, model dtype, device, and
+    output-buffer schema for its lifetime. The bind pass validates the tensors
+    produced by that instance; later scheduler steps may only vary the leading
+    batch extent certified by ``KVarNMetadata``.
+    """
+
+    process_generation: int
+    binding_epoch: int
+    cache_owner: torch.Tensor
+    cache_view: torch.Tensor
+    device: torch.device
+    activation_dtype: torch.dtype
+    cache_layout: str
+    record_bytes: int
+    split_policy: str
+    max_splits: int
+    kernel_variant: int
+    output_dtype: torch.dtype
+    qualified_batch_limit: int
+    native_decode: KVarNBoundNativeDecodePlanV2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Attention impl
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
+    """KVarN attention implementation.
+
+    Slow PyTorch decode for Stage 3b.2 — replaced by Triton in Stage 4.
+    """
+
+    supports_quant_query_input: bool = False
+    use_fused_qkv_cache_update: bool = False
+    use_inline_qkv_cache_update: bool = False
+    use_trusted_qlen1_inline_plan: bool = False
+    use_bound_qlen1_inline_plan_v2: bool = False
+    _kvarn_frontend_bound: bool = False
+
+    # Shared decode scratch — these are per-step throwaway buffers used by
+    # `kvarn_decode_attention`. Sharing across all impl instances (one set
+    # per device) avoids 28× memory waste on the per-layer attention.
+    # Lazily allocated by `_ensure_pool` on the first non-capture call.
+    _shared_q_fp32_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    _shared_q_rot_fp32_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    _shared_q_rot_fp16_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    _shared_out_rot_fp32_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    _shared_output_fp32_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    _shared_fused_out_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    _shared_native_output_fp16_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    # Optional native Xe2 split-K scratch. The class-level owner keeps the
+    # allocations alive across asynchronous layer launches and lets every
+    # KVarN layer on the device reuse the same stream-ordered buffers.
+    _shared_native_decode_scratch: ClassVar[
+        dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    ] = {}
+    _shared_mid_o_buf: ClassVar[
+        dict[torch.device, torch.Tensor]
+    ] = {}  # split-K partials
+    _shared_mid_lse_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    _shared_fa_K_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    _shared_fa_V_buf: ClassVar[dict[torch.device, torch.Tensor]] = {}
+
+    # ── Stage α-2: class-level shared sparse slot allocator ──────────────────
+    # Single source of truth across all 28 KVarNAttentionImpl instances:
+    #   _block_to_slot_dict[block_id] → slot      (Python, CPU)
+    #   _block_to_slot_t_per_device[device][block_id] → slot int32    (GPU mirror)
+    #   _is_sink_t_per_device[device][block_id] → bool                (GPU mirror)
+    # All allocator mutations happen in KVarNMetadataBuilder.build(), which
+    # runs once per step OUTSIDE any captured CUDA-graph region. The captured
+    # do_kv_cache_update kernel just reads block_to_slot_t.
+    # Allocator state, scoped PER KV-CACHE-GROUP (key = group_key tuple), because
+    # block_ids are only unique WITHIN a group. CPU dicts keyed by group_key; GPU
+    # mirrors keyed by (device, group_key). See `self._group_key`.
+    _block_to_slot_dict: ClassVar[dict[tuple, dict[int, int]]] = {}
+    _global_sink_blocks: ClassVar[dict[tuple, set[int]]] = {}
+    _free_slots: ClassVar[dict[tuple, list[int]]] = {}
+    _allocator_pool_size: ClassVar[dict[tuple, int]] = {}
+    # Monotonic per-group lifecycle receipt. Unlike pool-binding generations,
+    # this changes for every resident/free/sink ownership mutation, including
+    # swaps whose container identities and cardinalities remain unchanged.
+    _allocator_lifecycle_epochs: ClassVar[dict[tuple, int]] = {}
+    _block_to_slot_t_per_device: ClassVar[dict[tuple, torch.Tensor]] = {}
+    _is_sink_t_per_device: ClassVar[dict[tuple, torch.Tensor]] = {}
+    _max_known_block_id: ClassVar[dict[tuple, int]] = {}
+    # Keys (device, D, group, k_bits, v_bits) whose flush kernels (Sinkhorn +
+    # int4 store) have already been JIT-compiled via the pool-init warmup.
+    _kernel_warmed: ClassVar[set] = set()
+
+    # The selector freezes on the first KVarN layer constructed for a model.
+    # Device index owners themselves are intentionally call-local: retaining
+    # them across steps would let recycled block ids observe a stale schedule.
+    _flush_index_materialization: ClassVar[str | None] = None
+    _flush_writer: ClassVar[str | None] = None
+    _forward_pool_ensure: ClassVar[str | None] = None
+    _pool_runtime_policy: ClassVar[tuple[str | None, str | None] | None] = None
+    _qlen1_inline_plan: ClassVar[str | None] = None
+    _process_generation: ClassVar[int] = 0
+    _pool_epoch_counter: ClassVar[int] = 0
+    # Every replacement published through a shared pool/mirror map must bump
+    # its matching epoch after the replacement set is complete.
+    _pool_mirror_epochs: ClassVar[dict[tuple, int]] = {}
+    _pool_shared_epochs: ClassVar[dict[tuple, int]] = {}
+    _flush_index_counters: ClassVar[dict[str, int]] = {}
+    _cached_prefill_materializer: ClassVar[str | None] = None
+    _cached_prefill_materializer_counters: ClassVar[dict[str, int]] = {}
+
+    # Registry of impls so the builder can enumerate per-layer pools when
+    # it needs to update sink markers / trigger flushes.
+    _all_impls: ClassVar[list[KVarNAttentionImpl]] = []
+    _tiles_dumped: ClassVar[bool] = False
+
+    @classmethod
+    def _bump_allocator_lifecycle_epoch(cls, group_key: tuple) -> None:
+        cls._allocator_lifecycle_epochs[group_key] = (
+            cls._allocator_lifecycle_epochs.get(group_key, 0) + 1
+        )
+
+    def _bump_bound_qlen1_inline_v2_epoch(self) -> None:
+        self._bound_qlen1_inline_v2_binding_epoch = (
+            getattr(self, "_bound_qlen1_inline_v2_binding_epoch", 0) + 1
+        )
+        self._bound_qlen1_inline_v2_plan = None
+
+    @classmethod
+    def reset_process_state(cls) -> None:
+        """Release state from the worker's previous KVarN model load.
+
+        KVarN shares allocator mirrors and scratch across every layer in one
+        model.  Those objects are process-global for fast layer-to-layer reuse,
+        so a worker that loads another model must drop the previous generation
+        before constructing the replacement.
+        """
+        for impl in cls._all_impls:
+            invalidate = getattr(impl, "_bump_bound_qlen1_inline_v2_epoch", None)
+            if invalidate is not None:
+                invalidate()
+        cls._shared_q_fp32_buf.clear()
+        cls._shared_q_rot_fp32_buf.clear()
+        cls._shared_q_rot_fp16_buf.clear()
+        cls._shared_out_rot_fp32_buf.clear()
+        cls._shared_output_fp32_buf.clear()
+        cls._shared_fused_out_buf.clear()
+        cls._shared_native_output_fp16_buf.clear()
+        cls._shared_native_decode_scratch.clear()
+        cls._shared_mid_o_buf.clear()
+        cls._shared_mid_lse_buf.clear()
+        cls._shared_fa_K_buf.clear()
+        cls._shared_fa_V_buf.clear()
+        cls._block_to_slot_dict.clear()
+        cls._global_sink_blocks.clear()
+        cls._free_slots.clear()
+        cls._allocator_pool_size.clear()
+        cls._allocator_lifecycle_epochs.clear()
+        cls._block_to_slot_t_per_device.clear()
+        cls._is_sink_t_per_device.clear()
+        cls._max_known_block_id.clear()
+        cls._pool_mirror_epochs.clear()
+        cls._pool_shared_epochs.clear()
+        cls._kernel_warmed.clear()
+        cls._flush_index_materialization = None
+        cls._flush_writer = None
+        cls._forward_pool_ensure = None
+        cls._pool_runtime_policy = None
+        cls._qlen1_inline_plan = None
+        cls._process_generation += 1
+        cls._pool_epoch_counter += 1
+        cls._flush_index_counters.clear()
+        cls._cached_prefill_materializer = None
+        cls._cached_prefill_materializer_counters.clear()
+        cls._all_impls.clear()
+        cls._tiles_dumped = False
+
+    @classmethod
+    def _select_flush_index_materialization(
+        cls, default: str = _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE
+    ) -> str:
+        if cls._flush_index_materialization is None:
+            selection, source = _kvarn_flush_index_materialization_requested(default)
+            cls._flush_index_materialization = selection
+            logger.info_once(
+                "[KVARN_FACTORY] selected_flush_index_materialization=%s; "
+                "selector_source=%s; immutable for engine lifetime",
+                selection,
+                source,
+            )
+        return cls._flush_index_materialization
+
+    @classmethod
+    def flush_index_materialization_counters(cls) -> dict[str, int]:
+        """Return cumulative materialization provenance for this model load."""
+        return {
+            key: cls._flush_index_counters.get(key, 0)
+            for key in _KVARN_FLUSH_INDEX_COUNTER_KEYS
+        }
+
+    @classmethod
+    def _select_flush_writer(cls, default: str = _KVARN_FLUSH_WRITER_REFERENCE) -> str:
+        if cls._flush_writer is None:
+            selection, source = _kvarn_flush_writer_requested(default)
+            cls._flush_writer = selection
+            logger.info_once(
+                "[KVARN_FACTORY] selected_flush_writer=%s; selector_source=%s; "
+                "immutable for engine lifetime",
+                selection,
+                source,
+            )
+        return cls._flush_writer
+
+    @classmethod
+    def _select_forward_pool_ensure(cls) -> str:
+        if cls._forward_pool_ensure is None:
+            selection, source = _kvarn_forward_pool_ensure_requested()
+            cls._forward_pool_ensure = selection
+            logger.info_once(
+                "[KVARN_FACTORY] selected_forward_pool_ensure=%s; "
+                "selector_source=%s; epoch_guard="
+                "generation+group+capacity+mirror+shared_scratch+runtime; "
+                "fallback=full_validation; immutable for engine lifetime",
+                selection,
+                source,
+            )
+        return cls._forward_pool_ensure
+
+    @classmethod
+    def _select_pool_runtime_policy(cls) -> tuple[str | None, str | None]:
+        """Freeze pool-affecting native switches for this model generation."""
+        if cls._pool_runtime_policy is None:
+            cls._pool_runtime_policy = (
+                os.environ.get("KVARN_NATIVE_XPU"),
+                os.environ.get("KVARN_NATIVE_XPU_PERSISTENT_SCRATCH"),
+            )
+        return cls._pool_runtime_policy
+
+    @classmethod
+    def _next_pool_epoch(cls) -> int:
+        cls._pool_epoch_counter += 1
+        return cls._pool_epoch_counter
+
+    @classmethod
+    def _mark_pool_mirror_changed(cls, mirror_key: tuple) -> None:
+        cls._pool_mirror_epochs[mirror_key] = cls._next_pool_epoch()
+        for impl in cls._all_impls:
+            if getattr(impl, "_pool_ready_key", None) == mirror_key:
+                impl._bump_bound_qlen1_inline_v2_epoch()
+
+    @classmethod
+    def _mark_pool_shared_changed(cls, shared_key: tuple) -> None:
+        cls._pool_shared_epochs[shared_key] = cls._next_pool_epoch()
+        device, head_dim, num_kv_heads = shared_key
+        for impl in cls._all_impls:
+            ready_key = getattr(impl, "_pool_ready_key", None)
+            if (
+                ready_key is not None
+                and ready_key[0] == device
+                and getattr(impl, "head_size", None) == head_dim
+                and getattr(impl, "num_kv_heads", None) == num_kv_heads
+            ):
+                impl._bump_bound_qlen1_inline_v2_epoch()
+
+    @classmethod
+    def _select_qlen1_inline_plan(
+        cls, default: str = _KVARN_QLEN1_INLINE_PLAN_REFERENCE
+    ) -> str:
+        if cls._qlen1_inline_plan is None:
+            selection, source = _kvarn_qlen1_inline_plan_requested(default)
+            cls._qlen1_inline_plan = selection
+            if selection == _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2:
+                logger.info_once(
+                    "[KVARN_FACTORY] selected_qlen1_inline_plan=%s; "
+                    "selector_source=%s; variant=H; cached_invariants="
+                    "layout+abi+device+dtype+split+output; "
+                    "dynamic_guards=process_generation+binding_epoch+"
+                    "cache_identity+metadata_kind+batch_limit; "
+                    "fallback=reference; immutable for engine lifetime",
+                    selection,
+                    source,
+                )
+            else:
+                logger.info_once(
+                    "[KVARN_FACTORY] selected_qlen1_inline_plan=%s; "
+                    "selector_source=%s; cached_invariants="
+                    "pool+cache_abi+qkv_eligibility+decode_eligibility; "
+                    "dynamic_guards=qlen1+tensor_schema+cache_identity+generation+"
+                    "pool_epochs+lookup_capacity; "
+                    "fallback=reference; immutable for engine lifetime",
+                    selection,
+                    source,
+                )
+        return cls._qlen1_inline_plan
+
+    @classmethod
+    def _select_cached_prefill_materializer(cls) -> str:
+        if cls._cached_prefill_materializer is None:
+            cls._cached_prefill_materializer = (
+                _KVARN_CACHED_PREFILL_MATERIALIZER_NATIVE_XE2
+                if kvarn_native_feature_enabled("MATERIALIZE")
+                else _KVARN_CACHED_PREFILL_MATERIALIZER_REFERENCE
+            )
+            logger.info_once(
+                "[KVARN_FACTORY] selected_cached_prefill_materializer=%s; "
+                "selectors=KVARN_NATIVE_XPU,KVARN_NATIVE_XPU_MATERIALIZE; "
+                "eligibility_fallback=reference; immutable for engine lifetime",
+                cls._cached_prefill_materializer,
+            )
+        return cls._cached_prefill_materializer
+
+    @classmethod
+    def cached_prefill_materializer_counters(cls) -> dict[str, int]:
+        """Return materializer dispatch counters for the current model load."""
+        return {
+            key: cls._cached_prefill_materializer_counters.get(key, 0)
+            for key in _KVARN_CACHED_PREFILL_MATERIALIZER_COUNTER_KEYS
+        }
+
+    @classmethod
+    def _ensure_shared_q_output_scratch(
+        cls,
+        bkey: tuple,
+        q_rows: int,
+        head_dim: int,
+        device: torch.device,
+    ) -> None:
+        """Create or atomically grow the shared Q/output buffers."""
+        existing = (
+            cls._shared_q_fp32_buf.get(bkey),
+            cls._shared_q_rot_fp32_buf.get(bkey),
+            cls._shared_q_rot_fp16_buf.get(bkey),
+            cls._shared_out_rot_fp32_buf.get(bkey),
+            cls._shared_output_fp32_buf.get(bkey),
+            cls._shared_fused_out_buf.get(bkey),
+            cls._shared_native_output_fp16_buf.get(bkey),
+        )
+        if all(buf is not None and buf.shape[0] >= q_rows for buf in existing):
+            return
+
+        # Finish every allocation before publishing any replacement. If one
+        # allocation raises, callers continue to see the complete old set.
+        replacements = (
+            torch.empty(q_rows, head_dim, dtype=torch.float32, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float32, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float16, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float32, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float32, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float16, device=device),
+            torch.empty(q_rows, head_dim, dtype=torch.float16, device=device),
+        )
+        (
+            cls._shared_q_fp32_buf[bkey],
+            cls._shared_q_rot_fp32_buf[bkey],
+            cls._shared_q_rot_fp16_buf[bkey],
+            cls._shared_out_rot_fp32_buf[bkey],
+            cls._shared_output_fp32_buf[bkey],
+            cls._shared_fused_out_buf[bkey],
+            cls._shared_native_output_fp16_buf[bkey],
+        ) = replacements
+        cls._mark_pool_shared_changed(bkey)
+
+    @classmethod
+    def _impls_for_group(cls, group_key: tuple) -> list[KVarNAttentionImpl]:
+        """Impls belonging to one KV-cache group (same group_key)."""
+        return [i for i in cls._all_impls if i._group_key == group_key]
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int | None = None,
+        alibi_slopes: list[float] | None = None,
+        sliding_window: int | None = None,
+        kv_cache_dtype: str = "auto",
+        logits_soft_cap: float | None = None,
+        attn_type: str = AttentionType.DECODER,
+        kv_sharing_target_layer_name: str | None = None,
+        **kwargs,
+    ):
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.num_kv_groups = num_heads // self.num_kv_heads
+        self.kv_cache_dtype = kv_cache_dtype
+        # Sliding-window layers (e.g. Gemma-4: 50/60 layers, window 1024) only
+        # attend to the last `sliding_window` keys. Stored so the decode kernel
+        # can bound its block loop to the window — without this it reads the FULL
+        # history every step (16x too much work + wrong output past the window).
+        self.sliding_window = sliding_window or 0
+        # KV-cache-group key. KVarN's slot allocator + GPU mirrors are keyed by
+        # block_id, but vLLM gives each KV-cache group an INDEPENDENT block_id
+        # space. Heterogeneous models put KVarN layers in >1 group (e.g. Gemma-4:
+        # sliding head256/16kv + global head512/4kv), so a single global allocator
+        # aliases the two groups' block_ids -> wrong slots -> garbage. Scope all
+        # allocator state by this key so each group has its own slot space.
+        # (head_size, num_kv_heads, sliding_window) uniquely identifies the group
+        # and is computable identically by the per-group builder and each impl.
+        self._group_key = (head_size, self.num_kv_heads, self.sliding_window)
+        if os.environ.get("KVARN_DBG_LAYERS") == "1":
+            print(
+                f"[KVARN_LAYER] head_size={head_size} num_heads={num_heads} "
+                f"num_kv_heads={self.num_kv_heads} "
+                f"sliding_window={self.sliding_window}",
+                flush=True,
+            )
+
+        from vllm.model_executor.layers.quantization.kvarn.config import (
+            KVarNConfig,
+        )
+
+        self.kvarn_config = KVarNConfig.from_cache_dtype(kv_cache_dtype, head_size)
+        self._kvarn_xpu_beta_profile = _kvarn_xpu_beta_profile_enabled(kv_cache_dtype)
+        self._kvarn_cache_layout = _resolve_kvarn_cache_layout(
+            self.kvarn_config, beta_profile=self._kvarn_xpu_beta_profile
+        )
+        self._kvarn_dpas_layout = (
+            self._kvarn_cache_layout == KVARN_CACHE_LAYOUT_XE2_DPAS
+        )
+        self._kvarn_frontend_variant = kvarn_frontend_variant_requested(
+            KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM
+            if self._kvarn_xpu_beta_profile
+            else KVARN_FRONTEND_REFERENCE
+        )
+        self._kvarn_qkv_scatter_op_name = (
+            "kvarn_hadamard_qkv_scatter_current_stream"
+            if self._kvarn_frontend_variant
+            == KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM
+            else "kvarn_hadamard_qkv_scatter"
+        )
+        self._kvarn_qkv_scatter_op = getattr(
+            torch.ops._vllm_fa2_C, self._kvarn_qkv_scatter_op_name, None
+        )
+        self._kvarn_prefill_store_variant = kvarn_prefill_store_variant_requested(
+            KVARN_PREFILL_STORE_HADAMARD_SCATTER
+            if self._kvarn_xpu_beta_profile
+            else KVARN_PREFILL_STORE_REFERENCE
+        )
+        self.use_fused_qkv_cache_update = False
+        self.use_inline_qkv_cache_update = False
+        self._kvarn_frontend_bound = False
+        self._native_qkv_scatter_active_logged = False
+        self._pending_fused_qkv_signature: tuple | None = None
+        self._forward_pool_elision_active_logged = False
+        self._trusted_qlen1_inline_execution_logged = False
+        self._trusted_qlen1_inline_bound: _KVarNTrustedQlen1InlinePlan | None = None
+        self._bound_qlen1_inline_v2_execution_logged = False
+        self._bound_qlen1_inline_v2_binding_epoch = 0
+        self._bound_qlen1_inline_v2_plan: _KVarNBoundQlen1InlinePlanV2 | None = None
+        (
+            self._kvarn_native_split_policy,
+            self._kvarn_native_max_splits,
+        ) = kvarn_native_split_policy_requested(
+            KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1
+            if self._kvarn_xpu_beta_profile
+            else KVARN_NATIVE_SPLIT_POLICY_FIXED
+        )
+        (
+            self._kvarn_native_kernel_variant_name,
+            self._kvarn_native_kernel_variant,
+        ) = kvarn_native_kernel_variant_requested(
+            "q6_prefetch_record_cursor" if self._kvarn_xpu_beta_profile else "baseline"
+        )
+        validate_kvarn_native_factory_selection(
+            self._kvarn_cache_layout,
+            self._kvarn_native_kernel_variant_name,
+            self._kvarn_native_kernel_variant,
+            self._kvarn_native_split_policy,
+        )
+        logger.info_once(
+            "[KVARN_FACTORY] selected_cache_layout=%s; "
+            "selected_kernel_variant=%s(%d); max_decode_splits=%d; "
+            "selected_split_policy=%s; "
+            "immutable for engine lifetime",
+            self._kvarn_cache_layout,
+            self._kvarn_native_kernel_variant_name,
+            self._kvarn_native_kernel_variant,
+            self._kvarn_native_max_splits,
+            self._kvarn_native_split_policy,
+        )
+        logger.info_once(
+            "[KVARN_FACTORY] selected_prefill_store=%s; "
+            "selector=KVARN_NATIVE_XPU_PREFILL_STORE; "
+            "fallback=reference; immutable for engine lifetime",
+            self._kvarn_prefill_store_variant,
+        )
+        type(self)._select_flush_index_materialization(
+            _KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED
+            if self._kvarn_xpu_beta_profile
+            else _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE
+        )
+        self._kvarn_flush_writer = type(self)._select_flush_writer(
+            _KVARN_FLUSH_WRITER_NATIVE_XE2
+            if self._kvarn_xpu_beta_profile
+            else _KVARN_FLUSH_WRITER_REFERENCE
+        )
+        self._kvarn_forward_pool_ensure = type(self)._select_forward_pool_ensure()
+        self._kvarn_pool_runtime_policy = type(self)._select_pool_runtime_policy()
+        self._kvarn_qlen1_inline_plan = type(self)._select_qlen1_inline_plan(
+            _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2
+            if self._kvarn_xpu_beta_profile
+            else _KVARN_QLEN1_INLINE_PLAN_REFERENCE
+        )
+        self.use_trusted_qlen1_inline_plan = (
+            self._kvarn_qlen1_inline_plan == _KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE
+        )
+        self.use_bound_qlen1_inline_plan_v2 = (
+            self._kvarn_qlen1_inline_plan == _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2
+        )
+        if (
+            self._kvarn_forward_pool_ensure
+            == _KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF
+            and self._kvarn_frontend_variant
+            not in {
+                KVARN_FRONTEND_QKV_SCATTER,
+                KVARN_FRONTEND_QKV_SCATTER_INLINE,
+                KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
+            }
+        ):
+            raise RuntimeError(
+                f"{_KVARN_FORWARD_POOL_ENSURE_ENV}="
+                f"{_KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF} requires "
+                "KVARN_NATIVE_XPU_FRONTEND=qkv_scatter or "
+                "qkv_scatter_inline, or qkv_scatter_inline_current_stream"
+            )
+        if (
+            self._kvarn_qlen1_inline_plan
+            in {
+                _KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE,
+                _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2,
+            }
+            and self._kvarn_frontend_variant != KVARN_FRONTEND_QKV_SCATTER_INLINE
+            and self._kvarn_frontend_variant
+            != KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM
+        ):
+            raise RuntimeError(
+                f"{_KVARN_QLEN1_INLINE_PLAN_ENV}="
+                f"{self._kvarn_qlen1_inline_plan} requires "
+                "KVARN_NATIVE_XPU_FRONTEND=qkv_scatter_inline or "
+                "qkv_scatter_inline_current_stream"
+            )
+        self._kvarn_cached_prefill_materializer = type(
+            self
+        )._select_cached_prefill_materializer()
+        if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_NATIVE_XE2:
+            supported = _kvarn_native_balanced_writer_supported(
+                cache_layout=self._kvarn_cache_layout,
+                head_dim=self.kvarn_config.head_dim,
+                group=self.kvarn_config.group,
+                key_bits=self.kvarn_config.key_bits,
+                value_bits=self.kvarn_config.value_bits,
+                num_kv_heads=self.num_kv_heads,
+                record_bytes=self.kvarn_config.record_bytes,
+                op_available=kvarn_native_layout_abi_supported(
+                    "kvarn_pack_balanced_kv"
+                ),
+                rtn_quantile=float(os.environ.get("KVARN_RTN_QUANTILE", "0") or 0),
+            )
+            if not supported:
+                raise RuntimeError(
+                    "KVARN_FLUSH_WRITER=native_xe2 requires the xe2_dpas "
+                    "D256/G128/K4V4/Hkv4 cache ABI and a matching "
+                    "kvarn_pack_balanced_kv extension; percentile RTN is "
+                    "not supported"
+                )
+
+        # Per-block fp16 tail buffer (in-progress tiles). Keyed by block_id.
+        # Stage 3b uses a Python dict — small concurrent batch sizes only.
+        # Stage 4 will move this into a dedicated GPU buffer.
+        self._tails: dict[int, _BlockTail] = {}
+
+        # Sink blocks (NEVER quantised, stay fp16 forever in self._tails).
+        # Identified per-request as block_table[r][0]. Populated lazily during
+        # ``forward()`` since ``do_kv_cache_update`` doesn't get block_table.
+        # TODO: wire to vLLM's request-completion hook for eviction.
+        self._sink_blocks: set[int] = set()
+
+        # ── Stage α-2: deterministic per-block tail pool ─────────────────────
+        # Each block_id maps to slot = block_id in the pool (no allocator,
+        # no dict). Pool is sized to kv_cache.shape[0] = num_blocks at first
+        # `_ensure_pool` call. Sink blocks stay in the pool permanently;
+        # non-sink blocks have their slot's content quantised into the int4
+        # cache at tile-boundary flushes (triggered from the metadata
+        # builder, between captured graph replays).
+        # [POOL_SIZE, group, Hk, D] fp16
+        self._tail_K_pool: torch.Tensor = None  # type: ignore[assignment]
+        self._tail_V_pool: torch.Tensor = None  # type: ignore[assignment]
+        # Per-instance shorthand views of the class-level per-device tensors
+        # (so kernels can read without dict lookups). Re-bound on every
+        # _ensure_pool call.
+        self._is_sink_t: torch.Tensor | None = None  # [num_blocks] bool
+        self._block_to_slot_t: torch.Tensor | None = None  # [num_blocks] int32
+        self._block_lookup_size: int = 0
+
+        # Cached fp16 Hadamard for the rotate-on-store matmul in
+        # do_kv_cache_update (avoids a per-call .float() cast that allocates).
+        self._H_fp16: torch.Tensor | None = None
+
+        # Store-side rotation scratch (pre-allocated by _ensure_pool so the
+        # captured forward never allocates). Shapes:
+        #   _k_rot_scratch  [max_num_batched_tokens, Hk, D] fp16
+        #   _v_rot_scratch  [max_num_batched_tokens, Hk, D] fp16
+        self._k_rot_scratch: torch.Tensor = None  # type: ignore[assignment]
+        self._v_rot_scratch: torch.Tensor = None  # type: ignore[assignment]
+
+        # Reference to this layer's int4 kv_cache, captured on the first
+        # forward(). The metadata builder uses it to drive tile-boundary
+        # flushes into this layer's cache (outside the captured region).
+        self._kv_cache_ref: torch.Tensor | None = None
+
+        # Stage 5.a Step 7 — decode scratch. These instance attrs are
+        # bound by `_ensure_pool` to per-device class-shared tensors so all
+        # 28 attention layers reuse a single set of buffers.
+        self._q_fp32_buf: torch.Tensor | None = None
+        self._q_rot_fp32_buf: torch.Tensor | None = None
+        self._q_rot_fp16_buf: torch.Tensor | None = None
+        self._out_rot_fp32_buf: torch.Tensor | None = None
+        self._output_fp32_buf: torch.Tensor | None = None
+        self._fused_out_buf: torch.Tensor | None = None
+        self._native_output_fp16_buf: torch.Tensor | None = None
+        self._native_decode_scratch: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
+        self._pool_ready_key: tuple[torch.device, tuple] | None = None
+        self._pool_ready_native_key: tuple | None = None
+        self._pool_ready_env: tuple[str | None, ...] | None = None
+        self._pool_ready_process_generation: int = -1
+        self._pool_ready_mirror_epoch: int = -1
+        self._pool_ready_shared_epoch: int = -1
+        self._pool_epoch_latch_active_logged = False
+        self._mid_o_buf: torch.Tensor | None = None
+        self._mid_lse_buf: torch.Tensor | None = None
+        self._fa_K_buf: torch.Tensor = None  # type: ignore[assignment]
+        self._fa_V_buf: torch.Tensor = None  # type: ignore[assignment]
+
+        self.fa_version = get_flash_attn_version(head_size=head_size)
+
+        # Look up serving caps so scratch can be sized once, generously
+        # enough that capture probes don't trigger a resize inside the
+        # captured region. Falls back to conservative defaults if the
+        # global config isn't available (unit tests, etc).
+        try:
+            from vllm.config import get_current_vllm_config
+
+            _cfg = get_current_vllm_config()
+            self._max_num_seqs = _cfg.scheduler_config.max_num_seqs
+            self._max_num_batched_tokens = _cfg.scheduler_config.max_num_batched_tokens
+            self._max_model_len = _cfg.model_config.max_model_len
+            self._num_hidden_layers = getattr(
+                _cfg.model_config.hf_config, "num_hidden_layers", 32
+            )
+        except Exception:
+            self._max_num_seqs = 256
+            self._max_num_batched_tokens = 8192
+            self._num_hidden_layers = 32
+            self._max_model_len = 4096
+
+        # Register so the metadata builder can find us (slot allocation /
+        # sink marking / flush triggers all enumerate _all_impls).
+        type(self)._all_impls.append(self)
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _bind_bound_qlen1_inline_v2_group(self, group_key: tuple) -> None:
+        if self._group_key != group_key:
+            self._group_key = group_key
+            self._bump_bound_qlen1_inline_v2_epoch()
+
+    def _bind_bound_qlen1_inline_v2_cache(self, cache_view: torch.Tensor) -> None:
+        if self._kv_cache_ref is not cache_view:
+            self._kv_cache_ref = cache_view
+            self._bump_bound_qlen1_inline_v2_epoch()
+
+    def _publish_bound_qlen1_inline_v2_pool_binding(self) -> None:
+        if getattr(self, "use_bound_qlen1_inline_plan_v2", False):
+            self._bump_bound_qlen1_inline_v2_epoch()
+
+    def _override_pool_runtime_policy_for_test(
+        self, policy: tuple[str | None, str | None]
+    ) -> None:
+        """Explicitly replace the frozen receipt policy in unit tests only."""
+        if len(policy) != 2:
+            raise ValueError("KVarN pool runtime policy must contain two values")
+        self._kvarn_pool_runtime_policy = policy
+
+    def _pool_required_blocks(self, num_blocks_hint: int) -> int:
+        return max(
+            num_blocks_hint,
+            type(self)._max_known_block_id.get(self._group_key, 0) + 1,
+            1024,
+        )
+
+    def _beta_native_scratch_spec(
+        self, device: torch.device
+    ) -> tuple[tuple, int, int] | None:
+        """Return the mandatory native scratch binding for the XPU beta.
+
+        Experimental KVarN configurations intentionally retain their
+        no-scratch fallback.  The compact dtype's qualified Variant H path,
+        however, must never cache that fallback as its engine-lifetime plan.
+        """
+        if not (
+            getattr(self, "_kvarn_xpu_beta_profile", False)
+            and getattr(self, "use_bound_qlen1_inline_plan_v2", False)
+        ):
+            return None
+        batch_capacity = min(max(int(self._max_num_seqs), 1), 12)
+        split_capacity = kvarn_native_split_scratch_count(
+            self._max_model_len,
+            self._kvarn_native_max_splits,
+            self._kvarn_native_split_policy,
+            self._kvarn_native_kernel_variant,
+        )
+        head_dim = int(
+            getattr(self.kvarn_config, "head_dim", getattr(self, "head_size", 0))
+        )
+        native_key = (
+            device,
+            head_dim,
+            self.num_kv_heads,
+            batch_capacity,
+            split_capacity,
+        )
+        return native_key, batch_capacity, split_capacity
+
+    def _native_decode_scratch_is_valid(
+        self,
+        scratch: object,
+        *,
+        device: torch.device,
+        batch_capacity: int,
+        split_capacity: int,
+    ) -> bool:
+        if not (
+            isinstance(scratch, tuple)
+            and len(scratch) == 3
+            and all(isinstance(tensor, torch.Tensor) for tensor in scratch)
+        ):
+            return False
+        partial_output, partial_exp_sums, partial_max_logits = scratch
+        head_dim = int(
+            getattr(self.kvarn_config, "head_dim", getattr(self, "head_size", 0))
+        )
+        return (
+            partial_output.ndim == 3
+            and partial_output.shape[0] >= batch_capacity
+            and partial_output.shape[1] >= self.num_heads * split_capacity
+            and partial_output.shape[2] == head_dim
+            and partial_output.dtype == torch.float16
+            and partial_exp_sums.ndim == 3
+            and partial_exp_sums.shape[0] >= batch_capacity
+            and partial_exp_sums.shape[1] == self.num_heads
+            and partial_exp_sums.shape[2] >= split_capacity
+            and partial_exp_sums.dtype == torch.float32
+            and partial_max_logits.ndim == 3
+            and partial_max_logits.shape[0] >= batch_capacity
+            and partial_max_logits.shape[1] == self.num_heads
+            and partial_max_logits.shape[2] >= split_capacity
+            and partial_max_logits.dtype == torch.float32
+            and all(tensor.device == device for tensor in scratch)
+            and all(tensor.is_contiguous() for tensor in scratch)
+        )
+
+    def _beta_native_scratch_binding_is_valid(self, device: torch.device) -> bool:
+        spec = self._beta_native_scratch_spec(device)
+        if spec is None:
+            return True
+        native_key, batch_capacity, split_capacity = spec
+        shared_scratch = type(self)._shared_native_decode_scratch.get(native_key)
+        return (
+            self._pool_ready_native_key == native_key
+            and self._native_decode_scratch is shared_scratch
+            and self._native_decode_scratch_is_valid(
+                shared_scratch,
+                device=device,
+                batch_capacity=batch_capacity,
+                split_capacity=split_capacity,
+            )
+        )
+
+    def _ensure_native_decode_scratch(
+        self,
+        native_key: tuple,
+        *,
+        device: torch.device,
+        batch_capacity: int,
+        split_capacity: int,
+        shared_key: tuple,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cls = type(self)
+        scratch = cls._shared_native_decode_scratch.get(native_key)
+        beta_scratch_is_malformed = getattr(
+            self, "_kvarn_xpu_beta_profile", False
+        ) and not self._native_decode_scratch_is_valid(
+            scratch,
+            device=device,
+            batch_capacity=batch_capacity,
+            split_capacity=split_capacity,
+        )
+        if scratch is None or beta_scratch_is_malformed:
+            head_dim = int(
+                getattr(self.kvarn_config, "head_dim", getattr(self, "head_size", 0))
+            )
+            scratch = (
+                torch.empty(
+                    batch_capacity,
+                    self.num_heads * split_capacity,
+                    head_dim,
+                    dtype=torch.float16,
+                    device=device,
+                ),
+                torch.empty(
+                    batch_capacity,
+                    self.num_heads,
+                    split_capacity,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                torch.empty(
+                    batch_capacity,
+                    self.num_heads,
+                    split_capacity,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+            cls._shared_native_decode_scratch[native_key] = scratch
+            cls._mark_pool_shared_changed(shared_key)
+        return scratch
+
+    def _pool_epoch_latch_is_current(
+        self, device: torch.device, num_blocks_hint: int
+    ) -> bool:
+        """Check the opt-in readiness receipt without scanning shared buffers."""
+        if (
+            getattr(
+                self,
+                "_kvarn_forward_pool_ensure",
+                _KVARN_FORWARD_POOL_ENSURE_ALWAYS,
+            )
+            != _KVARN_FORWARD_POOL_ENSURE_EPOCH_LATCH
+        ):
+            return False
+        cls = type(self)
+        mirror_key = (device, self._group_key)
+        shared_key = (device, self.kvarn_config.head_dim, self.num_kv_heads)
+        return (
+            getattr(self, "_pool_ready_process_generation", -1)
+            == cls._process_generation
+            and self._pool_ready_key == mirror_key
+            and self._pool_ready_env == self._kvarn_pool_runtime_policy
+            and self._block_lookup_size >= self._pool_required_blocks(num_blocks_hint)
+            and getattr(self, "_pool_ready_mirror_epoch", -1)
+            == cls._pool_mirror_epochs.get(mirror_key, -1)
+            and getattr(self, "_pool_ready_shared_epoch", -1)
+            == cls._pool_shared_epochs.get(shared_key, -1)
+            and self._beta_native_scratch_binding_is_valid(device)
+        )
+
+    def _record_pool_epoch_latch(self, device: torch.device) -> None:
+        cls = type(self)
+        mirror_key = (device, self._group_key)
+        shared_key = (device, self.kvarn_config.head_dim, self.num_kv_heads)
+        self._pool_ready_process_generation = cls._process_generation
+        self._pool_ready_mirror_epoch = cls._pool_mirror_epochs.get(mirror_key, -1)
+        self._pool_ready_shared_epoch = cls._pool_shared_epochs.get(shared_key, -1)
+
+    def _pool_is_initialized_for(
+        self, device: torch.device, num_blocks_hint: int
+    ) -> bool:
+        """Check the fully initialized hot-path state without touching XPU."""
+        cls = type(self)
+        mkey = (device, self._group_key)
+        runtime_policy = self._kvarn_pool_runtime_policy
+        required_blocks = self._pool_required_blocks(num_blocks_hint)
+        block_to_slot = cls._block_to_slot_t_per_device.get(mkey)
+        is_sink = cls._is_sink_t_per_device.get(mkey)
+        if (
+            self._pool_ready_key != mkey
+            or self._pool_ready_env != runtime_policy
+            or block_to_slot is None
+            or is_sink is None
+            or self._block_to_slot_t is not block_to_slot
+            or self._is_sink_t is not is_sink
+            or self._block_lookup_size < required_blocks
+        ):
+            return False
+
+        bkey = (device, self.kvarn_config.head_dim, self.num_kv_heads)
+        shared_bindings = (
+            (self._q_fp32_buf, cls._shared_q_fp32_buf),
+            (self._q_rot_fp32_buf, cls._shared_q_rot_fp32_buf),
+            (self._q_rot_fp16_buf, cls._shared_q_rot_fp16_buf),
+            (self._out_rot_fp32_buf, cls._shared_out_rot_fp32_buf),
+            (self._output_fp32_buf, cls._shared_output_fp32_buf),
+            (self._fused_out_buf, cls._shared_fused_out_buf),
+            (self._native_output_fp16_buf, cls._shared_native_output_fp16_buf),
+            (self._mid_o_buf, cls._shared_mid_o_buf),
+            (self._mid_lse_buf, cls._shared_mid_lse_buf),
+            (self._fa_K_buf, cls._shared_fa_K_buf),
+            (self._fa_V_buf, cls._shared_fa_V_buf),
+        )
+        if any(
+            bound is None or bound is not mapping.get(bkey)
+            for bound, mapping in shared_bindings
+        ):
+            return False
+        if (
+            self._pool_ready_native_key is not None
+            and self._native_decode_scratch
+            is not cls._shared_native_decode_scratch.get(self._pool_ready_native_key)
+        ):
+            return False
+        if not self._beta_native_scratch_binding_is_valid(device):
+            return False
+        return all(
+            tensor is not None
+            for tensor in (
+                self._tail_K_pool,
+                self._tail_V_pool,
+                self._H_fp16,
+                self._k_rot_scratch,
+                self._v_rot_scratch,
+            )
+        )
+
+    def _ensure_pool(self, device: torch.device, num_blocks_hint: int = 0) -> None:
+        """Lazy-allocate the GPU tail pool + lookup tensors + decode scratch.
+
+        Stage α-2: pool is a *fixed-size* sparse buffer
+        ([POOL_SIZE, group, Hk, D]). A class-level allocator maps block_id →
+        slot (with a GPU lookup tensor `_block_to_slot_t_per_device[device]`
+        sized to num_blocks). Pool sizing covers each active request's sink,
+        in-progress tail, and bounded fp16 history windows.
+
+        All allocation happens BEFORE the captured forward, so
+        do_kv_cache_update can be pure tensor ops.
+        """
+        if self._pool_epoch_latch_is_current(device, num_blocks_hint):
+            if not getattr(self, "_pool_epoch_latch_active_logged", False):
+                logger.info(
+                    "[KVARN_FORWARD_POOL_ENSURE] active=epoch_latch; "
+                    "action=elide_full_validation; layer=%s",
+                    getattr(self, "layer_name", ""),
+                )
+                self._pool_epoch_latch_active_logged = True
+            return
+        if self._pool_is_initialized_for(device, num_blocks_hint):
+            self._record_pool_epoch_latch(device)
+            return
+        if current_platform.is_xpu():
+            is_capturing = torch.xpu.is_current_stream_capturing()
+        else:
+            is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing:
+            if (
+                getattr(
+                    self,
+                    "_kvarn_forward_pool_ensure",
+                    _KVARN_FORWARD_POOL_ENSURE_ALWAYS,
+                )
+                == _KVARN_FORWARD_POOL_ENSURE_EPOCH_LATCH
+            ):
+                raise RuntimeError(
+                    "KVarN epoch_latch became stale during stream capture; "
+                    "reinitialize the pool outside capture"
+                )
+            return
+        cfg = self.kvarn_config
+        cls = type(self)
+
+        # Pool: fixed size, per-instance because each layer holds unique K/V.
+        tail_shape = (cfg.group, self.num_kv_heads, cfg.head_dim)
+        tail_pool_current = (
+            isinstance(self._tail_K_pool, torch.Tensor)
+            and isinstance(self._tail_V_pool, torch.Tensor)
+            and self._tail_K_pool.device == device
+            and self._tail_V_pool.device == device
+            and self._tail_K_pool.shape[1:] == tail_shape
+            and self._tail_V_pool.shape == self._tail_K_pool.shape
+        )
+        if not tail_pool_current:
+            # Size the pool to the structural peak for the *capped* concurrency:
+            # sink + in-progress tail and bounded history per active request,
+            # plus the full blocks a chunked prefill can touch. max_num_seqs has
+            # already been clamped in the platform's check_and_update_config so
+            # this peak fits the pool memory budget — making the pool both
+            # exhaustion-safe (the scheduler can never exceed it) and OOM-safe
+            # (it is <= the budget). KVARN_POOL_SLOTS still pins the count.
+            env_slots = int(os.environ.get("KVARN_POOL_SLOTS", "0"))
+            if env_slots > 0:
+                pool_size = max(env_slots, 64)
+            else:
+                pool_size = cfg.pool_slots(
+                    self._max_num_seqs, self._max_num_batched_tokens
+                )
+            new_tail_k = torch.zeros(
+                pool_size,
+                cfg.group,
+                self.num_kv_heads,
+                cfg.head_dim,
+                dtype=torch.float16,
+                device=device,
+            )
+            new_tail_v = torch.zeros_like(new_tail_k)
+            self._tail_K_pool = new_tail_k
+            self._tail_V_pool = new_tail_v
+        else:
+            pool_size = self._tail_K_pool.shape[0]
+
+        # Per-GROUP allocator state — ensure it exists for THIS group_key.
+        # Decoupled from the per-impl pool allocation above: the impl's
+        # _group_key is set to the proxy in __init__ and later RE-TAGGED to the
+        # true (per-group) key by the builder, so the pool may already exist
+        # under a stale key when this group_key is first seen. Idempotent.
+        gk = self._group_key
+        if gk not in cls._free_slots:
+            cls._free_slots[gk] = list(range(pool_size - 1, -1, -1))
+            cls._allocator_pool_size[gk] = pool_size
+            cls._block_to_slot_dict[gk] = {}
+            cls._global_sink_blocks[gk] = set()
+            cls._bump_allocator_lifecycle_epoch(gk)
+
+        # GPU lookup tensors, keyed by (device, group_key): each KV-cache group
+        # has its own block_id space, so the two groups must NOT share a mirror.
+        gk = self._group_key
+        mkey = (device, gk)
+        num_blocks = max(num_blocks_hint, cls._max_known_block_id.get(gk, 0) + 1, 1024)
+        existing = cls._block_to_slot_t_per_device.get(mkey)
+        if existing is None or existing.shape[0] < num_blocks:
+            new_b2s = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
+            new_is_sink = torch.zeros(num_blocks, dtype=torch.bool, device=device)
+            # Re-sync from this group's CPU state (rare, only on resize / first init).
+            for bid, slot in cls._block_to_slot_dict.get(gk, {}).items():
+                if bid < num_blocks:
+                    new_b2s[bid] = slot
+            for bid in cls._global_sink_blocks.get(gk, set()):
+                if bid < num_blocks:
+                    new_is_sink[bid] = True
+            cls._block_to_slot_t_per_device[mkey] = new_b2s
+            cls._is_sink_t_per_device[mkey] = new_is_sink
+            cls._mark_pool_mirror_changed(mkey)
+        # Per-instance shorthand pointers so the decode driver / kernels read
+        # without dict lookups in the hot path.
+        self._is_sink_t = cls._is_sink_t_per_device[mkey]
+        self._block_to_slot_t = cls._block_to_slot_t_per_device[mkey]
+        self._block_lookup_size = self._block_to_slot_t.shape[0]
+
+        # Cached fp16 Hadamard for the rotate-on-store matmul.
+        if self._H_fp16 is None or self._H_fp16.device != device:
+            self._H_fp16 = self._hadamard(device).to(torch.float16).contiguous()
+
+        # One-time flush-kernel warmup. The Sinkhorn + int4-store
+        # kernels are exercised ONLY at a tile-boundary flush, which never
+        # happens during vLLM's profiling/dummy run (no request crosses a block
+        # boundary there). So they JIT-compile on the FIRST real flush DURING
+        # serving — a multi-hundred-ms stall that surfaces as a latency spike
+        # and a `jit_monitor` "JIT compilation during inference" warning, and
+        # disproportionately hurts low-concurrency aggregate throughput (the
+        # one-time cost lands inside a small measured window). Compile them here,
+        # once per shape/config, at pool-init time (outside any captured region)
+        # using the exact tile shapes the flush uses, so serving never pays it.
+        warm_key = (
+            device,
+            cfg.head_dim,
+            cfg.group,
+            cfg.key_bits,
+            cfg.value_bits,
+            self._kvarn_cache_layout,
+            self._kvarn_flush_writer,
+        )
+        if warm_key not in cls._kernel_warmed:
+            warm_tiles = (
+                self.num_kv_heads
+                if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_NATIVE_XE2
+                else 1
+            )
+            k_dummy = torch.zeros(
+                warm_tiles,
+                cfg.head_dim,
+                cfg.group,
+                dtype=torch.float16,
+                device=device,
+            )
+            v_dummy = torch.zeros(
+                warm_tiles,
+                cfg.group,
+                cfg.head_dim,
+                dtype=torch.float16,
+                device=device,
+            )
+            if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_NATIVE_XE2:
+                balanced = _sinkhorn_balance_kv(k_dummy, v_dummy, cfg)
+                dummy_cache = torch.zeros(
+                    1,
+                    self.num_kv_heads,
+                    cfg.record_bytes,
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                dummy_blocks = torch.zeros(1, dtype=torch.long, device=device)
+                _launch_kvarn_native_balanced_writer(
+                    balanced, dummy_blocks, dummy_cache
+                )
+            else:
+                _sinkhorn_pack_kv(
+                    k_dummy,
+                    v_dummy,
+                    cfg,
+                    cache_layout=self._kvarn_cache_layout,
+                )
+            cls._kernel_warmed.add(warm_key)
+
+        # Decode-kernel warmup. The DECODE kernels (fused
+        # single-stage incl. its @triton.autotune sweep, split-K stage1/2, and
+        # the packed-KV build kernel) never run during vLLM's prefill-shaped
+        # profiling, so their one-time JIT + autotune cost (including the
+        # autotuner's benchmark scratch) used to land in the FIRST real decode —
+        # which, since v0.21, is the CUDA-graph memory estimation warmup. The
+        # estimate then absorbed those one-time costs and over-charged "graph
+        # memory" by GiBs, directly shrinking the derived KV-cache capacity.
+        # Warm them here (profile time) on tiny synthetic state instead: the
+        # cost is charged once to the memory profile, and the graph estimate
+        # measures only real graph-pool memory. Keyed per (device, shape combo).
+        dec_key = (
+            "decode",
+            device,
+            cfg.head_dim,
+            cfg.group,
+            cfg.key_bits,
+            cfg.value_bits,
+            self.num_heads,
+            self.num_kv_heads,
+            int(getattr(self, "sliding_window", 0) or 0),
+        )
+        if dec_key not in cls._kernel_warmed:
+            self._warm_decode_kernels(device)
+            cls._kernel_warmed.add(dec_key)
+
+        # Store-side rotation scratch.
+        store_rows = max(self._max_num_batched_tokens, 1)
+        store_shape = (store_rows, self.num_kv_heads, cfg.head_dim)
+        if (
+            not isinstance(self._k_rot_scratch, torch.Tensor)
+            or not isinstance(self._v_rot_scratch, torch.Tensor)
+            or self._k_rot_scratch.device != device
+            or self._v_rot_scratch.device != device
+            or self._k_rot_scratch.shape != store_shape
+            or self._v_rot_scratch.shape != store_shape
+        ):
+            new_k_rot = torch.empty(
+                store_rows,
+                self.num_kv_heads,
+                cfg.head_dim,
+                dtype=torch.float16,
+                device=device,
+            )
+            new_v_rot = torch.empty_like(new_k_rot)
+            self._k_rot_scratch = new_k_rot
+            self._v_rot_scratch = new_v_rot
+        # Decode scratch sized from vllm_config, SHARED across all impl
+        # instances on this device (one set per device).
+        D = cfg.head_dim
+        Hq = self.num_heads
+        Hk = self.num_kv_heads
+        # Decode scratch rows. The decode driver indexes these buffers by
+        # N = B * Hq (decode batch * query heads), so they must hold the largest
+        # decode N as well as any prefill token count. A decode step (incl. its
+        # CUDA-graph capture batch) has at most max_num_seqs queries, so the
+        # decode bound is max_num_seqs * Hq. Sizing to the max of that and
+        # max_num_batched_tokens makes the buffers correct for ANY
+        # max_num_batched_tokens (the old code silently assumed
+        # max_num_batched_tokens >= max_num_seqs * Hq, which breaks when it is
+        # set low — e.g. a small chunked-prefill budget on a wide model).
+        q_rows = max(self._max_num_batched_tokens, self._max_num_seqs * Hq, 1)
+        # FA packed K/V scratch holds the total KV tokens attended in ONE
+        # decode step (= sum of the batch's context lengths). The theoretical
+        # bound max_num_seqs * max_model_len is pathological (e.g. 256×8192 =
+        # 2.1M tokens ≈ 8.6 GB) and would starve the actual KV cache. Cap it at
+        # FA_SCRATCH_CAP tokens (~1 GB of fp16 K+V) — enough for typical
+        # serving and for the bench (single request up to max_model_len). The
+        # scratch is per-step, shared across all layers, allocated ONCE.
+        FA_SCRATCH_CAP = 262144
+        fa_rows = max(
+            min(self._max_num_seqs * self._max_model_len, FA_SCRATCH_CAP),
+            self._max_model_len,
+            4096,
+        )
+        cls = type(self)
+        # Key the shared decode scratch by (device, D, Hk), NOT device alone:
+        # heterogeneous-head models (e.g. Gemma-4: 256-dim/16-kv sliding layers +
+        # 512-dim/4-kv global layers) have multiple (head_dim, kv_heads) combos,
+        # and a buffer sized for one combo's D/Hk is the wrong width for another
+        # (caused a reshape(N,512)-on-256-wide-buffer crash). One scratch set per
+        # combo (Gemma-4 = 2 sets; cost is small).
+        bkey = (device, D, Hk)
+        cls._ensure_shared_q_output_scratch(bkey, q_rows, D, device)
+        from vllm.v1.attention.ops.triton_kvarn_decode import (
+            adaptive_num_kv_splits,
+            kvarn_native_feature_enabled,
+        )
+
+        use_native_scratch = (
+            kvarn_native_feature_enabled("PERSISTENT_SCRATCH")
+            and device.type == "xpu"
+            and D == 256
+            and Hq == 24
+            and Hk == 4
+            and cfg.group == 128
+            and cfg.key_bits == 4
+            and cfg.value_bits == 4
+            and cfg.record_bytes >= 35_072
+            and cfg.record_bytes % 4 == 0
+            and int(getattr(self, "sliding_window", 0) or 0) == 0
+            and kvarn_native_decode_abi_supported(True)
+        )
+        native_key = None
+        if use_native_scratch:
+            native_splits = kvarn_native_split_scratch_count(
+                self._max_model_len,
+                self._kvarn_native_max_splits,
+                self._kvarn_native_split_policy,
+                self._kvarn_native_kernel_variant,
+            )
+            native_batch = min(max(self._max_num_seqs, 1), 12)
+            native_key = (device, D, Hk, native_batch, native_splits)
+            self._ensure_native_decode_scratch(
+                native_key,
+                device=device,
+                batch_capacity=native_batch,
+                split_capacity=native_splits,
+                shared_key=bkey,
+            )
+
+        # Split-K partial buffers, sized to EXACTLY what the split-K decode path
+        # can index: it runs ONLY on pure single-query decode steps, whose row
+        # count is N = B*Hq with B <= max_num_seqs — NOT q_rows (which is
+        # max_num_batched_tokens-driven and sized the buffer ~85x too big at
+        # typical configs: 256 MiB instead of ~3 MiB for max_num_seqs=2/Hq=24/
+        # 64 splits). Split count matches the driver's
+        # adaptive helper (same max_model_len) or a larger adaptive count would
+        # overflow a smaller buffer; the driver additionally falls back to the
+        # single-stage kernel if N ever exceeds the buffer rows (defensive —
+        # e.g. an oversized padded dummy batch).
+        _splits = adaptive_num_kv_splits(
+            (self._max_model_len + cfg.group - 1) // cfg.group
+        )
+        # Rows are bounded by the split-K REGIME, not max_num_seqs: the driver
+        # only takes split-K when B*Hk <= sm_count (otherwise the single-stage
+        # kernel runs), so the most rows it can ever index is (sm_count//Hk)*Hq
+        # = sm_count*Q_PER_KV, independent of max_num_seqs. Sizing to
+        # max_num_seqs*Hq over-reserved this fp32 partial buffer ~10-20x at high
+        # concurrency, where it competes directly with the int4 KV cache. The
+        # driver still falls back to single-stage if N ever exceeds these rows
+        # (defensive), and split-K is never disabled for a batch it would take
+        # (B*Hk<=sm_count => N=B*Hq <= (sm_count//Hk)*Hq).
+        compute_units = num_compute_units(device.index or 0)
+        mid_rows = max((compute_units // max(Hk, 1)) * Hq, Hq, 1)
+        _ex_mid = cls._shared_mid_o_buf.get(bkey)
+        if (
+            _ex_mid is None
+            or _ex_mid.shape[0] < mid_rows
+            or _ex_mid.shape[1] != _splits
+        ):
+            new_mid_o = torch.empty(
+                mid_rows, _splits, D, dtype=torch.float32, device=device
+            )
+            new_mid_lse = torch.empty(
+                mid_rows, _splits, dtype=torch.float32, device=device
+            )
+            cls._shared_mid_o_buf[bkey] = new_mid_o
+            cls._shared_mid_lse_buf[bkey] = new_mid_lse
+            cls._mark_pool_shared_changed(bkey)
+        if (
+            bkey not in cls._shared_fa_K_buf
+            or cls._shared_fa_K_buf[bkey].shape[0] < fa_rows
+        ):
+            new_fa_k = torch.zeros(fa_rows, Hk, D, dtype=torch.float16, device=device)
+            new_fa_v = torch.zeros_like(new_fa_k)
+            cls._shared_fa_K_buf[bkey] = new_fa_k
+            cls._shared_fa_V_buf[bkey] = new_fa_v
+            cls._mark_pool_shared_changed(bkey)
+        # Mirror to instance attrs for fast access by the decode driver.
+        self._q_fp32_buf = cls._shared_q_fp32_buf[bkey]
+        self._q_rot_fp32_buf = cls._shared_q_rot_fp32_buf[bkey]
+        self._q_rot_fp16_buf = cls._shared_q_rot_fp16_buf[bkey]
+        self._out_rot_fp32_buf = cls._shared_out_rot_fp32_buf[bkey]
+        self._output_fp32_buf = cls._shared_output_fp32_buf[bkey]
+        self._fused_out_buf = cls._shared_fused_out_buf[bkey]
+        self._native_output_fp16_buf = cls._shared_native_output_fp16_buf[bkey]
+        self._native_decode_scratch = (
+            cls._shared_native_decode_scratch[native_key]
+            if native_key is not None
+            else None
+        )
+        self._mid_o_buf = cls._shared_mid_o_buf[bkey]
+        self._mid_lse_buf = cls._shared_mid_lse_buf[bkey]
+        self._fa_K_buf = cls._shared_fa_K_buf[bkey]
+        self._fa_V_buf = cls._shared_fa_V_buf[bkey]
+        self._pool_ready_key = mkey
+        self._pool_ready_native_key = native_key
+        self._pool_ready_env = self._kvarn_pool_runtime_policy
+        if not self._beta_native_scratch_binding_is_valid(device):
+            raise RuntimeError(
+                "XPU KVarN beta requires a complete native scratch binding; "
+                "the installed with-scratch ABI or configured capacity is "
+                "unavailable"
+            )
+        self._record_pool_epoch_latch(device)
+        self._publish_bound_qlen1_inline_v2_pool_binding()
+
+    def _warm_decode_kernels(self, device: torch.device) -> None:
+        """Compile + autotune every decode-path Triton kernel on tiny synthetic
+        state (see the note at the call site in ``_ensure_pool``).
+        Uses throwaway tensors only — never touches the real cache/pool."""
+        from vllm.v1.attention.ops.triton_kvarn_decode import (
+            _kvarn_build_packed_kv_kernel,
+            _kvarn_fused_decode_kernel,
+            _kvarn_fused_decode_stage1,
+            _kvarn_fused_decode_stage2,
+            adaptive_num_kv_splits,
+        )
+
+        cfg = self.kvarn_config
+        D, G = cfg.head_dim, cfg.group
+        Hq, Hk = self.num_heads, self.num_kv_heads
+        B, n_blocks = 8, 4
+        sw = int(getattr(self, "sliding_window", 0) or 0)
+
+        cache = torch.zeros(
+            B * n_blocks, Hk, cfg.record_bytes, dtype=torch.uint8, device=device
+        )
+        pool_k = torch.zeros(1, G, Hk, D, dtype=torch.float16, device=device)
+        pool_v = torch.zeros_like(pool_k)
+        b2s = torch.full((B * n_blocks,), -1, dtype=torch.int32, device=device)
+        bt = torch.arange(B * n_blocks, dtype=torch.int32, device=device).view(
+            B, n_blocks
+        )
+        sl = torch.full((B,), n_blocks * G, dtype=torch.int32, device=device)
+        q = torch.zeros(B, Hq, D, dtype=torch.float16, device=device)
+        out = torch.zeros_like(q)
+
+        qpk = Hq // Hk
+        qpk_pad = 1 << (qpk - 1).bit_length() if qpk > 1 else 1
+        common = dict(
+            MAX_BLOCKS_PER_REQ=n_blocks,
+            D=D,
+            GROUP=G,
+            Q_PER_KV=qpk,
+            Q_PER_KV_PAD=qpk_pad,
+            SLIDING_WINDOW=sw,
+            K_BITS=cfg.key_bits,
+            V_BITS=cfg.value_bits,
+            NUM_BLOCKS_LOOKUP=B * n_blocks,
+            K_PACKED_OFFSET=cfg.k_packed_offset,
+            K_S_COL_OFFSET=cfg.k_s_col_offset,
+            K_ZP_OFFSET=cfg.k_zp_offset,
+            K_S_ROW_OFFSET=cfg.k_s_row_offset,
+            V_PACKED_OFFSET=cfg.v_packed_offset,
+            V_S_COL_OFFSET=cfg.v_s_col_offset,
+            V_S_ROW_OFFSET=cfg.v_s_row_offset,
+            V_ZP_OFFSET=cfg.v_zp_offset,
+            VQ_INDIRECT=False,
+        )
+        # 1. Single-stage fused kernel — runs the @triton.autotune sweep.
+        # (sl doubles as the unused Req_row_ptr dummy; see VQ_INDIRECT.)
+        _kvarn_fused_decode_kernel[(B, Hk)](
+            q,
+            sl,
+            bt,
+            sl,
+            b2s,
+            cache,
+            pool_k,
+            pool_v,
+            out,
+            self.scale,
+            Hq * D,
+            D,
+            bt.stride(0),
+            cache.stride(0),
+            cache.stride(1),
+            pool_k.stride(0),
+            pool_k.stride(1),
+            pool_k.stride(2),
+            Hq * D,
+            D,
+            **common,
+        )
+        # 2. Split-K stage1 + stage2, with the exact split count and launch
+        # knobs the decode driver will use for this deployment.
+        splits = adaptive_num_kv_splits((self._max_model_len + G - 1) // G)
+        mid_o = torch.zeros(B * Hq, splits, D, dtype=torch.float32, device=device)
+        mid_lse = torch.zeros(B * Hq, splits, dtype=torch.float32, device=device)
+        # stage1 is @triton.autotune'd; this warmup launch triggers its sweep
+        # here (pre-CUDA-graph-capture) so capture never benchmarks.
+        _kvarn_fused_decode_stage1[(B, Hk, splits)](
+            q,
+            sl,
+            bt,
+            sl,
+            b2s,
+            cache,
+            pool_k,
+            pool_v,
+            mid_o,
+            mid_lse,
+            self.scale,
+            Hq * D,
+            D,
+            bt.stride(0),
+            cache.stride(0),
+            cache.stride(1),
+            pool_k.stride(0),
+            pool_k.stride(1),
+            pool_k.stride(2),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_lse.stride(0),
+            NUM_KV_SPLITS=splits,
+            HQ=Hq,
+            **common,
+        )
+        out2d = out.view(B * Hq, D)
+        _kvarn_fused_decode_stage2[(B * Hq,)](
+            mid_o,
+            mid_lse,
+            out2d,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_lse.stride(0),
+            out2d.stride(0),
+            D=D,
+            NUM_KV_SPLITS=splits,
+            num_warps=2,
+        )
+        # 2b. VQ_INDIRECT (fused spec-verify) specializations — separate
+        # compiled variants; warm them so the FIRST MTP verify step doesn't
+        # pay the Triton JIT mid-serving.
+        vq_rows = torch.zeros(B, dtype=torch.int32, device=device)
+        common_vq = dict(common, VQ_INDIRECT=True)
+        _kvarn_fused_decode_kernel[(B, Hk)](
+            q,
+            vq_rows,
+            bt,
+            sl,
+            b2s,
+            cache,
+            pool_k,
+            pool_v,
+            out,
+            self.scale,
+            Hq * D,
+            D,
+            bt.stride(0),
+            cache.stride(0),
+            cache.stride(1),
+            pool_k.stride(0),
+            pool_k.stride(1),
+            pool_k.stride(2),
+            Hq * D,
+            D,
+            **common_vq,
+        )
+        _kvarn_fused_decode_stage1[(B, Hk, splits)](
+            q,
+            vq_rows,
+            bt,
+            sl,
+            b2s,
+            cache,
+            pool_k,
+            pool_v,
+            mid_o,
+            mid_lse,
+            self.scale,
+            Hq * D,
+            D,
+            bt.stride(0),
+            cache.stride(0),
+            cache.stride(1),
+            pool_k.stride(0),
+            pool_k.stride(1),
+            pool_k.stride(2),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_lse.stride(0),
+            NUM_KV_SPLITS=splits,
+            HQ=Hq,
+            **common_vq,
+        )
+        # 2c. Shared-dequant verify kernel (uniform-QLEN spec verify) — runs
+        # its @triton.autotune sweep here so capture never benchmarks. QLEN is
+        # the deployment's 1 + num_speculative_tokens.
+        try:
+            from vllm.config import get_current_vllm_config
+
+            _spec = get_current_vllm_config().speculative_config
+            _qlen = 1 + int(_spec.num_speculative_tokens) if _spec else 0
+        except Exception:
+            _qlen = 0
+        if _qlen >= 2:
+            from vllm.v1.attention.ops.triton_kvarn_decode import (
+                _kvarn_fused_verify_stage1,
+            )
+
+            nq = B * _qlen
+            sl_vq = sl.repeat_interleave(_qlen)
+            qv = torch.zeros(nq, Hq, D, dtype=torch.float16, device=device)
+            mid_o_v = torch.zeros(
+                nq * Hq, splits, D, dtype=torch.float32, device=device
+            )
+            mid_lse_v = torch.zeros(nq * Hq, splits, dtype=torch.float32, device=device)
+            common_v = dict(common)
+            _kvarn_fused_verify_stage1[(B, Hk, splits)](
+                qv,
+                bt,
+                sl_vq,
+                b2s,
+                cache,
+                pool_k,
+                pool_v,
+                mid_o_v,
+                mid_lse_v,
+                self.scale,
+                Hq * D,
+                D,
+                bt.stride(0),
+                cache.stride(0),
+                cache.stride(1),
+                pool_k.stride(0),
+                pool_k.stride(1),
+                pool_k.stride(2),
+                mid_o_v.stride(0),
+                mid_o_v.stride(1),
+                mid_lse_v.stride(0),
+                QLEN=_qlen,
+                HQ=Hq,
+                NUM_KV_SPLITS=splits,
+                **common_v,
+            )
+        # 3. Packed-KV build kernel (materialize fallback + the cached-multiquery
+        # spec-verify path).
+        kp = torch.zeros(B * n_blocks * G, Hk, D, dtype=torch.float16, device=device)
+        vp = torch.zeros_like(kp)
+        cu_k = torch.arange(B + 1, dtype=torch.int32, device=device) * (n_blocks * G)
+        _kvarn_build_packed_kv_kernel[(B * n_blocks, Hk)](
+            bt,
+            sl,
+            cu_k,
+            b2s,
+            cache,
+            pool_k,
+            pool_v,
+            kp,
+            vp,
+            bt.stride(0),
+            cache.stride(0),
+            cache.stride(1),
+            pool_k.stride(0),
+            pool_k.stride(1),
+            pool_k.stride(2),
+            kp.stride(0),
+            kp.stride(1),
+            MAX_BLOCKS_PER_REQ=n_blocks,
+            D=D,
+            GROUP=G,
+            K_BITS=cfg.key_bits,
+            V_BITS=cfg.value_bits,
+            NUM_BLOCKS_LOOKUP=B * n_blocks,
+            K_PACKED_OFFSET=cfg.k_packed_offset,
+            K_S_COL_OFFSET=cfg.k_s_col_offset,
+            K_ZP_OFFSET=cfg.k_zp_offset,
+            K_S_ROW_OFFSET=cfg.k_s_row_offset,
+            V_PACKED_OFFSET=cfg.v_packed_offset,
+            V_S_COL_OFFSET=cfg.v_s_col_offset,
+            V_S_ROW_OFFSET=cfg.v_s_row_offset,
+            V_ZP_OFFSET=cfg.v_zp_offset,
+            DPAS_LAYOUT=self._kvarn_dpas_layout,
+            num_warps=4,
+            num_stages=2,
+        )
+        torch.accelerator.synchronize(device)
+
+    def _batch_slot_mapping_cpu(self) -> list[int] | None:
+        """Return the slot_mapping CPU list cached on this step's metadata, or
+        None if unavailable. Looks up via the forward context so we don't need
+        the caller to plumb it through."""
+        try:
+            from vllm.forward_context import get_forward_context
+
+            ctx = get_forward_context()
+        except Exception:
+            return None
+        md = getattr(ctx, "attn_metadata", None)
+        if md is None:
+            return None
+        if isinstance(md, dict):
+            for m in md.values():
+                if isinstance(m, KVarNMetadata):
+                    return m.slot_mapping_cpu
+            return None
+        if isinstance(md, list):
+            for entry in md:
+                if isinstance(entry, dict):
+                    for m in entry.values():
+                        if isinstance(m, KVarNMetadata):
+                            return m.slot_mapping_cpu
+            return None
+        return getattr(md, "slot_mapping_cpu", None)
+
+    def _hadamard(self, device: torch.device) -> torch.Tensor:
+        return _build_hadamard(self.head_size, device)
+
+    def _flat_block(
+        self, kv_cache: torch.Tensor, block_id: int, head: int
+    ) -> torch.Tensor:
+        """Contiguous ``[record_bytes]`` uint8 view for one (block, head).
+
+        ``kv_cache`` has shape ``(num_blocks, num_kv_heads, record_bytes)``,
+        so this selects a single contiguous row — no copy, writes propagate
+        back to the cache tensor.
+        """
+        return kv_cache[block_id, head]
+
+    @staticmethod
+    def _record_cache_view(kv_cache: torch.Tensor) -> torch.Tensor:
+        """Normalize vLLM's logical ``[B,H,1,C]`` view to packed records."""
+        if kv_cache.numel() == 0:
+            # vLLM profiles activation memory before allocating the KV cache
+            # and passes an empty one-dimensional sentinel to every backend.
+            return kv_cache
+        if kv_cache.ndim == 4:
+            if kv_cache.shape[2] != 1:
+                raise ValueError(
+                    "KVarN expects one packed state per kernel block, got "
+                    f"shape {tuple(kv_cache.shape)}"
+                )
+            return kv_cache.squeeze(2)
+        if kv_cache.ndim != 3:
+            raise ValueError(
+                "KVarN expects a [block,head,record] cache, got "
+                f"shape {tuple(kv_cache.shape)}"
+            )
+        return kv_cache
+
+    def _write_packed(
+        self,
+        kv_cache: torch.Tensor,
+        block_id: int,
+        head: int,
+        store_K: dict[str, torch.Tensor],
+        store_V: dict[str, torch.Tensor],
+    ) -> None:
+        cfg = self.kvarn_config
+        flat = self._flat_block(kv_cache, block_id, head)
+
+        # K packed bytes
+        ko = cfg.k_packed_offset
+        flat[ko : ko + cfg.k_packed_bytes] = (
+            store_K["q_packed_uint8"].reshape(-1).to(torch.uint8)
+        )
+        # K s_col, zp (per-channel, length D, fp16)
+        flat[cfg.k_s_col_offset : cfg.k_s_col_offset + cfg.head_dim * 2].view(
+            torch.float16
+        )[:] = store_K["s_col_K"]
+        flat[cfg.k_zp_offset : cfg.k_zp_offset + cfg.head_dim * 2].view(torch.float16)[
+            :
+        ] = store_K["zp_K"]
+        flat[cfg.k_s_row_offset : cfg.k_s_row_offset + cfg.group * 2].view(
+            torch.float16
+        )[:] = store_K["s_row_K"]
+
+        # V packed bytes
+        vo = cfg.v_packed_offset
+        flat[vo : vo + cfg.v_packed_bytes] = (
+            store_V["q_packed_uint8"].reshape(-1).to(torch.uint8)
+        )
+        flat[cfg.v_s_col_offset : cfg.v_s_col_offset + cfg.head_dim * 2].view(
+            torch.float16
+        )[:] = store_V["s_col_V"]
+        flat[cfg.v_s_row_offset : cfg.v_s_row_offset + cfg.group * 2].view(
+            torch.float16
+        )[:] = store_V["s_row_V"]
+        flat[cfg.v_zp_offset : cfg.v_zp_offset + cfg.group * 2].view(torch.float16)[
+            :
+        ] = store_V["zp_V"]
+
+    def _read_block_dequantized(
+        self,
+        kv_cache: torch.Tensor,
+        block_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read a full quantized block and return (K, V) in unrotated frame.
+
+        Returns:
+            K: [group, num_kv_heads, head_dim] fp16
+            V: [group, num_kv_heads, head_dim] fp16
+        """
+        _require_kvarn_dpas_reader(self._kvarn_dpas_layout, False, "Python dequantizer")
+        cfg = self.kvarn_config
+        group = cfg.group
+        D = cfg.head_dim
+        device = kv_cache.device
+
+        K_out = torch.empty(
+            group, self.num_kv_heads, D, dtype=torch.float16, device=device
+        )
+        V_out = torch.empty(
+            group, self.num_kv_heads, D, dtype=torch.float16, device=device
+        )
+
+        H = self._hadamard(device)  # [D, D] fp32
+
+        for h in range(self.num_kv_heads):
+            flat = self._flat_block(kv_cache, block_id, h)
+
+            # K side. K is packed at cfg.key_bits (8 // bits values per byte),
+            # so the per-channel row holds group // pack_k bytes — NOT a fixed
+            # group // 2. (group // 2 only happens to be right for 4-bit K.)
+            pack_k = 8 // cfg.key_bits
+            k_packed = flat[
+                cfg.k_packed_offset : cfg.k_packed_offset + cfg.k_packed_bytes
+            ].view(D, group // pack_k)
+            s_col_K = flat[cfg.k_s_col_offset : cfg.k_s_col_offset + D * 2].view(
+                torch.float16
+            )
+            zp_K = flat[cfg.k_zp_offset : cfg.k_zp_offset + D * 2].view(torch.float16)
+            s_row_K = flat[cfg.k_s_row_offset : cfg.k_s_row_offset + group * 2].view(
+                torch.float16
+            )
+            K_rot_DG = kvarn_dequant_tile_k(
+                k_packed, s_col_K, zp_K, s_row_K, group=group, bits=cfg.key_bits
+            )
+            # Un-rotate: [D, group] → [group, D] (= K rows-tokens),
+            # then ⋅H to undo rotation
+            K_unrot = K_rot_DG.T @ H  # [group, D]
+            K_out[:, h, :] = K_unrot.to(torch.float16)
+
+            # V side. V is packed at cfg.value_bits — for the default k4v2
+            # preset that is 2-bit (4 values per byte), so each token row holds
+            # D // pack_v bytes. The old fixed D // 2 assumed 4-bit V and broke
+            # k4v2 (view size mismatch), which is why this slow gather path had
+            # never worked for the default preset.
+            pack_v = 8 // cfg.value_bits
+            v_packed = flat[
+                cfg.v_packed_offset : cfg.v_packed_offset + cfg.v_packed_bytes
+            ].view(group, D // pack_v)
+            s_col_V = flat[cfg.v_s_col_offset : cfg.v_s_col_offset + D * 2].view(
+                torch.float16
+            )
+            s_row_V = flat[cfg.v_s_row_offset : cfg.v_s_row_offset + group * 2].view(
+                torch.float16
+            )
+            zp_V = flat[cfg.v_zp_offset : cfg.v_zp_offset + group * 2].view(
+                torch.float16
+            )
+            V_rot_GD = kvarn_dequant_tile_v(
+                v_packed, s_col_V, s_row_V, zp_V, head_dim=D, bits=cfg.value_bits
+            )
+            V_unrot = V_rot_GD @ H  # [group, D]
+            V_out[:, h, :] = V_unrot.to(torch.float16)
+
+        return K_out, V_out
+
+    def _flush_tail(self, block_id: int, kv_cache: torch.Tensor) -> None:
+        """Quantize a fully-filled tail buffer and write it into the cache.
+
+        Stage α-2 sparse pool: pool slot = _block_to_slot_dict[block_id].
+        Data is already rotated (rotation happens at do_kv_cache_update),
+        so no `@ H` step here.
+        """
+        cfg = self.kvarn_config
+        cls = type(self)
+        slot = cls._block_to_slot_dict.get(self._group_key, {}).get(block_id)
+        if slot is None:
+            # Block has no pool slot — nothing to flush.
+            self._tails.pop(block_id, None)
+            return
+        K_rot = self._tail_K_pool[slot].float()  # [group, Hk, D]
+        V_rot = self._tail_V_pool[slot].float()  # [group, Hk, D]
+        self._tails.pop(block_id, None)  # drop tracker entry
+
+        # Build batched per-head tiles (rows = absorb axis for each)
+        K_tiles = K_rot.permute(1, 2, 0).contiguous()  # [Hk, D, group]
+        V_tiles = V_rot.permute(1, 0, 2).contiguous()  # [Hk, group, D]
+
+        # Sinkhorn + pack (fused launch when square head_dim==group, else
+        # separate K/V launches — see _sinkhorn_pack_kv).
+        K_out, V_out = _sinkhorn_pack_kv(
+            K_tiles,
+            V_tiles,
+            cfg,
+            cache_layout=self._kvarn_cache_layout,
+        )
+        Hk = self.num_kv_heads
+
+        for h in range(Hk):
+            store_K = {k: v[h] for k, v in K_out.items()}
+            store_V = {k: v[h] for k, v in V_out.items()}
+            self._write_packed(kv_cache, block_id, h, store_K, store_V)
+
+        # NOTE: the pool slot is NOT freed here. The slot index addresses the
+        # SAME row in every layer's pool, so it must stay allocated until ALL
+        # layers have flushed their data into int4. The builder frees it once,
+        # after iterating every impl (see "Free the flushed blocks' slots" in
+        # build()). Freeing here would let layer 0's flush drop the slot, after
+        # which layers 1..N find no slot (`.get()` → None) and silently skip
+        # writing their int4 — corrupting all-but-the-first layer's history.
+
+    @classmethod
+    def _batched_flush(cls, flush_pairs: list) -> None:
+        """Flush many (impl, block_id, kv_cache) tiles to int4.
+
+        Dispatches to the vectorized path (default) or the legacy per-tile path
+        (KVARN_FAST_FLUSH=0, kept for A/B + the tile-dump debug hook). The
+        vectorized path replaces the per-(layer,block,head) Python gather/write
+        loops — which exploded into ~10^5 tiny GPU ops on a synchronized burst
+        (prefill completion, lockstep decode boundary) and dominated build() at
+        high concurrency (~44 ms/step at B=256) — with one
+        index_select gather + one index_copy write per (layer, block-chunk).
+        Numerically identical: same Sinkhorn, same RTN/pack math, same byte
+        layout; only the data movement is batched."""
+        if not flush_pairs:
+            return
+        if (
+            cls._select_flush_writer() == _KVARN_FLUSH_WRITER_REFERENCE
+            and os.environ.get("KVARN_FAST_FLUSH", "1") != "1"
+        ):
+            return cls._batched_flush_legacy(flush_pairs)
+
+        cfg = flush_pairs[0][0].kvarn_config
+        Hk = flush_pairs[0][0].num_kv_heads
+        D = cfg.head_dim
+        G = cfg.group
+        T = cfg.record_bytes
+        kpb = cfg.k_packed_bytes
+        vpb = cfg.v_packed_bytes
+
+        # Group by impl (layer); every impl flushes the SAME block set (the
+        # builder cross-products flush_block_ids with group_impls) and pool slot
+        # indices are shared across layers, so per impl we have (kvc, bids, slots).
+        by_impl: dict = {}
+        for impl, bid, kvc in flush_pairs:
+            slot = cls._block_to_slot_dict.get(impl._group_key, {}).get(bid)
+            if slot is None:
+                impl._tails.pop(bid, None)
+                continue
+            e = by_impl.get(id(impl))
+            if e is None:
+                e = [impl, kvc, [], []]
+                by_impl[id(impl)] = e
+            e[2].append(bid)
+            e[3].append(slot)
+            impl._tails.pop(bid, None)
+        if not by_impl:
+            return
+
+        # Block-chunk so one Sinkhorn launch stays bounded (~2k [R,C] tiles).
+        CHUNK_BLOCKS = max(1, 2048 // max(Hk, 1))
+        materialization = cls._select_flush_index_materialization()
+        shared_indices: dict[tuple, _KVarNFlushDeviceIndices] = {}
+        # Own every device index tensor until all layer writes have been
+        # enqueued. Nothing survives this call, so the next scheduler step
+        # cannot observe stale block ids after allocator recycling.
+        index_owners: list[_KVarNFlushDeviceIndices] = []
+        call_layer_batches = 0
+        call_schedule_groups = 0
+        call_device_materializations = 0
+        call_shared_reuses = 0
+        for impl, kvc, bids, slots in by_impl.values():
+            if kvc is None:
+                continue
+            dev = impl._tail_K_pool.device
+            call_layer_batches += 1
+            schedule_key = None
+            indices = None
+            if materialization == _KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED:
+                schedule_key = (
+                    dev,
+                    impl._group_key,
+                    tuple(bids),
+                    tuple(slots),
+                )
+                indices = shared_indices.get(schedule_key)
+            if indices is None:
+                # One H2D per complete block set, then device slices per chunk.
+                # In shared mode, only an exact group-scoped schedule match can
+                # reuse these tensors across layers.
+                indices = _KVarNFlushDeviceIndices(
+                    block_ids=torch.as_tensor(bids, dtype=torch.long, device=dev),
+                    pool_slots=torch.as_tensor(slots, dtype=torch.long, device=dev),
+                )
+                index_owners.append(indices)
+                call_schedule_groups += 1
+                call_device_materializations += 2
+                if schedule_key is not None:
+                    shared_indices[schedule_key] = indices
+            else:
+                call_shared_reuses += 1
+            for c0 in range(0, len(bids), CHUNK_BLOCKS):
+                bchunk = bids[c0 : c0 + CHUNK_BLOCKS]
+                nB = len(bchunk)
+                slot_t = indices.pool_slots[c0 : c0 + CHUNK_BLOCKS]
+                bid_t = indices.block_ids[c0 : c0 + CHUNK_BLOCKS]
+                # One gather per chunk (was nB tiny .float() ops).
+                K_rot = impl._tail_K_pool.index_select(0, slot_t).float()  # [nB,G,Hk,D]
+                V_rot = impl._tail_V_pool.index_select(0, slot_t).float()
+                # Tiles: K [N, D, G] (absorb=channel), V [N, G, D] (absorb=token).
+                K_tiles = K_rot.permute(0, 2, 3, 1).reshape(nB * Hk, D, G)
+                V_tiles = V_rot.permute(0, 2, 1, 3).reshape(nB * Hk, G, D)
+                if (
+                    getattr(impl, "_kvarn_flush_writer", cls._select_flush_writer())
+                    == _KVARN_FLUSH_WRITER_NATIVE_XE2
+                ):
+                    balanced = _sinkhorn_balance_kv(K_tiles, V_tiles, cfg)
+                    _launch_kvarn_native_balanced_writer(balanced, bid_t, kvc)
+                    continue
+                K_out, V_out = _sinkhorn_pack_kv(
+                    K_tiles,
+                    V_tiles,
+                    cfg,
+                    cache_layout=impl._kvarn_cache_layout,
+                )
+                # Assemble the packed cache record [nB*Hk, tile_bytes] by
+                # concatenating fields in config-offset order (fp16 scales
+                # byte-reinterpreted to uint8), then pad to record_bytes.
+                M = nB * Hk
+                parts = [
+                    K_out["q_packed_uint8"].reshape(M, kpb),
+                    K_out["s_col_K"].contiguous().view(torch.uint8),
+                    K_out["zp_K"].contiguous().view(torch.uint8),
+                    K_out["s_row_K"].contiguous().view(torch.uint8),
+                    V_out["q_packed_uint8"].reshape(M, vpb),
+                    V_out["s_col_V"].contiguous().view(torch.uint8),
+                    V_out["s_row_V"].contiguous().view(torch.uint8),
+                    V_out["zp_V"].contiguous().view(torch.uint8),
+                ]
+                rec = torch.cat(parts, dim=1)  # [M, tile_bytes]
+                if rec.shape[1] < T:
+                    rec = torch.nn.functional.pad(rec, (0, T - rec.shape[1]))
+                # One scatter per chunk (was nB*Hk _write_packed calls).
+                kvc[bid_t] = rec.view(nB, Hk, T)
+
+        call_counters = {
+            "flush_calls": 1,
+            "layer_batches": call_layer_batches,
+            "schedule_groups": call_schedule_groups,
+            "device_index_tensor_materializations": call_device_materializations,
+            "shared_layer_reuses": call_shared_reuses,
+        }
+        for key, value in call_counters.items():
+            cls._flush_index_counters[key] = (
+                cls._flush_index_counters.get(key, 0) + value
+            )
+        logger.info_once(
+            "[KVARN_FLUSH_INDEX] selected=%s; first_flush_layer_batches=%d; "
+            "first_flush_schedule_groups=%d; "
+            "first_flush_device_index_tensor_materializations=%d; "
+            "first_flush_shared_layer_reuses=%d",
+            materialization,
+            call_layer_batches,
+            call_schedule_groups,
+            call_device_materializations,
+            call_shared_reuses,
+        )
+        cumulative = cls.flush_index_materialization_counters()
+        logger.debug(
+            "[KVARN_FLUSH_INDEX_COUNTER] selected=%s; flush_calls=%d; "
+            "layer_batches=%d; schedule_groups=%d; "
+            "device_index_tensor_materializations=%d; shared_layer_reuses=%d",
+            materialization,
+            cumulative["flush_calls"],
+            cumulative["layer_batches"],
+            cumulative["schedule_groups"],
+            cumulative["device_index_tensor_materializations"],
+            cumulative["shared_layer_reuses"],
+        )
+
+    @classmethod
+    def _batched_flush_legacy(cls, flush_pairs: list) -> None:
+        """Flush many (impl, block_id, kv_cache) tiles via batched Sinkhorn + RTN.
+
+        Replaces the per-(layer, block) Python loop calling `_flush_tail`. At
+        burst with many layers × many lockstep boundary crossings, the per-call
+        kernel-launch + Python-iter overhead dominated; Sinkhorn and the RTN-
+        pack are per-tile-independent, so stacking is numerically identical
+        (no accuracy change).
+
+        Chunked at CHUNK_PAIRS to bound the transient gather memory — at peak
+        (48 layers × ~73 lockstep reqs = ~3.5k pairs), the unchunked stack hits
+        >2 GB of fp32 working memory and OOMs on a memory-tight burst.
+        """
+        if not flush_pairs:
+            return
+        CHUNK_PAIRS = 256
+        cfg = flush_pairs[0][0].kvarn_config
+        Hk = flush_pairs[0][0].num_kv_heads
+        # Pre-filter pairs that still have a pool slot (some may have been freed
+        # by a sibling impl's flush already during this builder call).
+        filt: list[tuple] = []
+        for impl, bid, kvc in flush_pairs:
+            slot = cls._block_to_slot_dict.get(impl._group_key, {}).get(bid)
+            if slot is None:
+                impl._tails.pop(bid, None)
+                continue
+            filt.append((impl, bid, kvc, slot))
+            impl._tails.pop(bid, None)
+        if not filt:
+            return
+        for c0 in range(0, len(filt), CHUNK_PAIRS):
+            chunk = filt[c0 : c0 + CHUNK_PAIRS]
+            N = len(chunk)
+            # Gather pool data for this chunk.
+            K_list = [
+                impl._tail_K_pool[slot].float() for impl, _, _, slot in chunk
+            ]  # [G, Hk, D]
+            V_list = [impl._tail_V_pool[slot].float() for impl, _, _, slot in chunk]
+            K_stack = torch.stack(K_list, dim=0)  # [N, G, Hk, D]
+            V_stack = torch.stack(V_list, dim=0)
+            # Optional: dump first chunk's raw (pre-Sinkhorn) tiles for outlier
+            # analysis (KVARN_DUMP_TILES=/path/to/file.pt).
+            dump_path = os.environ.get("KVARN_DUMP_TILES", "")
+            if dump_path and not getattr(cls, "_tiles_dumped", False):
+                cls._tiles_dumped = True
+                # Capture per-tile (layer_idx, block_id) for per-layer analysis.
+                # layer_idx pulled from impl.layer_name
+                # (e.g. "model.layers.7.self_attn")
+                # via a regex fallback to enumerate index if name parsing fails.
+                import regex as re
+
+                lyr_ids, blk_ids = [], []
+                for impl, bid, _, _ in chunk:
+                    name = getattr(impl, "layer_name", "") or ""
+                    m = re.search(r"layers\.(\d+)\b", name)
+                    lyr_ids.append(int(m.group(1)) if m else -1)
+                    blk_ids.append(int(bid))
+                torch.save(
+                    {
+                        "K_stack": K_stack.detach().cpu(),
+                        "V_stack": V_stack.detach().cpu(),
+                        "layer_ids": lyr_ids,
+                        "block_ids": blk_ids,
+                        "Hk": flush_pairs[0][0].num_kv_heads,
+                        "G": cfg.group,
+                        "D": cfg.head_dim,
+                        "key_bits": cfg.key_bits,
+                        "value_bits": cfg.value_bits,
+                        "sinkhorn_iters": cfg.sinkhorn_iters,
+                    },
+                    dump_path,
+                )
+                print(
+                    f"[KVARN] dumped {N} (layer,block) pre-Sinkhorn tiles "
+                    f"→ {dump_path}",
+                    flush=True,
+                )
+                print(f"[KVARN] layer_ids in dump: {sorted(set(lyr_ids))}", flush=True)
+            del K_list, V_list
+            # K tile per Sinkhorn batch row: [D, G] (absorb = channel).
+            K_tiles = K_stack.permute(0, 2, 3, 1).reshape(
+                N * Hk, K_stack.shape[3], K_stack.shape[1]
+            )
+            V_tiles = V_stack.permute(0, 2, 1, 3).reshape(
+                N * Hk, V_stack.shape[1], V_stack.shape[3]
+            )
+            del K_stack, V_stack
+            # Sinkhorn + pack (fused when square head_dim==group, else separate
+            # K/V launches for non-square head_dim=256 — see _sinkhorn_pack_kv).
+            cache_layout = chunk[0][0]._kvarn_cache_layout
+            if any(impl._kvarn_cache_layout != cache_layout for impl, *_ in chunk):
+                raise RuntimeError(
+                    "Cannot batch KVarN flushes across different cache layouts"
+                )
+            K_out, V_out = _sinkhorn_pack_kv(
+                K_tiles,
+                V_tiles,
+                cfg,
+                cache_layout=cache_layout,
+            )
+            del K_tiles, V_tiles
+            # Distribute packed results to each (layer, block, head) cache slot.
+            for i, (impl, bid, kvc, _) in enumerate(chunk):
+                for h in range(Hk):
+                    idx = i * Hk + h
+                    store_K = {k: v[idx] for k, v in K_out.items()}
+                    store_V = {k: v[idx] for k, v in V_out.items()}
+                    impl._write_packed(kvc, bid, h, store_K, store_V)
+            del K_out, V_out
+
+    # ── do_kv_cache_update ───────────────────────────────────────────────────
+
+    def configure_fused_qkv_cache_update(self, layer_name: str) -> bool:
+        """Freeze the selected Q/K/V frontend for this attention layer."""
+        if self._kvarn_frontend_bound:
+            if layer_name != self.layer_name:
+                raise RuntimeError(
+                    "KVarN frontend layer binding is immutable: "
+                    f"configured for {self.layer_name!r}, got {layer_name!r}"
+                )
+            return self.use_fused_qkv_cache_update
+
+        self.layer_name = layer_name
+        self.use_fused_qkv_cache_update = self._kvarn_frontend_variant in {
+            KVARN_FRONTEND_QKV_SCATTER,
+            KVARN_FRONTEND_QKV_SCATTER_INLINE,
+            KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
+        } and kvarn_native_layer_selected(
+            layer_name, os.environ.get("KVARN_NATIVE_XPU_LAYER", "")
+        )
+        self.use_inline_qkv_cache_update = (
+            self.use_fused_qkv_cache_update
+            and self._kvarn_frontend_variant
+            in {
+                KVARN_FRONTEND_QKV_SCATTER_INLINE,
+                KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
+            }
+        )
+        self._kvarn_frontend_bound = True
+        logger.info(
+            "[KVARN_FRONTEND] configured=%s; layer=%s; selected=%s; "
+            "native_op=%s; fallback=reference; immutable for engine lifetime",
+            self._kvarn_frontend_variant,
+            layer_name,
+            self.use_fused_qkv_cache_update,
+            (
+                self._kvarn_qkv_scatter_op_name
+                if self.use_fused_qkv_cache_update
+                else "none"
+            ),
+        )
+        if self.use_inline_qkv_cache_update:
+            logger.info(
+                "[KVARN_FRONTEND_INLINE] configured=%s; layer=%s; "
+                "route=single_attention_context; "
+                "native_op=%s; "
+                "immutable for engine lifetime",
+                self._kvarn_frontend_variant,
+                layer_name,
+                self._kvarn_qkv_scatter_op_name,
+            )
+        return self.use_fused_qkv_cache_update
+
+    def _fused_qkv_signature(self, query: torch.Tensor, attn_metadata) -> tuple:
+        """Identify the exact eager Q tensor and pool binding just updated."""
+        return (
+            query.data_ptr(),
+            tuple(query.shape),
+            tuple(query.stride()),
+            query.dtype,
+            query.device,
+            id(attn_metadata),
+            getattr(self, "_group_key", None),
+            getattr(self, "_pool_ready_key", None),
+        )
+
+    def _consume_fused_qkv_rotation(self, query: torch.Tensor, attn_metadata) -> bool:
+        pending = getattr(self, "_pending_fused_qkv_signature", None)
+        self._pending_fused_qkv_signature = None
+        return pending == self._fused_qkv_signature(query, attn_metadata)
+
+    def _native_qkv_scatter_eligible(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata,
+    ) -> bool:
+        """Fail-closed eligibility for the narrow eager Xe2 fused frontend."""
+        if (
+            not self.use_fused_qkv_cache_update
+            or attn_metadata is None
+            or slot_mapping.ndim != 1
+        ):
+            return False
+
+        N = slot_mapping.shape[0]
+        cfg = self.kvarn_config
+        q_rot = self._q_rot_fp16_buf
+        block_to_slot = self._block_to_slot_t
+        tail_key = self._tail_K_pool
+        tail_value = self._tail_V_pool
+        if not all(
+            isinstance(tensor, torch.Tensor)
+            for tensor in (q_rot, block_to_slot, tail_key, tail_value)
+        ):
+            return False
+
+        is_capturing = (
+            query.device.type == "xpu" and torch.xpu.is_current_stream_capturing()
+        )
+        return (
+            _is_pure_kvarn_decode_step(attn_metadata, N)
+            and kvarn_native_store_supported(
+                device_type=query.device.type,
+                num_tokens=N,
+                num_query_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_size,
+                group=cfg.group,
+                key_bits=cfg.key_bits,
+                value_bits=cfg.value_bits,
+                record_bytes=cfg.record_bytes,
+                sliding_window=int(self.sliding_window or 0),
+                key_dtype=key.dtype,
+                value_dtype=value.dtype,
+                has_lookup=True,
+                has_tail_pool=True,
+                is_capturing=is_capturing,
+                op_available=(
+                    self._kvarn_qkv_scatter_op is not None
+                    and kvarn_native_decode_abi_supported(False)
+                    and kvarn_native_layout_abi_supported(
+                        self._kvarn_qkv_scatter_op_name
+                    )
+                ),
+            )
+            and query.dtype == key.dtype
+            and key.dtype == value.dtype
+            and query.dtype in (torch.float16, torch.bfloat16)
+            and query.device == key.device == value.device
+            and query.ndim == 3
+            and query.shape[0] >= N
+            and query.shape[1:] == (self.num_heads, self.head_size)
+            and key.ndim == 3
+            and key.shape[0] >= N
+            and key.shape[1:] == (self.num_kv_heads, self.head_size)
+            and value.ndim == 3
+            and value.shape == key.shape
+            and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+            and slot_mapping.dtype == torch.int64
+            and slot_mapping.is_contiguous()
+            and slot_mapping.device == query.device
+            and block_to_slot.ndim == 1
+            and block_to_slot.dtype == torch.int32
+            and block_to_slot.is_contiguous()
+            and block_to_slot.device == query.device
+            and tail_key.ndim == 4
+            and tail_value.ndim == 4
+            and tail_key.dtype == torch.float16
+            and tail_value.dtype == torch.float16
+            and tail_key.shape == tail_value.shape
+            and tail_key.shape[1:] == (cfg.group, self.num_kv_heads, self.head_size)
+            and tail_key.stride() == tail_value.stride()
+            and tail_key.stride(-1) == 1
+            and tail_key.device == query.device
+            and tail_value.device == query.device
+            and q_rot.ndim == 2
+            and q_rot.dtype == torch.float16
+            and q_rot.shape[0] >= N * self.num_heads
+            and q_rot.shape[1] == self.head_size
+            and q_rot.is_contiguous()
+            and q_rot.device == query.device
+        )
+
+    def _launch_native_qkv_scatter(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        N = slot_mapping.shape[0]
+        if self._kvarn_qkv_scatter_op is None:
+            raise RuntimeError(
+                f"KVarN QKV scatter op {self._kvarn_qkv_scatter_op_name!r} "
+                "is unavailable"
+            )
+        self._kvarn_qkv_scatter_op(
+            query[:N],
+            key[:N],
+            value[:N],
+            slot_mapping[:N],
+            self._block_to_slot_t,
+            self._q_rot_fp16_buf[: N * self.num_heads].view(
+                N, self.num_heads, self.head_size
+            ),
+            self._tail_K_pool,
+            self._tail_V_pool,
+            self.kvarn_config.group,
+            self._kvarn_dpas_layout,
+        )
+        if not getattr(self, "_native_qkv_scatter_active_logged", False):
+            logger.info_once(
+                "[KVARN_FRONTEND] active=qkv_scatter; "
+                "layer=%s; native_op=%s; "
+                "qlen=1; cache_layout=%s",
+                getattr(self, "layer_name", ""),
+                self._kvarn_qkv_scatter_op_name,
+                self._kvarn_cache_layout,
+            )
+            self._native_qkv_scatter_active_logged = True
+
+    def _capture_trusted_inline_pool_receipt(
+        self, device: torch.device, lookup_capacity: int
+    ) -> _KVarNTrustedInlinePoolReceipt | None:
+        """Snapshot the pool bindings consumed by the trusted inline route."""
+        cls = type(self)
+        mirror_key = (device, self._group_key)
+        shared_key = (device, self.kvarn_config.head_dim, self.num_kv_heads)
+        block_to_slot = cls._block_to_slot_t_per_device.get(mirror_key)
+        is_sink = cls._is_sink_t_per_device.get(mirror_key)
+        q_rot_fp16 = cls._shared_q_rot_fp16_buf.get(shared_key)
+        fused_output = cls._shared_fused_out_buf.get(shared_key)
+        native_output_fp16 = cls._shared_native_output_fp16_buf.get(shared_key)
+        native_scratch_key = self._pool_ready_native_key
+        native_scratch = self._native_decode_scratch
+        mirror_epoch = cls._pool_mirror_epochs.get(mirror_key, -1)
+        shared_epoch = cls._pool_shared_epochs.get(shared_key, -1)
+        if (
+            mirror_epoch < 0
+            or shared_epoch < 0
+            or self._pool_ready_process_generation != cls._process_generation
+            or self._pool_ready_mirror_epoch != mirror_epoch
+            or self._pool_ready_shared_epoch != shared_epoch
+            or self._pool_ready_key != mirror_key
+            or self._pool_ready_env != self._kvarn_pool_runtime_policy
+            or block_to_slot is None
+            or is_sink is None
+            or q_rot_fp16 is None
+            or fused_output is None
+            or native_output_fp16 is None
+            or self._block_to_slot_t is not block_to_slot
+            or self._is_sink_t is not is_sink
+            or self._q_rot_fp16_buf is not q_rot_fp16
+            or self._fused_out_buf is not fused_output
+            or self._native_output_fp16_buf is not native_output_fp16
+            or self._block_lookup_size < lookup_capacity
+            or block_to_slot.shape[0] < lookup_capacity
+            or (
+                native_scratch_key is not None
+                and native_scratch
+                is not cls._shared_native_decode_scratch.get(native_scratch_key)
+            )
+        ):
+            return None
+        return _KVarNTrustedInlinePoolReceipt(
+            mirror_key=mirror_key,
+            shared_key=shared_key,
+            mirror_epoch=mirror_epoch,
+            shared_epoch=shared_epoch,
+            runtime_policy=self._kvarn_pool_runtime_policy,
+            lookup_capacity=lookup_capacity,
+            block_to_slot=block_to_slot,
+            is_sink=is_sink,
+            tail_key=self._tail_K_pool,
+            tail_value=self._tail_V_pool,
+            q_rot_fp16=q_rot_fp16,
+            fused_output=fused_output,
+            native_output_fp16=native_output_fp16,
+            native_scratch_key=native_scratch_key,
+            native_scratch=native_scratch,
+        )
+
+    def _trusted_inline_pool_receipt_is_current(
+        self, receipt: _KVarNTrustedInlinePoolReceipt | None
+    ) -> bool:
+        """Validate epochs, capacity, and exact bindings without a full scan."""
+        if receipt is None:
+            return False
+        cls = type(self)
+        return (
+            receipt.runtime_policy == self._kvarn_pool_runtime_policy
+            and self._pool_ready_process_generation == cls._process_generation
+            and self._pool_ready_key == receipt.mirror_key
+            and self._pool_ready_env == receipt.runtime_policy
+            and self._pool_ready_mirror_epoch == receipt.mirror_epoch
+            and self._pool_ready_shared_epoch == receipt.shared_epoch
+            and cls._pool_mirror_epochs.get(receipt.mirror_key, -1)
+            == receipt.mirror_epoch
+            and cls._pool_shared_epochs.get(receipt.shared_key, -1)
+            == receipt.shared_epoch
+            and self._block_lookup_size >= receipt.lookup_capacity
+            and receipt.block_to_slot.shape[0] >= receipt.lookup_capacity
+            and self._block_to_slot_t is receipt.block_to_slot
+            and self._is_sink_t is receipt.is_sink
+            and cls._block_to_slot_t_per_device.get(receipt.mirror_key)
+            is receipt.block_to_slot
+            and cls._is_sink_t_per_device.get(receipt.mirror_key) is receipt.is_sink
+            and self._tail_K_pool is receipt.tail_key
+            and self._tail_V_pool is receipt.tail_value
+            and self._q_rot_fp16_buf is receipt.q_rot_fp16
+            and self._fused_out_buf is receipt.fused_output
+            and self._native_output_fp16_buf is receipt.native_output_fp16
+            and cls._shared_q_rot_fp16_buf.get(receipt.shared_key) is receipt.q_rot_fp16
+            and cls._shared_fused_out_buf.get(receipt.shared_key)
+            is receipt.fused_output
+            and cls._shared_native_output_fp16_buf.get(receipt.shared_key)
+            is receipt.native_output_fp16
+            and self._pool_ready_native_key == receipt.native_scratch_key
+            and self._native_decode_scratch is receipt.native_scratch
+            and (
+                receipt.native_scratch_key is None
+                or cls._shared_native_decode_scratch.get(receipt.native_scratch_key)
+                is receipt.native_scratch
+            )
+        )
+
+    def _trusted_qlen1_inline_inputs_valid(
+        self,
+        plan: _KVarNTrustedQlen1InlinePlan,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata,
+        output: torch.Tensor,
+    ) -> bool:
+        """Check only step-varying facts not covered by the cached plan."""
+        generation_is_current = (
+            plan.process_generation == type(self)._process_generation
+        )
+        pool_is_current = self._trusted_inline_pool_receipt_is_current(
+            plan.pool_receipt
+        )
+        if not generation_is_current or not pool_is_current:
+            return False
+        if kv_cache is not plan.cache_owner or query.device != plan.device:
+            return False
+        if slot_mapping.ndim != 1:
+            return False
+        num_tokens = slot_mapping.shape[0]
+        if (
+            not _is_pure_kvarn_decode_step(attn_metadata, num_tokens)
+            or not 1 <= num_tokens <= plan.native_decode.max_batch
+        ):
+            return False
+        if not all(
+            isinstance(tensor, torch.Tensor)
+            for tensor in (
+                query,
+                key,
+                value,
+                slot_mapping,
+                output,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+            )
+        ):
+            return False
+        return (
+            query.dtype == key.dtype == value.dtype == plan.activation_dtype
+            and query.device == key.device == value.device == slot_mapping.device
+            and output.device == query.device
+            and output.dtype in (torch.float16, torch.bfloat16)
+            and query.ndim == key.ndim == value.ndim == output.ndim == 3
+            and query.shape[0] >= num_tokens
+            and key.shape[0] >= num_tokens
+            and value.shape[0] >= num_tokens
+            and output.shape[0] >= num_tokens
+            and query.shape[1:] == (self.num_heads, self.head_size)
+            and key.shape[1:] == (self.num_kv_heads, self.head_size)
+            and value.shape[1:] == key.shape[1:]
+            and output.shape[1:] == query.shape[1:]
+            and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+            and output.is_contiguous()
+            and slot_mapping.dtype == torch.int64
+            and slot_mapping.is_contiguous()
+            and attn_metadata.block_table[:num_tokens].is_contiguous()
+            and attn_metadata.seq_lens[:num_tokens].is_contiguous()
+            and int(attn_metadata.max_seq_len) >= 1
+        )
+
+    def forward_trusted_qlen1_inline(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+        output: torch.Tensor,
+    ) -> bool:
+        """Run the opt-in native qlen=1 frontend and decode from one proof."""
+        if (
+            getattr(
+                self,
+                "_kvarn_qlen1_inline_plan",
+                _KVARN_QLEN1_INLINE_PLAN_REFERENCE,
+            )
+            != _KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE
+        ):
+            return False
+
+        plan = self._trusted_qlen1_inline_bound
+        if plan is None:
+            cache_view = self._record_cache_view(kv_cache)
+            if (
+                cache_view.numel() == 0
+                or cache_view.shape[-1] != self.kvarn_config.record_bytes
+            ):
+                return False
+            self._ensure_pool(query.device, num_blocks_hint=cache_view.shape[0])
+            if not self._native_qkv_scatter_eligible(
+                layer, query, key, value, slot_mapping, attn_metadata
+            ):
+                return False
+            native_decode = build_kvarn_trusted_native_decode_plan(
+                query,
+                cache_view,
+                self.kvarn_config,
+                self,
+                attn_metadata,
+            )
+            if native_decode is None:
+                return False
+            pool_receipt = self._capture_trusted_inline_pool_receipt(
+                query.device, cache_view.shape[0]
+            )
+            if pool_receipt is None:
+                return False
+            plan = _KVarNTrustedQlen1InlinePlan(
+                process_generation=type(self)._process_generation,
+                cache_owner=kv_cache,
+                cache_view=cache_view,
+                device=query.device,
+                activation_dtype=query.dtype,
+                native_decode=native_decode,
+                pool_receipt=pool_receipt,
+            )
+            self._trusted_qlen1_inline_bound = plan
+            self._kv_cache_ref = cache_view
+
+        if not self._trusted_qlen1_inline_inputs_valid(
+            plan,
+            query,
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            attn_metadata,
+            output,
+        ):
+            self._trusted_qlen1_inline_bound = None
+            return False
+
+        self._pending_fused_qkv_signature = None
+        self._launch_native_qkv_scatter(query, key, value, slot_mapping)
+        num_tokens = slot_mapping.shape[0]
+        q = query[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
+        direct_output = output[:num_tokens]
+        attn_out = self._decode_path(
+            q,
+            plan.cache_view,
+            attn_metadata,
+            output=direct_output,
+            query_rotation_precomputed=True,
+            trusted_native_plan=plan.native_decode,
+        )
+        if attn_out is not direct_output:
+            direct_output.copy_(attn_out)
+        if not self._trusted_qlen1_inline_execution_logged:
+            logger.info(
+                "[KVARN_TRUSTED_QLEN1_INLINE] active=trusted_native; "
+                "layer=%s; cached=pool_ready+cache_abi+qkv_eligibility+"
+                "decode_eligibility; fallback=reference",
+                getattr(self, "layer_name", ""),
+            )
+            self._trusted_qlen1_inline_execution_logged = True
+        return True
+
+    def _bind_bound_qlen1_inline_v2_plan(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+        output: torch.Tensor,
+    ) -> _KVarNBoundQlen1InlinePlanV2 | None:
+        if (
+            type(attn_metadata) is not KVarNMetadata
+            or attn_metadata.qlen1_dispatch_kind
+            is not _KVarNQlen1MetadataKind.EAGER_PURE_DECODE
+        ):
+            return None
+        batch_size = attn_metadata.num_actual_tokens
+        if (
+            slot_mapping.ndim != 1
+            or slot_mapping.shape[0] != batch_size
+            or output.dtype != query.dtype
+            or output.device != query.device
+            or not output.is_contiguous()
+            or not (
+                output.ndim == 3
+                and output.shape[0] >= batch_size
+                and output.shape[1:] == (self.num_heads, self.head_size)
+                or output.ndim == 2
+                and output.shape[0] >= batch_size
+                and output.shape[1] == self.num_heads * self.head_size
+            )
+        ):
+            return None
+
+        cache_view = self._record_cache_view(kv_cache)
+        if (
+            cache_view.numel() == 0
+            or cache_view.shape[-1] != self.kvarn_config.record_bytes
+        ):
+            return None
+        self._ensure_pool(query.device, num_blocks_hint=cache_view.shape[0])
+        if not self._native_qkv_scatter_eligible(
+            layer, query, key, value, slot_mapping, attn_metadata
+        ):
+            return None
+        native_decode = build_kvarn_trusted_native_decode_plan(
+            query,
+            cache_view,
+            self.kvarn_config,
+            self,
+            attn_metadata,
+        )
+        if native_decode is None:
+            return None
+        if (
+            self._beta_native_scratch_spec(query.device) is not None
+            and not native_decode.use_scratch_op
+        ):
+            raise RuntimeError(
+                "XPU KVarN beta Variant H requires native scratch decode; "
+                "refusing to cache a downgraded no-scratch plan"
+            )
+        qualified_batch_limit = min(
+            native_decode.max_batch,
+            int(getattr(self, "_max_num_seqs", native_decode.max_batch)),
+        )
+        if not 1 <= batch_size <= qualified_batch_limit:
+            return None
+
+        self._bind_bound_qlen1_inline_v2_cache(cache_view)
+        bound_native_decode = KVarNBoundNativeDecodePlanV2(
+            max_batch=qualified_batch_limit,
+            dpas_layout=self._kvarn_dpas_layout,
+            q_rot_fp16=self._q_rot_fp16_buf,
+            fused_out=self._fused_out_buf,
+            native_output_fp16=self._native_output_fp16_buf,
+            native_scratch=self._native_decode_scratch,
+            block_to_slot=self._block_to_slot_t,
+            tail_key=self._tail_K_pool,
+            tail_value=self._tail_V_pool,
+            use_native_hadamard=native_decode.use_native_hadamard,
+            use_scratch_op=native_decode.use_scratch_op,
+            output_hadamard_supported=native_decode.output_hadamard_supported,
+            direct_bf16_output=(
+                output.dtype == torch.bfloat16 and native_decode.bf16_output_supported
+            ),
+            max_splits=self._kvarn_native_max_splits,
+            split_policy=self._kvarn_native_split_policy,
+            kernel_variant=self._kvarn_native_kernel_variant,
+        )
+        return _KVarNBoundQlen1InlinePlanV2(
+            process_generation=type(self)._process_generation,
+            binding_epoch=self._bound_qlen1_inline_v2_binding_epoch,
+            cache_owner=kv_cache,
+            cache_view=cache_view,
+            device=query.device,
+            activation_dtype=query.dtype,
+            cache_layout=self._kvarn_cache_layout,
+            record_bytes=self.kvarn_config.record_bytes,
+            split_policy=self._kvarn_native_split_policy,
+            max_splits=self._kvarn_native_max_splits,
+            kernel_variant=self._kvarn_native_kernel_variant,
+            output_dtype=output.dtype,
+            qualified_batch_limit=qualified_batch_limit,
+            native_decode=bound_native_decode,
+        )
+
+    def _bound_qlen1_inline_v2_hot_path_is_current(
+        self,
+        plan: _KVarNBoundQlen1InlinePlanV2,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+    ) -> bool:
+        # Q/K/V/output schema belongs to the immutable Attention instance and
+        # was qualified when the plan was bound. Only scheduler-owned facts and
+        # replaceable cache/pool bindings remain dynamic here.
+        if type(attn_metadata) is not KVarNMetadata or slot_mapping.ndim != 1:
+            return False
+        batch_size = attn_metadata.num_actual_tokens
+        bindings_are_current = (
+            plan.process_generation == type(self)._process_generation
+            and plan.binding_epoch == self._bound_qlen1_inline_v2_binding_epoch
+            and kv_cache is plan.cache_owner
+            and attn_metadata.qlen1_dispatch_kind
+            is _KVarNQlen1MetadataKind.EAGER_PURE_DECODE
+            and batch_size == slot_mapping.shape[0]
+            and 1 <= batch_size <= plan.qualified_batch_limit
+        )
+        return bindings_are_current
+
+    def forward_bound_qlen1_inline_v2(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+        output: torch.Tensor,
+    ) -> bool:
+        """Run Variant H after one fail-closed qualification pass."""
+        if not self.use_bound_qlen1_inline_plan_v2:
+            return False
+
+        plan = self._bound_qlen1_inline_v2_plan
+        if plan is None:
+            plan = self._bind_bound_qlen1_inline_v2_plan(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+                attn_metadata,
+                output,
+            )
+            if plan is None:
+                return False
+            self._bound_qlen1_inline_v2_plan = plan
+        if not self._bound_qlen1_inline_v2_hot_path_is_current(
+            plan, kv_cache, slot_mapping, attn_metadata
+        ):
+            return False
+
+        self._pending_fused_qkv_signature = None
+        self._launch_native_qkv_scatter(query, key, value, slot_mapping)
+        batch_size = attn_metadata.num_actual_tokens
+        q = query[:batch_size].view(batch_size, self.num_heads, self.head_size)
+        direct_output = output[:batch_size]
+        if output.ndim != 3:
+            direct_output = direct_output.view(
+                batch_size, self.num_heads, self.head_size
+            )
+        attn_out = self._decode_path(
+            q,
+            plan.cache_view,
+            attn_metadata,
+            output=direct_output,
+            query_rotation_precomputed=True,
+            bound_native_plan_v2=plan.native_decode,
+        )
+        if attn_out is not direct_output:
+            direct_output.copy_(attn_out)
+        if not self._bound_qlen1_inline_v2_execution_logged:
+            native_splits = kvarn_native_split_count(
+                int(attn_metadata.max_seq_len),
+                plan.native_decode.max_splits,
+                batch_size=batch_size,
+                split_policy=plan.native_decode.split_policy,
+                kernel_variant=plan.native_decode.kernel_variant,
+            )
+            logger.info(
+                "[KVARN_BOUND_QLEN1_INLINE] active=bound_native_v2; variant=H; "
+                "Using the native Xe2 KVarN qlen=1 decoder (batch limit %d; "
+                "native H256 transforms=%s; fused output H256=%s; "
+                "direct bf16 output=%s; cache layout=%s; splits=%d); "
+                "hot_guards=process_generation+binding_epoch+cache_identity+"
+                "metadata_kind+batch_limit; fp16_contract=exact; "
+                "fallback=reference; layer=%s",
+                plan.qualified_batch_limit,
+                plan.native_decode.use_native_hadamard,
+                (native_splits > 1 and plan.native_decode.output_hadamard_supported),
+                (
+                    native_splits > 1
+                    and plan.native_decode.output_hadamard_supported
+                    and plan.native_decode.direct_bf16_output
+                ),
+                plan.cache_layout,
+                native_splits,
+                getattr(self, "layer_name", ""),
+            )
+            self._bound_qlen1_inline_v2_execution_logged = True
+        return True
+
+    def _native_prefill_scatter_eligible(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata,
+    ) -> bool:
+        """Fail-closed eligibility for the opt-in multi-token Xe2 writer."""
+        if (
+            self._kvarn_prefill_store_variant != KVARN_PREFILL_STORE_HADAMARD_SCATTER
+            or slot_mapping.ndim != 1
+            or not _is_pure_kvarn_prefill_step(attn_metadata, slot_mapping.shape[0])
+        ):
+            return False
+
+        num_tokens = slot_mapping.shape[0]
+        cfg = self.kvarn_config
+        block_to_slot = self._block_to_slot_t
+        tail_key = self._tail_K_pool
+        tail_value = self._tail_V_pool
+        if not all(
+            isinstance(tensor, torch.Tensor)
+            for tensor in (block_to_slot, tail_key, tail_value)
+        ):
+            return False
+
+        is_capturing = (
+            key.device.type == "xpu" and torch.xpu.is_current_stream_capturing()
+        )
+        return (
+            kvarn_native_prefill_store_supported(
+                device_type=key.device.type,
+                num_tokens=num_tokens,
+                num_query_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_size,
+                group=cfg.group,
+                key_bits=cfg.key_bits,
+                value_bits=cfg.value_bits,
+                record_bytes=cfg.record_bytes,
+                sliding_window=int(self.sliding_window or 0),
+                key_dtype=key.dtype,
+                value_dtype=value.dtype,
+                has_lookup=True,
+                has_tail_pool=True,
+                is_capturing=is_capturing,
+                op_available=kvarn_native_layout_abi_supported(
+                    "kvarn_hadamard_scatter"
+                ),
+            )
+            and kvarn_native_layer_selected(
+                getattr(self, "layer_name", ""),
+                os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
+            )
+            and key.ndim == 3
+            and key.shape[0] >= num_tokens
+            and key.shape[1:] == (self.num_kv_heads, self.head_size)
+            and value.ndim == 3
+            and value.shape == key.shape
+            and key.stride(-1) == value.stride(-1) == 1
+            and key.device == value.device
+            and slot_mapping.dtype == torch.int64
+            and slot_mapping.is_contiguous()
+            and slot_mapping.device == key.device
+            and block_to_slot.ndim == 1
+            and block_to_slot.dtype == torch.int32
+            and block_to_slot.is_contiguous()
+            and block_to_slot.device == key.device
+            and tail_key.ndim == 4
+            and tail_value.ndim == 4
+            and tail_key.dtype == torch.float16
+            and tail_value.dtype == torch.float16
+            and tail_key.shape == tail_value.shape
+            and tail_key.shape[1:] == (cfg.group, self.num_kv_heads, self.head_size)
+            and tail_key.stride() == tail_value.stride()
+            and tail_key.stride(-1) == 1
+            and tail_key.device == key.device
+            and tail_value.device == key.device
+        )
+
+    def _launch_native_prefill_scatter(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        num_tokens = slot_mapping.shape[0]
+        torch.ops._vllm_fa2_C.kvarn_hadamard_scatter(
+            key[:num_tokens],
+            value[:num_tokens],
+            slot_mapping[:num_tokens],
+            self._block_to_slot_t,
+            self._tail_K_pool,
+            self._tail_V_pool,
+            self.kvarn_config.group,
+            self._kvarn_dpas_layout,
+        )
+
+    def do_qkv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Fuse eager qlen=1 Q rotation with native K/V tail scatter."""
+        self._pending_fused_qkv_signature = None
+        kv_cache = self._record_cache_view(kv_cache)
+        N = slot_mapping.shape[0]
+        if N <= 0:
+            return
+        self._ensure_pool(query.device, num_blocks_hint=kv_cache.shape[0])
+        attn_metadata = _active_kvarn_metadata(layer)
+        if self._native_qkv_scatter_eligible(
+            layer, query, key, value, slot_mapping, attn_metadata
+        ):
+            self._launch_native_qkv_scatter(query, key, value, slot_mapping)
+            self._pending_fused_qkv_signature = self._fused_qkv_signature(
+                query, attn_metadata
+            )
+            return
+
+        self.do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Append incoming tokens to the per-block fp16 tail buffers.
+
+        We DO NOT flush here. Flushing requires the block_table (to know
+        which block IDs are "sink" blocks for each request), which is only
+        available via ``attn_metadata`` in ``forward()``. The flush is
+        therefore deferred to ``_flush_eligible_tails``, invoked at the top
+        of ``forward()``.
+        """
+        if self.use_fused_qkv_cache_update:
+            self._pending_fused_qkv_signature = None
+        kv_cache = self._record_cache_view(kv_cache)
+        # Stage α-2: fully tensorised store. rotate(k, v) by H_fp16 → scatter
+        # into pool at slot=block_id directly. No Python loop, no allocator,
+        # no dict mutation. Safe inside a captured CUDA graph.
+        cfg = self.kvarn_config
+        if kv_cache.shape[-1] != cfg.record_bytes:
+            raise RuntimeError(
+                "KVarN cache record ABI mismatch: allocated "
+                f"{kv_cache.shape[-1]} bytes, expected {cfg.record_bytes} "
+                f"for {self.kv_cache_dtype}."
+            )
+        N = slot_mapping.shape[0]
+        if N <= 0:
+            return
+        device = key.device
+        Hk = self.num_kv_heads
+        D = self.head_size
+
+        # Ensure pool + lookup tensors + rotation scratch exist (no-op during
+        # capture; first call before capture sizes pool to kv_cache num_blocks).
+        self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
+
+        attn_metadata = _active_kvarn_metadata(layer)
+        if self._native_prefill_scatter_eligible(
+            layer, key, value, slot_mapping, attn_metadata
+        ):
+            self._launch_native_prefill_scatter(key, value, slot_mapping)
+            logger.info_once(
+                "[KVARN_PREFILL_STORE] active=hadamard_scatter; "
+                "layer=%s; native_op=kvarn_hadamard_scatter; tokens=%d; "
+                "cache_layout=%s; fallback=reference",
+                getattr(self, "layer_name", ""),
+                N,
+                self._kvarn_cache_layout,
+            )
+            return
+
+        is_capturing = device.type == "xpu" and torch.xpu.is_current_stream_capturing()
+        use_native_store = (
+            _is_pure_kvarn_decode_step(attn_metadata, N)
+            and kvarn_native_store_supported(
+                device_type=device.type,
+                num_tokens=N,
+                num_query_heads=self.num_heads,
+                num_kv_heads=Hk,
+                head_dim=D,
+                group=cfg.group,
+                key_bits=cfg.key_bits,
+                value_bits=cfg.value_bits,
+                record_bytes=cfg.record_bytes,
+                sliding_window=int(getattr(self, "sliding_window", 0) or 0),
+                key_dtype=key.dtype,
+                value_dtype=value.dtype,
+                has_lookup=self._block_to_slot_t is not None,
+                has_tail_pool=(
+                    self._tail_K_pool is not None and self._tail_V_pool is not None
+                ),
+                is_capturing=is_capturing,
+                op_available=(
+                    kvarn_native_decode_abi_supported(False)
+                    and kvarn_native_layout_abi_supported("kvarn_hadamard_scatter")
+                ),
+            )
+            and (
+                kvarn_native_layer_selected(
+                    getattr(self, "layer_name", ""),
+                    os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
+                )
+                and key.stride(-1) == 1
+                and value.stride(-1) == 1
+                and slot_mapping.dtype == torch.int64
+                and self._block_to_slot_t.dtype == torch.int32
+                and self._tail_K_pool.dtype == torch.float16
+                and self._tail_V_pool.dtype == torch.float16
+            )
+        )
+        if use_native_store:
+            torch.ops._vllm_fa2_C.kvarn_hadamard_scatter(
+                key[:N].view(N, Hk, D),
+                value[:N].view(N, Hk, D),
+                slot_mapping[:N],
+                self._block_to_slot_t,
+                self._tail_K_pool,
+                self._tail_V_pool,
+                cfg.group,
+                self._kvarn_dpas_layout,
+            )
+            return
+
+        # The established fallback rotates and stores fp16 activations.
+        if key.dtype != torch.float16:
+            key = key.to(torch.float16)
+            value = value.to(torch.float16)
+
+        # Reshape to (N, Hk, D) — view, no copy (key/value already fp16).
+        k_view = key[:N].view(N, Hk, D)
+        v_view = value[:N].view(N, Hk, D)
+
+        # Rotate via the cached fp16 Hadamard into bounded scratch views.
+        k_rot = self._k_rot_scratch[:N]
+        v_rot = self._v_rot_scratch[:N]
+        _rotate_kvarn_kv_into_scratch(
+            k_view,
+            v_view,
+            self._H_fp16,
+            k_rot,
+            v_rot,
+        )
+
+        # Scatter via the sparse pool indirection. Slot lookup (block_id →
+        # pool slot) is done inside the kernel against the GPU
+        # _block_to_slot_t tensor (mutated only by the metadata builder).
+        _kvarn_scatter_store_kernel[(N, Hk)](
+            k_rot,
+            v_rot,
+            slot_mapping[:N],
+            self._block_to_slot_t,
+            self._tail_K_pool,
+            self._tail_V_pool,
+            k_rot.stride(0),
+            k_rot.stride(1),
+            self._tail_K_pool.stride(0),
+            self._tail_K_pool.stride(1),
+            self._tail_K_pool.stride(2),
+            GROUP=cfg.group,
+            D=D,
+            NUM_BLOCKS_LOOKUP=self._block_lookup_size,
+            num_warps=2,
+            num_stages=2,
+        )
+        # No CPU bookkeeping here — fill tracking + flush triggering live in
+        # KVarNMetadataBuilder.build() (outside the captured region). This
+        # method is now pure tensor ops, safe inside a captured CUDA graph.
+
+    # ── forward ──────────────────────────────────────────────────────────────
+
+    def forward(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+        output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        kv_cache = self._record_cache_view(kv_cache)
+        profiling_without_cache = kv_cache.numel() == 0
+        if (
+            not profiling_without_cache
+            and kv_cache.shape[-1] != self.kvarn_config.record_bytes
+        ):
+            raise RuntimeError(
+                "KVarN cache record ABI mismatch: allocated "
+                f"{kv_cache.shape[-1]} bytes, expected "
+                f"{self.kvarn_config.record_bytes} for {self.kv_cache_dtype}."
+            )
+        num_tokens = query.shape[0]
+        device = query.device
+        if self.use_fused_qkv_cache_update:
+            query_rotation_precomputed = self._consume_fused_qkv_rotation(
+                query, attn_metadata
+            )
+        else:
+            query_rotation_precomputed = False
+
+        if output is None:
+            output = torch.zeros(
+                num_tokens,
+                self.num_heads * self.head_size,
+                dtype=query.dtype,
+                device=device,
+            )
+        if profiling_without_cache:
+            # Persistent tail/scratch pools and their kernel warmups must be
+            # included in vLLM's memory profile even though the physical KV
+            # tensor does not exist yet.
+            self._ensure_pool(device, num_blocks_hint=0)
+        if attn_metadata is None:
+            return output.fill_(0)
+
+        N = attn_metadata.num_actual_tokens
+        if N <= 0:
+            return output.fill_(0)
+
+        # Make sure pool + block-lookup tensors exist and cover num_blocks.
+        if not profiling_without_cache:
+            elide_pool_ensure = (
+                getattr(
+                    self,
+                    "_kvarn_forward_pool_ensure",
+                    _KVARN_FORWARD_POOL_ENSURE_ALWAYS,
+                )
+                == _KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF
+                and query_rotation_precomputed
+            )
+            if elide_pool_ensure:
+                if not self._forward_pool_elision_active_logged:
+                    logger.info(
+                        "[KVARN_FORWARD_POOL_ENSURE] "
+                        "active=fused_qkv_proof; action=elide_ensure_pool; "
+                        "layer=%s",
+                        getattr(self, "layer_name", ""),
+                    )
+                    self._forward_pool_elision_active_logged = True
+            else:
+                self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
+            # Cache the kv_cache ref so the metadata builder can drive flushes
+            # into this layer's int4 cache (outside the captured region).
+            if getattr(self, "use_bound_qlen1_inline_plan_v2", False):
+                self._bind_bound_qlen1_inline_v2_cache(kv_cache)
+            else:
+                self._kv_cache_ref = kv_cache
+
+        # Flush is now triggered from KVarNMetadataBuilder.build() between
+        # captured graph replays — nothing to do here at the top of forward.
+
+        # KVarN compute is fp16 internally. Pure one-token decode and pure
+        # cached-prefill continuations read K/V from cache after its update, so
+        # the latter only needs its live Q cast here.
+        cached_prefill_kv_unused = (
+            attn_metadata.is_prefill
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.has_cached_multiquery
+        )
+        query, key, value = _cast_kvarn_activations(
+            query,
+            key,
+            value,
+            query_only=(
+                not attn_metadata.is_prefill and attn_metadata.max_query_len <= 1
+            ),
+            key_value_unused=cached_prefill_kv_unused,
+        )
+
+        q = query[:N].view(N, self.num_heads, self.head_size)
+
+        # The empty-cache profiling batch is expected to be a first-chunk
+        # prefill, which can compute attention directly from Q/K/V.  If a
+        # future profiler supplies cached/decode metadata without a cache,
+        # return a deterministic placeholder instead of indexing the sentinel.
+        if profiling_without_cache and (
+            not attn_metadata.is_prefill
+            or attn_metadata.num_decodes != 0
+            or attn_metadata.has_cached_multiquery
+        ):
+            return output.fill_(0)
+
+        direct_decode_output: torch.Tensor | None = None
+        if not attn_metadata.is_prefill:
+            direct_decode_output = output[:N]
+            if output.ndim != 3:
+                direct_decode_output = direct_decode_output.view(
+                    N, self.num_heads, self.head_size
+                )
+            if query_rotation_precomputed:
+                attn_out = self._decode_path(
+                    q,
+                    kv_cache,
+                    attn_metadata,
+                    output=direct_decode_output,
+                    query_rotation_precomputed=True,
+                )
+            else:
+                attn_out = self._decode_path(
+                    q, kv_cache, attn_metadata, output=direct_decode_output
+                )
+        elif (
+            attn_metadata.vq_seqlen is not None and attn_metadata.num_decode_tokens == N
+        ):
+            # Pure multi-token decode batch = a spec-decode verify step
+            # (uniform query length under graph capture). One fused-kernel
+            # pass over the vq plan — fully graph-capturable.
+            attn_out = self._verify_decode_path(q, kv_cache, attn_metadata)
+        elif attn_metadata.num_decodes == 0:
+            if attn_metadata.has_cached_multiquery:
+                # Speculative-decode verify (or chunked-prefill continuation):
+                # the query tokens have cached history that must be attended.
+                # _prefill_first_chunk would drop it; use the context-aware path.
+                attn_out = self._cached_multiquery_path(q, kv_cache, attn_metadata)
+            else:
+                k = key[:N].view(N, self.num_kv_heads, self.head_size)
+                v = value[:N].view(N, self.num_kv_heads, self.head_size)
+                attn_out = self._prefill_first_chunk(q, k, v, attn_metadata, kv_cache)
+        else:
+            # Mixed batch — split into decode + prefill portions, same as TurboQuant.
+            attn_out = self._mixed_batch_path(
+                q, key[:N], value[:N], kv_cache, attn_metadata
+            )
+
+        if attn_out is direct_decode_output:
+            return output
+        if output.ndim == 3:
+            output[:N].copy_(attn_out)
+        else:
+            output[:N].copy_(attn_out.reshape(N, -1))
+        return output
+
+    # ── attention sub-paths ──────────────────────────────────────────────────
+
+    def _flash_varlen(
+        self,
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max_q,
+        max_k,
+        causal=True,
+    ) -> torch.Tensor:
+        if self.fa_version is None:
+            return flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=max_q,
+                max_seqlen_k=max_k,
+                softmax_scale=self.scale,
+                causal=causal,
+            )
+        return flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            softmax_scale=self.scale,
+            causal=causal,
+            fa_version=self.fa_version,
+        )
+
+    def _prefill_first_chunk(
+        self,
+        q,
+        k,
+        v,
+        attn_metadata: KVarNMetadata,
+        kv_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """First-chunk prefill: every request's full prompt is in the current
+        batch, so attention runs on raw K/V via flash_attn_varlen. The K/V
+        have already been written to the cache by `do_kv_cache_update`."""
+        causal = getattr(attn_metadata, "causal", True)
+        # FlashAttention caps head_dim at 256; the head_dim-512 global layers of
+        # Gemma-4 must use the SDPA path (handles arbitrary head_dim). Prefill is
+        # a one-time cost (decode dominates at long context), so SDPA here is fine.
+        if _HAS_FLASH_ATTN and self.head_size <= 256:
+            return self._flash_varlen(
+                q,
+                k,
+                v,
+                cu_q=attn_metadata.query_start_loc,
+                cu_k=attn_metadata.query_start_loc,
+                max_q=attn_metadata.max_query_len,
+                max_k=attn_metadata.max_query_len,
+                causal=causal,
+            )
+        # Per-request SDPA fallback (e.g. when flash_attn isn't available).
+        outputs = []
+        qsl = attn_metadata.query_start_loc.tolist()
+        for r in range(len(qsl) - 1):
+            qs, qe = qsl[r], qsl[r + 1]
+            if qe <= qs:
+                continue
+            q_r = q[qs:qe].transpose(0, 1).unsqueeze(0)  # [1, Hq, q_len, D]
+            k_r = k[qs:qe].transpose(0, 1).unsqueeze(0)
+            v_r = v[qs:qe].transpose(0, 1).unsqueeze(0)
+            o = F.scaled_dot_product_attention(
+                q_r,
+                k_r,
+                v_r,
+                is_causal=causal,
+                scale=self.scale,
+                enable_gqa=self.num_kv_heads < self.num_heads,
+            )
+            outputs.append(o[0].transpose(0, 1))  # [q_len, Hq, D]
+        return (
+            torch.cat(outputs, dim=0)
+            if outputs
+            else torch.empty(
+                0,
+                self.num_heads,
+                self.head_size,
+                device=q.device,
+                dtype=q.dtype,
+            )
+        )
+
+    def _gather_request_kv(
+        self,
+        kv_cache: torch.Tensor,
+        block_table_row: torch.Tensor,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reconstruct full fp16 K and V for one request from cached blocks
+        + tail buffers. Returns (K [seq_len, Hk, D], V [seq_len, Hk, D])."""
+        cfg = self.kvarn_config
+        group = cfg.group
+        n_full = seq_len // group
+        tail_len = seq_len % group
+        device = kv_cache.device
+        D = self.head_size
+
+        # Stage α-2: pool stores ROTATED K/V indexed by block_id directly.
+        # The slow fallback consumer (_decode_path_slow → SDPA) expects
+        # un-rotated K/V, so apply H^-1 (= H^T for orthonormal H).
+        H = self._hadamard(device)  # [D, D] fp32
+
+        def _unrot_pool(x: torch.Tensor) -> torch.Tensor:
+            return (x.float() @ H.T).to(torch.float16)
+
+        # Stage α-2: a block lives in the fp16 pool iff it has a slot
+        # (sinks + in-progress tails). Flushed blocks have their slot freed
+        # and live in the int4 cache.
+        dict_map = type(self)._block_to_slot_dict.get(self._group_key, {})
+
+        K_parts: list[torch.Tensor] = []
+        V_parts: list[torch.Tensor] = []
+
+        for i in range(n_full):
+            block_id = int(block_table_row[i].item())
+            slot = dict_map.get(block_id)
+            if slot is not None:
+                K_parts.append(_unrot_pool(self._tail_K_pool[slot]))
+                V_parts.append(_unrot_pool(self._tail_V_pool[slot]))
+            else:
+                K_blk, V_blk = self._read_block_dequantized(kv_cache, block_id)
+                K_parts.append(K_blk)
+                V_parts.append(V_blk)
+
+        if tail_len > 0:
+            block_id = int(block_table_row[n_full].item())
+            slot = dict_map.get(block_id)
+            if slot is not None:
+                K_parts.append(_unrot_pool(self._tail_K_pool[slot, :tail_len]))
+                V_parts.append(_unrot_pool(self._tail_V_pool[slot, :tail_len]))
+            else:
+                K_parts.append(
+                    torch.zeros(
+                        tail_len,
+                        self.num_kv_heads,
+                        D,
+                        dtype=torch.float16,
+                        device=device,
+                    )
+                )
+                V_parts.append(torch.zeros_like(K_parts[-1]))
+
+        K = (
+            torch.cat(K_parts, dim=0)
+            if K_parts
+            else torch.empty(
+                0,
+                self.num_kv_heads,
+                D,
+                dtype=torch.float16,
+                device=device,
+            )
+        )
+        V = torch.cat(V_parts, dim=0) if V_parts else torch.empty_like(K)
+        return K, V
+
+    def _decode_path(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+        output: torch.Tensor | None = None,
+        query_rotation_precomputed: bool = False,
+        trusted_native_plan: KVarNTrustedNativeDecodePlan | None = None,
+        bound_native_plan_v2: KVarNBoundNativeDecodePlanV2 | None = None,
+    ) -> torch.Tensor:
+        """Triton-driven decode: in-kernel dequant + scoring + weighted V,
+        with the in-progress fp16 tail buffers combined via LSE in PyTorch.
+
+        Assumes one query token per request (the standard decode regime).
+        For mixed-query-length decode steps (e.g. speculative decoding), this
+        path falls back to ``_decode_path_slow`` which materialises fp16 K/V
+        and runs SDPA — retained for correctness in edge cases.
+        """
+        # If every request contributes exactly one query token, the Triton
+        # kernel's (B, Hq) launch shape is valid; otherwise fall back.
+        # Use the precomputed Python-int max_query_len (NOT a GPU reduction +
+        # host branch — that would force a sync, forbidden during CUDA graph
+        # capture).
+        if attn_metadata.max_query_len > 1:
+            return self._cached_multiquery_path(q, kv_cache, attn_metadata)
+
+        # q shape: [num_decode_tokens, num_heads, head_dim]
+        # num_decode_tokens == B (one token per request)
+        return kvarn_decode_attention(
+            query=q,
+            kv_cache=kv_cache,
+            hadamard=self._hadamard(q.device),
+            scale=self.scale,
+            cfg=self.kvarn_config,
+            impl=self,
+            md=attn_metadata,
+            output=output,
+            query_rotation_precomputed=query_rotation_precomputed,
+            trusted_native_plan=trusted_native_plan,
+            bound_native_plan_v2=bound_native_plan_v2,
+        )
+
+    def _decode_path_slow(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+    ) -> torch.Tensor:
+        """Fallback: full fp16 dequant + SDPA. Used for multi-query-per-request
+        decode steps (e.g. speculative decoding) where the Triton kernel's
+        ``(B, Hq)`` per-program shape would mishandle the per-token mapping.
+        """
+        num_reqs = attn_metadata.block_table.shape[0]
+        seq_lens = attn_metadata.seq_lens.tolist()
+        qsl = attn_metadata.query_start_loc.tolist()
+        out = torch.empty(
+            q.shape[0], self.num_heads, self.head_size, dtype=q.dtype, device=q.device
+        )
+        for r in range(num_reqs):
+            q_start, q_end = qsl[r], qsl[r + 1]
+            if q_end <= q_start:
+                continue
+            seq_len = seq_lens[r]
+            K_full, V_full = self._gather_request_kv(
+                kv_cache,
+                attn_metadata.block_table[r],
+                seq_len,
+            )
+            q_r = q[q_start:q_end].transpose(0, 1).unsqueeze(0).float()
+            K_t = K_full.transpose(0, 1).unsqueeze(0).float()
+            V_t = V_full.transpose(0, 1).unsqueeze(0).float()
+            cached_len = seq_len - (q_end - q_start)
+            q_pos = (
+                torch.arange(q_end - q_start, device=q.device).unsqueeze(1) + cached_len
+            )
+            k_pos = torch.arange(seq_len, device=q.device).unsqueeze(0)
+            mask = k_pos <= q_pos
+            o = F.scaled_dot_product_attention(
+                q_r,
+                K_t,
+                V_t,
+                attn_mask=mask,
+                scale=self.scale,
+                enable_gqa=self.num_kv_heads < self.num_heads,
+            )
+            out[q_start:q_end] = o[0].transpose(0, 1).to(q.dtype)
+        return out
+
+    def _verify_decode_path(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+    ) -> torch.Tensor:
+        """Spec-as-decode verify using the builder's persistent vq plan.
+
+        Capture-safe: the vq buffers are persistent (filled CPU-side in
+        build() between replays), the block-table/seq-len bound is the
+        deployment constant, and the driver's intermediates are created
+        inside the captured region (graph-pool managed) — same pattern as
+        the single-token fused decode.
+        """
+        md = attn_metadata
+        group = self.kvarn_config.group
+        max_ctx_blocks = max((self._max_model_len + group - 1) // group, 1)
+        from vllm.v1.attention.ops.triton_kvarn_decode import (
+            kvarn_verify_attention,
+        )
+
+        B = md.block_table.shape[0]
+        return kvarn_verify_attention(
+            q,
+            kv_cache,
+            md.block_table,
+            self.scale,
+            self.kvarn_config,
+            self,
+            md.vq_req,
+            md.vq_seqlen,
+            max_ctx_blocks,
+            qlen=md.vq_qlen,
+            seq_lens=md.seq_lens[:B],
+        )
+
+    def _fused_verify_path(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+    ) -> torch.Tensor:
+        """Speculative-decode verify via the fused dual-source kernel.
+
+        Each query token becomes a virtual kernel row with its own
+        bottom-right causal length (cached_len + idx + 1) and an indirection
+        to its request's block-table row — so the verify step reads int4
+        tiles + the fp16 pool directly instead of materializing the whole
+        context to fp16 scratch every step (O(context)/step; the
+        long-context MTP collapse: measured 88 -> 45 tok/s from 2K -> 32K
+        with the materialize route vs near-flat without MTP).
+
+        Eager-only (verify steps are not graph-captured): fresh small
+        tensors per call are fine.
+        """
+        md = attn_metadata
+        B = md.block_table.shape[0]
+        n_tok = q.shape[0]
+        device = q.device
+        group = self.kvarn_config.group
+
+        qsl = md.query_start_loc[: B + 1].to(torch.long)
+        qlens = qsl[1:] - qsl[:-1]  # [B]
+        vq_req_long = torch.repeat_interleave(
+            torch.arange(B, device=device), qlens
+        )  # [n_tok]
+        pos_in_req = torch.arange(n_tok, device=device) - qsl[:-1][vq_req_long]
+        committed = md.seq_lens[:B].to(torch.long) - qlens
+        vq_seqlen = (committed[vq_req_long] + pos_in_req + 1).to(torch.int32)
+        vq_req = vq_req_long.to(torch.int32)
+
+        max_ctx_blocks = min(
+            (int(md.max_seq_len) + group - 1) // group, md.block_table.shape[1]
+        )
+        max_ctx_blocks = max(max_ctx_blocks, 1)
+
+        from vllm.v1.attention.ops.triton_kvarn_decode import (
+            kvarn_verify_attention,
+        )
+
+        return kvarn_verify_attention(
+            q,
+            kv_cache,
+            md.block_table,
+            self.scale,
+            self.kvarn_config,
+            self,
+            vq_req,
+            vq_seqlen,
+            max_ctx_blocks,
+        )
+
+    def _native_cached_prefill_materializer_eligibility(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+        *,
+        num_query_tokens: int,
+        total_k: int,
+        max_seq_len: int,
+    ) -> tuple[bool, str]:
+        """Fail closed before dispatching the native continuation materializer."""
+        if (
+            self._kvarn_cached_prefill_materializer
+            != _KVARN_CACHED_PREFILL_MATERIALIZER_NATIVE_XE2
+        ):
+            return False, "selected_reference"
+        if not _is_pure_kvarn_cached_prefill_step(attn_metadata, num_query_tokens):
+            return False, "not_pure_cached_prefill"
+
+        cfg = self.kvarn_config
+        block_to_slot = self._block_to_slot_t
+        tail_key = self._tail_K_pool
+        tail_value = self._tail_V_pool
+        tensors = (
+            kv_cache,
+            block_table,
+            seq_lens,
+            cu_seqlens_k,
+            block_to_slot,
+            tail_key,
+            tail_value,
+            key_output,
+            value_output,
+        )
+        if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+            return False, "missing_tensor"
+        assert isinstance(block_to_slot, torch.Tensor)
+        assert isinstance(tail_key, torch.Tensor)
+        assert isinstance(tail_value, torch.Tensor)
+        if (
+            self._kvarn_cache_layout != KVARN_CACHE_LAYOUT_XE2_DPAS
+            or self.head_size != 256
+            or self.num_kv_heads != 4
+            or cfg.group != 128
+            or cfg.key_bits != 4
+            or cfg.value_bits != 4
+            or cfg.record_bytes < 35_072
+            or cfg.record_bytes % 4 != 0
+        ):
+            return False, "unsupported_cache_abi"
+        if not kvarn_native_layer_selected(
+            getattr(self, "layer_name", ""),
+            os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
+        ):
+            return False, "layer_not_selected"
+        if not kvarn_native_layout_abi_supported("kvarn_materialize_packed_kv"):
+            return False, "native_op_unavailable"
+        if kv_cache.device.type != "xpu":
+            return False, "not_xpu"
+        if torch.xpu.is_current_stream_capturing():
+            return False, "stream_capturing"
+        if not (
+            kv_cache.dtype == torch.uint8
+            and kv_cache.ndim == 3
+            and kv_cache.shape[1] == self.num_kv_heads
+            and kv_cache.shape[2] == cfg.record_bytes
+            and kv_cache.is_contiguous()
+            and block_table.dtype == torch.int32
+            and block_table.ndim == 2
+            and block_table.shape[0] == seq_lens.shape[0]
+            and block_table.is_contiguous()
+            and seq_lens.dtype == torch.int32
+            and seq_lens.ndim == 1
+            and seq_lens.is_contiguous()
+            and cu_seqlens_k.dtype == torch.int32
+            and cu_seqlens_k.shape == (seq_lens.shape[0] + 1,)
+            and cu_seqlens_k.is_contiguous()
+            and block_to_slot.dtype == torch.int32
+            and block_to_slot.ndim == 1
+            and block_to_slot.shape[0] >= kv_cache.shape[0]
+            and block_to_slot.is_contiguous()
+            and tail_key.dtype == torch.float16
+            and tail_key.ndim == 4
+            and tail_key.shape[1:] == (cfg.group, self.num_kv_heads, self.head_size)
+            and tail_key.is_contiguous()
+            and tail_value.dtype == torch.float16
+            and tail_value.shape == tail_key.shape
+            and tail_value.is_contiguous()
+            and key_output.dtype == torch.float16
+            and key_output.ndim == 3
+            and key_output.shape[0] >= total_k
+            and key_output.shape[1:] == (self.num_kv_heads, self.head_size)
+            and key_output.is_contiguous()
+            and value_output.dtype == torch.float16
+            and value_output.shape == key_output.shape
+            and value_output.is_contiguous()
+        ):
+            return False, "incompatible_tensor_abi"
+        anchor = kv_cache.device
+        if any(tensor.device != anchor for tensor in tensors[1:]):
+            return False, "device_mismatch"
+        if max_seq_len < 1 or max_seq_len > block_table.shape[1] * cfg.group:
+            return False, "invalid_extent"
+        return True, "eligible"
+
+    def _launch_native_cached_prefill_materializer(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        max_seq_len: int,
+    ) -> None:
+        torch.ops._vllm_fa2_C.kvarn_materialize_packed_kv(
+            kv_cache,
+            block_table,
+            seq_lens,
+            cu_seqlens_k,
+            self._block_to_slot_t,
+            self._tail_K_pool,
+            self._tail_V_pool,
+            key_output,
+            value_output,
+            max_seq_len,
+            self._kvarn_dpas_layout,
+        )
+
+    def _launch_reference_cached_prefill_materializer(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        max_seq_len: int,
+    ) -> None:
+        cfg = self.kvarn_config
+        group = cfg.group
+        max_blocks = min((max_seq_len + group - 1) // group, block_table.shape[1])
+        max_blocks = max(max_blocks, 1)
+        from vllm.v1.attention.ops.triton_kvarn_decode import (
+            _kvarn_build_packed_kv_kernel,
+        )
+
+        grid = (seq_lens.shape[0] * max_blocks, self.num_kv_heads)
+        _kvarn_build_packed_kv_kernel[grid](
+            block_table,
+            seq_lens,
+            cu_seqlens_k,
+            self._block_to_slot_t,
+            kv_cache,
+            self._tail_K_pool,
+            self._tail_V_pool,
+            key_output,
+            value_output,
+            block_table.stride(0),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            self._tail_K_pool.stride(0),
+            self._tail_K_pool.stride(1),
+            self._tail_K_pool.stride(2),
+            key_output.stride(0),
+            key_output.stride(1),
+            MAX_BLOCKS_PER_REQ=max_blocks,
+            D=self.head_size,
+            GROUP=group,
+            K_BITS=cfg.key_bits,
+            V_BITS=cfg.value_bits,
+            NUM_BLOCKS_LOOKUP=self._block_lookup_size,
+            K_PACKED_OFFSET=cfg.k_packed_offset,
+            K_S_COL_OFFSET=cfg.k_s_col_offset,
+            K_ZP_OFFSET=cfg.k_zp_offset,
+            K_S_ROW_OFFSET=cfg.k_s_row_offset,
+            V_PACKED_OFFSET=cfg.v_packed_offset,
+            V_S_COL_OFFSET=cfg.v_s_col_offset,
+            V_S_ROW_OFFSET=cfg.v_s_row_offset,
+            V_ZP_OFFSET=cfg.v_zp_offset,
+            DPAS_LAYOUT=self._kvarn_dpas_layout,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    def _materialize_cached_prefill_kv(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        """Materialize cached K/V using builder-owned metadata when available."""
+        md = attn_metadata
+        batch_size = md.block_table.shape[0]
+        seq_lens = md.seq_lens[:batch_size]
+        if seq_lens.dtype != torch.int32:
+            seq_lens = seq_lens.to(torch.int32)
+        cu_seqlens_k = md.fa_cu_seqlens_k
+        if cu_seqlens_k is None:
+            cu_seqlens_k = F.pad(torch.cumsum(seq_lens, 0, dtype=torch.int32), (1, 0))
+        else:
+            cu_seqlens_k = cu_seqlens_k[: batch_size + 1]
+
+        seq_lens_cpu = getattr(md, "seq_lens_cpu", None)
+        cpu_seq_lens: list[int] | None = None
+        if seq_lens_cpu is not None and len(seq_lens_cpu) >= batch_size:
+            cpu_seq_lens = [int(length) for length in seq_lens_cpu[:batch_size]]
+            if any(length < 0 for length in cpu_seq_lens):
+                raise ValueError("cached prefill has a negative sequence length")
+            total_k = sum(cpu_seq_lens)
+        else:
+            total_k = int(cu_seqlens_k[-1].item())
+        if total_k <= 0 or total_k > self._fa_K_buf.shape[0]:
+            raise ValueError("cached prefill exceeds KVarN materialization scratch")
+
+        max_seq_len = int(md.max_seq_len)
+        if cpu_seq_lens and max(cpu_seq_lens) > max_seq_len:
+            raise ValueError("cached prefill max sequence length is inconsistent")
+        block_table = md.block_table[:batch_size]
+        key_output = self._fa_K_buf
+        value_output = self._fa_V_buf
+        eligible, reason = self._native_cached_prefill_materializer_eligibility(
+            kv_cache,
+            block_table,
+            seq_lens,
+            cu_seqlens_k,
+            key_output,
+            value_output,
+            md,
+            num_query_tokens=q.shape[0],
+            total_k=total_k,
+            max_seq_len=max_seq_len,
+        )
+        cls = type(self)
+        cls._cached_prefill_materializer_counters["calls"] = (
+            cls._cached_prefill_materializer_counters.get("calls", 0) + 1
+        )
+        if eligible:
+            self._launch_native_cached_prefill_materializer(
+                kv_cache,
+                block_table,
+                seq_lens,
+                cu_seqlens_k,
+                key_output,
+                value_output,
+                max_seq_len,
+            )
+            cls._cached_prefill_materializer_counters["native_launches"] = (
+                cls._cached_prefill_materializer_counters.get("native_launches", 0) + 1
+            )
+            logger.info_once(
+                "[KVARN_PREFILL_MATERIALIZER] active=native_xe2; layer=%s; "
+                "native_op=kvarn_materialize_packed_kv; cache_layout=%s; "
+                "eligibility_fallback=reference",
+                getattr(self, "layer_name", ""),
+                self._kvarn_cache_layout,
+            )
+        else:
+            self._launch_reference_cached_prefill_materializer(
+                kv_cache,
+                block_table,
+                seq_lens,
+                cu_seqlens_k,
+                key_output,
+                value_output,
+                max_seq_len,
+            )
+            cls._cached_prefill_materializer_counters["reference_launches"] = (
+                cls._cached_prefill_materializer_counters.get("reference_launches", 0)
+                + 1
+            )
+            if (
+                self._kvarn_cached_prefill_materializer
+                == _KVARN_CACHED_PREFILL_MATERIALIZER_NATIVE_XE2
+            ):
+                cls._cached_prefill_materializer_counters[
+                    "selected_native_fallbacks"
+                ] = (
+                    cls._cached_prefill_materializer_counters.get(
+                        "selected_native_fallbacks", 0
+                    )
+                    + 1
+                )
+                logger.info_once(
+                    "[KVARN_PREFILL_MATERIALIZER] selected=native_xe2; "
+                    "active=reference; layer=%s; cache_layout=%s; "
+                    "eligibility_fallback=reference",
+                    getattr(self, "layer_name", ""),
+                    self._kvarn_cache_layout,
+                )
+            else:
+                logger.info_once(
+                    "[KVARN_PREFILL_MATERIALIZER] active=reference; layer=%s; "
+                    "cache_layout=%s",
+                    getattr(self, "layer_name", ""),
+                    self._kvarn_cache_layout,
+                )
+        counters = cls.cached_prefill_materializer_counters()
+        logger.debug(
+            "[KVARN_PREFILL_MATERIALIZER_EXTENT] active=%s; reason=%s; "
+            "layer=%s; query_tokens=%d; context_tokens=%d; max_seq_len=%d; "
+            "cache_layout=%s; calls=%d; native_launches=%d; "
+            "reference_launches=%d; selected_native_fallbacks=%d",
+            "native_xe2" if eligible else "reference",
+            reason,
+            getattr(self, "layer_name", ""),
+            q.shape[0],
+            total_k,
+            max_seq_len,
+            self._kvarn_cache_layout,
+            counters["calls"],
+            counters["native_launches"],
+            counters["reference_launches"],
+            counters["selected_native_fallbacks"],
+        )
+        return key_output, value_output, cu_seqlens_k, total_k, max_seq_len
+
+    def _cached_multiquery_path(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+    ) -> torch.Tensor:
+        """Multi-query tokens with cached history (a speculative-decode verify
+        step or a chunked-prefill continuation), batched.
+
+        Builds the batch's rotated fp16 K/V with one native or Triton
+        block-table-driven materializer and runs a single
+        ``flash_attn_varlen`` call. FA's varlen causal mask is bottom-right
+        aligned when ``seqlen_q < seqlen_k``, i.e. query token ``t`` attends
+        keys ``<= cached_len + t`` — exactly the spec-verify / continuation
+        semantics, so no explicit mask is needed.
+
+        Replaces ``_decode_path_slow`` on this route: the per-request Python
+        gather (per-block ``.item()`` syncs + Python dequant + fp32 SDPA, per
+        layer, per step) made MTP decode unusably slow (< 5 tok/s) and its
+        transient fp32 materializations inflated the CUDA-graph memory
+        estimate by GiBs, collapsing the derived KV-cache capacity. The slow
+        path remains the fallback for head_dim > 256 (FA's cap) or a batch
+        whose total KV exceeds the shared materialize scratch.
+        """
+        md = attn_metadata
+        B = md.block_table.shape[0]
+        # Small-qlen multi-query (the spec-decode verify step: every decode
+        # step under MTP) goes to the FUSED verify kernel: per-token virtual
+        # rows over the dual-source decode kernel, no fp16 materialization.
+        # Routed by CONTEXT depth (measured, Qwen3.6-27B AWQ single stream):
+        # materialize wins short context (88 vs 81 tok/s @2K — its one
+        # write+read is cheap there and the fused per-call overhead shows);
+        # fused wins long context (51 vs 45 @32K, growing with depth — the
+        # materialize round-trip is the O(context)/step MTP
+        # slowdown). Crossover ~12K; default threshold 64 blocks (8K).
+        # The materialize+FA route also keeps LARGE qlen (chunked-prefill
+        # continuations), where one materialization amortizes over thousands
+        # of query tokens. KVARN_FUSED_VERIFY=0 forces materialize always.
+        _group = self.kvarn_config.group
+        dpas_layout = self._kvarn_dpas_layout
+        if _use_kvarn_fused_verify(
+            max_query_len=md.max_query_len,
+            max_seq_len=int(md.max_seq_len),
+            group=_group,
+            batch_size=B,
+            dpas_layout=dpas_layout,
+        ):
+            return self._fused_verify_path(q, kv_cache, md)
+        if not _HAS_FLASH_ATTN or self.head_size > 256 or self._fa_K_buf is None:
+            _require_kvarn_dpas_reader(dpas_layout, False, "slow multi-query decode")
+            return self._decode_path_slow(q, kv_cache, md)
+
+        try:
+            K_packed, V_packed, cu_k, total_k, max_k = (
+                self._materialize_cached_prefill_kv(q, kv_cache, md)
+            )
+        except ValueError:
+            _require_kvarn_dpas_reader(dpas_layout, False, "slow multi-query decode")
+            return self._decode_path_slow(q, kv_cache, md)
+
+        D = self.head_size
+        # The packed K/V are in the rotated frame (the store path rotates before
+        # quantizing / pooling), so rotate q in and un-rotate the output — same
+        # fp16 Hadamard as the store side, so QK^T is invariant.
+        H16 = (
+            self._H_fp16
+            if self._H_fp16 is not None
+            else self._hadamard(q.device).to(torch.float16)
+        )
+        n_tok = q.shape[0]
+        q_rot = torch.mm(q.reshape(-1, D), H16).view(n_tok, self.num_heads, D)
+        out_rot = self._flash_varlen(
+            q_rot,
+            K_packed[:total_k],
+            V_packed[:total_k],
+            cu_q=md.query_start_loc[: B + 1],
+            cu_k=cu_k,
+            max_q=md.max_query_len,
+            max_k=max_k,
+            causal=getattr(md, "causal", True),
+        )
+        return torch.mm(out_rot.reshape(-1, D), H16).view(n_tok, self.num_heads, D)
+
+    def _mixed_batch_path(
+        self,
+        q: torch.Tensor,
+        k_all: torch.Tensor,
+        v_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: KVarNMetadata,
+    ) -> torch.Tensor:
+        """Split mixed batch into decode-then-prefill, mirroring TurboQuant."""
+        num_decodes = attn_metadata.num_decodes
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        N = attn_metadata.num_actual_tokens
+
+        out = torch.empty(
+            N, self.num_heads, self.head_size, dtype=q.dtype, device=q.device
+        )
+
+        # Build the Stage α-2 fa_* fields for the decode subset. This path
+        # always runs eager (mixed batches aren't graph-captured), so fresh
+        # (non-persistent) tensors are fine.
+        group = self.kvarn_config.group
+        dec_seq_lens = attn_metadata.seq_lens[:num_decodes].to(torch.int32)
+        dec_cu_k = torch.nn.functional.pad(
+            torch.cumsum(dec_seq_lens, dim=0), (1, 0)
+        ).to(torch.int32)
+        dec_cu_q = torch.arange(num_decodes + 1, dtype=torch.int32, device=q.device)
+        mbpr = (self._max_model_len + group - 1) // group
+        decode_meta = KVarNMetadata(
+            seq_lens=attn_metadata.seq_lens[:num_decodes],
+            slot_mapping=attn_metadata.slot_mapping[:num_decode_tokens],
+            block_table=attn_metadata.block_table[:num_decodes],
+            query_start_loc=attn_metadata.query_start_loc[: num_decodes + 1],
+            num_actual_tokens=num_decode_tokens,
+            max_query_len=1,
+            max_seq_len=attn_metadata.max_seq_len,
+            is_prefill=False,
+            fa_cu_seqlens_q=dec_cu_q,
+            fa_cu_seqlens_k=dec_cu_k,
+            fa_max_blocks_per_req=mbpr,
+            fa_max_seqlen_k_fixed=self._max_model_len,
+            causal=getattr(attn_metadata, "causal", True),
+        )
+        if attn_metadata.vq_seqlen is not None:
+            # Spec-as-decode: the decode portion carries multi-token verify
+            # queries — use the vq plan (mixed batches run eager, slices ok).
+            # vq_req is set together with vq_seqlen (never None when it is not).
+            assert attn_metadata.vq_req is not None
+            decode_meta.vq_req = attn_metadata.vq_req[:num_decode_tokens]
+            decode_meta.vq_seqlen = attn_metadata.vq_seqlen[:num_decode_tokens]
+            decode_meta.vq_qlen = attn_metadata.vq_qlen
+            out[:num_decode_tokens] = self._verify_decode_path(
+                q[:num_decode_tokens],
+                kv_cache,
+                decode_meta,
+            )
+        else:
+            out[:num_decode_tokens] = self._decode_path(
+                q[:num_decode_tokens],
+                kv_cache,
+                decode_meta,
+            )
+
+        prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
+        prefill_qsl = attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
+        prefill_meta = KVarNMetadata(
+            seq_lens=prefill_seq_lens,
+            slot_mapping=attn_metadata.slot_mapping[num_decode_tokens:N],
+            block_table=attn_metadata.block_table[num_decodes:],
+            query_start_loc=prefill_qsl,
+            num_actual_tokens=N - num_decode_tokens,
+            max_query_len=attn_metadata.max_query_len,
+            # avoid a per-step .item() D2H sync; the global max is a safe
+            # upper bound for the prefill kernel
+            max_seq_len=attn_metadata.max_seq_len,
+            is_prefill=True,
+            has_cached_multiquery=getattr(
+                attn_metadata,
+                "prefill_has_cached_multiquery",
+                attn_metadata.has_cached_multiquery,
+            ),
+            seq_lens_cpu=(
+                attn_metadata.seq_lens_cpu[num_decodes:]
+                if attn_metadata.seq_lens_cpu is not None
+                else None
+            ),
+            fa_cu_seqlens_k=getattr(attn_metadata, "prefill_fa_cu_seqlens_k", None),
+            causal=getattr(attn_metadata, "causal", True),
+        )
+        if prefill_meta.has_cached_multiquery:
+            # The multi-query (prefill-classified) requests here are speculative
+            # -decode verify steps / chunked-prefill continuations with cached
+            # history — attend over the cached K/V, not just the new tokens.
+            out[num_decode_tokens:] = self._cached_multiquery_path(
+                q[num_decode_tokens:],
+                kv_cache,
+                prefill_meta,
+            )
+        else:
+            k_pref = k_all[num_decode_tokens:].view(
+                -1, self.num_kv_heads, self.head_size
+            )
+            v_pref = v_all[num_decode_tokens:].view(
+                -1, self.num_kv_heads, self.head_size
+            )
+            out[num_decode_tokens:] = self._prefill_first_chunk(
+                q[num_decode_tokens:],
+                k_pref,
+                v_pref,
+                prefill_meta,
+                kv_cache,
+            )
+        return out

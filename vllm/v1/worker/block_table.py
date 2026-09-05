@@ -55,6 +55,11 @@ class SlotMappingMode(Enum):
 
 
 class BlockTable:
+    def __new__(cls, *args: Any, track_row_versions: bool = False, **kwargs: Any):
+        if cls is BlockTable and track_row_versions:
+            return super().__new__(_RowVersionedBlockTable)
+        return super().__new__(cls)
+
     def __init__(
         self,
         block_size: int,
@@ -66,6 +71,8 @@ class BlockTable:
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
         slot_mapping_mode: SlotMappingMode = SlotMappingMode.TOKEN_TO_KV_SLOT,
+        *,
+        track_row_versions: bool = False,
     ):
         """
         Args:
@@ -81,6 +88,7 @@ class BlockTable:
             slot_mapping_mode: How this cache group maps scheduled tokens to
                 cache slots. Mamba-like state caches do not use token slot
                 mappings and should use SlotMappingMode.NONE.
+            track_row_versions: Whether to record block-table row mutations.
         """
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -115,6 +123,8 @@ class BlockTable:
             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
         )
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
+        if track_row_versions:
+            self.row_versions = np.zeros(max_num_reqs, dtype=np.uint64)
 
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens, dtype=torch.int64
@@ -277,12 +287,48 @@ class BlockTable:
         """Returns the numpy array of the block table."""
         return self.block_table.np
 
+    def get_row_versions(self, num_reqs: int) -> np.ndarray:
+        """Return mutation versions in active block-table row order."""
+        raise RuntimeError("Block-table row version tracking is disabled")
+
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype
     ) -> CpuGpuBuffer:
         return CpuGpuBuffer(
             *size, dtype=dtype, device=self.device, pin_memory=self.pin_memory
         )
+
+
+class _RowVersionedBlockTable(BlockTable):
+    def append_row(self, block_ids: list[int], row_idx: int) -> None:
+        super().append_row(block_ids, row_idx)
+        if block_ids:
+            self.row_versions[row_idx] += 1
+
+    def add_row(self, block_ids: list[int], row_idx: int) -> None:
+        super().add_row(block_ids, row_idx)
+        if not block_ids:
+            self.row_versions[row_idx] += 1
+
+    def clear_row(self, row_idx: int) -> None:
+        super().clear_row(row_idx)
+        self.row_versions[row_idx] += 1
+
+    def move_row(self, src: int, tgt: int) -> None:
+        super().move_row(src, tgt)
+        self.row_versions[src] += 1
+        self.row_versions[tgt] += 1
+
+    def swap_row(self, src: int, tgt: int) -> None:
+        super().swap_row(src, tgt)
+        self.row_versions[[src, tgt]] += 1
+
+    def clear(self) -> None:
+        super().clear()
+        self.row_versions += 1
+
+    def get_row_versions(self, num_reqs: int) -> np.ndarray:
+        return self.row_versions[:num_reqs]
 
 
 class MultiGroupBlockTable:
@@ -299,6 +345,7 @@ class MultiGroupBlockTable:
         max_num_blocks: list[int],
         cp_kv_cache_interleave_size: int = 1,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
+        track_row_versions: bool = False,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
@@ -341,6 +388,7 @@ class MultiGroupBlockTable:
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
                 slot_mapping_mode=slot_mapping_mode,
+                track_row_versions=track_row_versions,
             )
             for (
                 block_size,

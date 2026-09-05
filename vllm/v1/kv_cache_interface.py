@@ -55,6 +55,13 @@ class KVQuantMode(IntEnum):
     TURBOQUANT_K3V4_NC = 8
     TURBOQUANT_3BIT_NC = 9
     NVFP4_DS_MLA = 10  # opaque-bytes NVFP4 DS-MLA layouts (FlashMLA sparse)
+    # Keep fork-local KVarN modes in a separate range so additions to the
+    # upstream enum cannot silently alias a cache ABI during refreshes.
+    KVARN_K4V2_G128 = 100
+    KVARN_K4V4_G128 = 101
+    KVARN_K4V2_G64 = 102
+    KVARN_K4V4_G64 = 103
+    KVARN_K4V4_G128_COMPACT = 104
 
     @property
     def is_per_token_head(self) -> bool:
@@ -80,6 +87,17 @@ class KVQuantMode(IntEnum):
             KVQuantMode.TURBOQUANT_3BIT_NC,
         )
 
+    @property
+    def is_kvarn(self) -> bool:
+        """True for KVarN variance-normalized KV-cache modes."""
+        return self in (
+            KVQuantMode.KVARN_K4V2_G128,
+            KVQuantMode.KVARN_K4V4_G128,
+            KVQuantMode.KVARN_K4V2_G64,
+            KVQuantMode.KVARN_K4V4_G64,
+            KVQuantMode.KVARN_K4V4_G128_COMPACT,
+        )
+
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
@@ -97,6 +115,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     if kv_cache_dtype.startswith("nvfp4"):
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
+        return KVQuantMode[kv_cache_dtype.upper()]
+    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("kvarn_"):
         return KVQuantMode[kv_cache_dtype.upper()]
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
@@ -1221,6 +1241,7 @@ class KVCacheTensor:
     layer_stride: int
     block_stride: int
     offset: int = 0  # byte offset of layers[0]'s block 0
+    pool_id: int = 0  # physical backing allocation for this placement
 
 
 @dataclass
@@ -1238,6 +1259,14 @@ class KVCacheGroupSpec:
     is_eagle_group: bool = False
     # Whether this group is part of the externally transferable KV state.
     enable_kv_transfer: bool = True
+
+
+@dataclass
+class KVCachePoolSpec:
+    """A physical block-ID namespace shared by one or more cache groups."""
+
+    num_blocks: int
+    group_ids: list[int]
 
 
 @dataclass
@@ -1262,6 +1291,64 @@ class KVCacheConfig:
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
+    kv_cache_pools: list[KVCachePoolSpec] | None = None
+    """Physical cache pools, or one shared legacy pool when omitted."""
+
+    def __post_init__(self) -> None:
+        if self.kv_cache_pools is None:
+            self.kv_cache_pools = [
+                KVCachePoolSpec(
+                    num_blocks=self.num_blocks,
+                    group_ids=list(range(len(self.kv_cache_groups))),
+                )
+            ]
+
+        group_pool_ids: list[int | None] = [None] * len(self.kv_cache_groups)
+        for pool_id, pool in enumerate(self.kv_cache_pools):
+            if pool.num_blocks <= 0:
+                raise ValueError("KV cache pools must contain at least one block")
+            for group_id in pool.group_ids:
+                if not 0 <= group_id < len(self.kv_cache_groups):
+                    raise ValueError(f"Invalid KV cache group id: {group_id}")
+                if group_pool_ids[group_id] is not None:
+                    raise ValueError(
+                        f"KV cache group {group_id} belongs to multiple pools"
+                    )
+                group_pool_ids[group_id] = pool_id
+        if any(pool_id is None for pool_id in group_pool_ids):
+            raise ValueError("Every KV cache group must belong to one pool")
+        self._group_pool_ids = tuple(group_pool_ids)
+        if self.kv_cache_pools:
+            self.num_blocks = min(pool.num_blocks for pool in self.kv_cache_pools)
+
+    def pool_id_for_group(self, group_id: int) -> int:
+        pool_id = self._group_pool_ids[group_id]
+        assert pool_id is not None
+        return pool_id
+
+    def num_blocks_for_group(self, group_id: int) -> int:
+        pool_id = self.pool_id_for_group(group_id)
+        assert self.kv_cache_pools is not None
+        return self.kv_cache_pools[pool_id].num_blocks
+
+    def num_blocks_for_pool(self, pool_id: int) -> int:
+        assert self.kv_cache_pools is not None
+        return self.kv_cache_pools[pool_id].num_blocks
+
+    @property
+    def has_independent_kv_cache_pools(self) -> bool:
+        assert self.kv_cache_pools is not None
+        return len(self.kv_cache_pools) > 1
+
+    @property
+    def max_num_blocks(self) -> int:
+        assert self.kv_cache_pools is not None
+        return max((pool.num_blocks for pool in self.kv_cache_pools), default=0)
+
+    @property
+    def num_managed_groups(self) -> int:
+        """Number of scheduler-managed groups assigned to physical pools."""
+        return len(self._group_pool_ids)
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:

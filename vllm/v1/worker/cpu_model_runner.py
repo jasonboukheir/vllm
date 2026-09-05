@@ -198,6 +198,38 @@ class CPUModelRunner(GPUModelRunner):
                 for block_id in block_ids:
                     kv[block_id].zero_()
 
+    def _zero_block_ids_by_group(
+        self, group_block_ids: list[tuple[int, list[int]]]
+    ) -> None:
+        """Zero attention blocks only in their owning physical CPU pools."""
+        block_ids_by_pool: dict[int, list[int]] = {}
+        for group_id, block_ids in group_block_ids:
+            if not 0 <= group_id < self.kv_cache_config.num_managed_groups:
+                raise ValueError(f"Invalid KV cache group id: {group_id}")
+            pool_id = self.kv_cache_config.pool_id_for_group(group_id)
+            block_ids_by_pool.setdefault(pool_id, []).extend(block_ids)
+
+        seen_ptrs: set[tuple[int, int]] = set()
+        for group_id in range(self.kv_cache_config.num_managed_groups):
+            group = self.kv_cache_config.kv_cache_groups[group_id]
+            if not isinstance(group.kv_cache_spec, FullAttentionSpec):
+                continue
+            pool_id = self.kv_cache_config.pool_id_for_group(group_id)
+            block_ids = block_ids_by_pool.get(pool_id)
+            if not block_ids:
+                continue
+            for layer_name in group.layer_names:
+                ctx = self.compilation_config.static_forward_context.get(layer_name)
+                if ctx is None or not isinstance(ctx.kv_cache, torch.Tensor):
+                    continue
+                kv = ctx.kv_cache
+                pointer_key = (pool_id, kv.data_ptr())
+                if pointer_key in seen_ptrs:
+                    continue
+                seen_ptrs.add(pointer_key)
+                for block_id in dict.fromkeys(block_ids):
+                    kv[block_id].zero_()
+
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         """CPU-safe version: direct tolist() without CUDA events."""
         return sampled_token_ids.tolist()

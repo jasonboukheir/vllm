@@ -8,8 +8,9 @@ from unittest.mock import patch
 import pytest
 
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
 from vllm.v1.worker import gpu_worker, startup_plan
-from vllm.v1.worker.gpu_worker import maybe_rocm_profiling_fallback
+from vllm.v1.worker.gpu_worker import Worker, maybe_rocm_profiling_fallback
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -79,6 +80,41 @@ def test_startup_plan_apply_gate(plan_env):
     explicit = _plan_worker(kv_bytes=7 * GiB_bytes)
     maybe_apply_startup_plan(explicit)
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
+
+
+@pytest.mark.parametrize("runner_generation", ["v1", "v2"])
+@pytest.mark.parametrize(
+    ("cache_dtype", "expect_reset"),
+    [("kvarn_k4v4_g128_compact", True), ("auto", False)],
+)
+def test_kvarn_state_is_reset_immediately_before_model_load(
+    runner_generation, cache_dtype, expect_reset
+):
+    events = []
+    model_runner = SimpleNamespace(
+        generation=runner_generation,
+        load_model=lambda **kwargs: events.append(("load", kwargs)),
+    )
+    worker = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        vllm_config=SimpleNamespace(weight_transfer_config=None),
+        model_runner=model_runner,
+        _maybe_get_memory_pool_context=lambda **kwargs: nullcontext(),
+        _scoped_allocator_max_split=lambda **kwargs: nullcontext(),
+    )
+
+    with patch.object(
+        KVarNAttentionImpl,
+        "reset_process_state",
+        side_effect=lambda: events.append(("reset", {})),
+    ):
+        Worker.load_model(worker, load_dummy_weights=True)
+
+    expected = []
+    if expect_reset:
+        expected.append(("reset", {}))
+    expected.append(("load", {"load_dummy_weights": True}))
+    assert events == expected
 
 
 # Memory accounting of the profiling run (Worker.determine_available_memory).

@@ -200,6 +200,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             max_query_len=num_query_per_req,
             max_seq_len=cad.max_seq_len + num_query_per_req,
             block_table_tensor=cad.block_table_tensor,
+            block_table_cpu=cad.block_table_cpu,
             slot_mapping=query_slot_mapping,
             causal=self.dflash_causal,
         )

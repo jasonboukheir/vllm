@@ -1,0 +1,2737 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""KVarN decode and speculative-verify Triton kernels.
+
+Store/flush kernels pack filled KV tiles into the int4 cache; the decode and
+verify paths attend over that cache (dequantizing selected tiles and reading the
+fp16 tail pool for sink / unflushed blocks). Python entry points:
+``kvarn_decode_attention`` and ``kvarn_verify_attention``.
+
+Cache layout (per block, head) — 17920 bytes, see KVarNConfig.
+
+The task plan for both kernels (which cache blocks to dequant, which pool
+blocks to gather, where they land in the packed buffer) is built once per
+batch in ``KVarNMetadataBuilder.build`` and reused across all 28+ attention
+layer forwards in a step.
+"""
+
+from __future__ import annotations
+
+import functools
+import os
+from dataclasses import dataclass
+
+import torch
+
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
+from vllm.utils.platform_utils import num_compute_units
+
+logger = init_logger(__name__)
+
+_KVARN_NATIVE_RECORD_BYTES = 35_072
+_KVARN_NATIVE_SPLIT_COUNTS = frozenset({1, 2, 4, 8, 16, 17, 24, 32})
+_KVARN_NATIVE_MAX_BATCH = 12
+KVARN_NATIVE_SPLIT_POLICY_FIXED = "fixed"
+KVARN_NATIVE_SPLIT_POLICY_B70_Q6 = "b70_q6"
+KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2 = "b70_q6_v2"
+KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1 = "b70_q6_id18_v1"
+_KVARN_NATIVE_SPLIT_POLICIES = frozenset(
+    {
+        KVARN_NATIVE_SPLIT_POLICY_FIXED,
+        KVARN_NATIVE_SPLIT_POLICY_B70_Q6,
+        KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2,
+        KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1,
+    }
+)
+_KVARN_NATIVE_B70_Q6_POLICIES = frozenset(
+    {
+        KVARN_NATIVE_SPLIT_POLICY_B70_Q6,
+        KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2,
+        KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1,
+    }
+)
+# The B70 primitive factory sweeps showed that ID12 and its independently
+# selectable ID13 reducer variant prefer S=8 at 4K and 16K, but S=32 at
+# 65,023 tokens. Keep the lower-overhead S=8 schedule through 48 Ki tokens and
+# switch only above that conservative, deliberately late boundary. The
+# unmeasured crossover should
+# be retuned from matched service ABBA measurements rather than inferred more
+# aggressively from three points.
+_KVARN_NATIVE_B70_Q6_V2_B4_SPLIT32_AFTER = 48 * 1024
+KVARN_CACHE_LAYOUT_NATURAL = "natural"
+KVARN_CACHE_LAYOUT_XE2_DPAS = "xe2_dpas"
+_KVARN_CACHE_LAYOUTS = frozenset(
+    {KVARN_CACHE_LAYOUT_NATURAL, KVARN_CACHE_LAYOUT_XE2_DPAS}
+)
+KVARN_FRONTEND_REFERENCE = "reference"
+KVARN_FRONTEND_QKV_SCATTER = "qkv_scatter"
+KVARN_FRONTEND_QKV_SCATTER_INLINE = "qkv_scatter_inline"
+KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM = "qkv_scatter_inline_current_stream"
+_KVARN_FRONTEND_VARIANTS = frozenset(
+    {
+        KVARN_FRONTEND_REFERENCE,
+        KVARN_FRONTEND_QKV_SCATTER,
+        KVARN_FRONTEND_QKV_SCATTER_INLINE,
+        KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
+    }
+)
+KVARN_PREFILL_STORE_REFERENCE = "reference"
+KVARN_PREFILL_STORE_HADAMARD_SCATTER = "hadamard_scatter"
+_KVARN_PREFILL_STORE_VARIANTS = frozenset(
+    {KVARN_PREFILL_STORE_REFERENCE, KVARN_PREFILL_STORE_HADAMARD_SCATTER}
+)
+KVARN_NATIVE_KERNEL_BASELINE = 0
+KVARN_NATIVE_KERNEL_QK_I8U4 = 1
+KVARN_NATIVE_KERNEL_Q6_SCALAR = 2
+KVARN_NATIVE_KERNEL_Q8_VECTOR = 3
+KVARN_NATIVE_KERNEL_Q6_VECTOR = 4
+_KVARN_NATIVE_KERNEL_PAGE128_RESERVED = 5
+KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS = 6
+KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS = 7
+KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS = 8
+KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR = 9
+KVARN_NATIVE_KERNEL_Q6_MAIN_GRF128 = 10
+KVARN_NATIVE_KERNEL_Q6_SPLIT_REDUCER_SPECIALIZED = 11
+KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH = 12
+KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER = 13
+_KVARN_NATIVE_B70_Q6_V2_KERNEL_VARIANTS = frozenset(
+    {
+        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
+        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
+    }
+)
+KVARN_NATIVE_KERNEL_Q6_SIMD_UNPACK = 14
+KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE = 15
+KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH = 16
+KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR = 17
+KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR = 18
+KVARN_NATIVE_KERNEL_Q6_PAGE_METADATA_CURSOR = 20
+KVARN_NATIVE_KERNEL_Q6_PAIRED_NIBBLE_HALF2 = 21
+_KVARN_NATIVE_KERNEL_VARIANTS = {
+    "baseline": KVARN_NATIVE_KERNEL_BASELINE,
+    "qk_i8u4": KVARN_NATIVE_KERNEL_QK_I8U4,
+    "q6_scalar": KVARN_NATIVE_KERNEL_Q6_SCALAR,
+    "q8_vector": KVARN_NATIVE_KERNEL_Q8_VECTOR,
+    "q6_vector": KVARN_NATIVE_KERNEL_Q6_VECTOR,
+    "q6_cached_weights": KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS,
+    "q6_exact_rows": KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS,
+    "q6_cached_weights_exact_rows": KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS,
+    "q6_page_pair": KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR,
+    "q6_main_grf128": KVARN_NATIVE_KERNEL_Q6_MAIN_GRF128,
+    "q6_split_reducer_specialized": KVARN_NATIVE_KERNEL_Q6_SPLIT_REDUCER_SPECIALIZED,
+    "q6_next_page_prefetch": KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
+    "q6_next_page_prefetch_split_reducer": (
+        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER
+    ),
+    "q6_simd_unpack": KVARN_NATIVE_KERNEL_Q6_SIMD_UNPACK,
+    "q6_block_output_store": KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE,
+    "q6_current_half_v_prefetch": KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
+    "q6_page_record_cursor": KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
+    "q6_prefetch_record_cursor": KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
+    "q6_page_metadata_cursor": KVARN_NATIVE_KERNEL_Q6_PAGE_METADATA_CURSOR,
+    "q6_paired_nibble_half2": KVARN_NATIVE_KERNEL_Q6_PAIRED_NIBBLE_HALF2,
+}
+_KVARN_NATIVE_DPAS_ONLY_KERNEL_VARIANTS = frozenset(
+    {
+        KVARN_NATIVE_KERNEL_QK_I8U4,
+        KVARN_NATIVE_KERNEL_Q6_SCALAR,
+        KVARN_NATIVE_KERNEL_Q8_VECTOR,
+        KVARN_NATIVE_KERNEL_Q6_VECTOR,
+        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS,
+        KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS,
+        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS,
+        KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR,
+        KVARN_NATIVE_KERNEL_Q6_MAIN_GRF128,
+        KVARN_NATIVE_KERNEL_Q6_SPLIT_REDUCER_SPECIALIZED,
+        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
+        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
+        KVARN_NATIVE_KERNEL_Q6_SIMD_UNPACK,
+        KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE,
+        KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
+        KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
+        KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
+        KVARN_NATIVE_KERNEL_Q6_PAGE_METADATA_CURSOR,
+        KVARN_NATIVE_KERNEL_Q6_PAIRED_NIBBLE_HALF2,
+    }
+)
+_KVARN_NATIVE_Q6_KERNEL_VARIANTS = frozenset(
+    {
+        KVARN_NATIVE_KERNEL_Q6_SCALAR,
+        KVARN_NATIVE_KERNEL_Q6_VECTOR,
+        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS,
+        KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS,
+        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS,
+        KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR,
+        KVARN_NATIVE_KERNEL_Q6_MAIN_GRF128,
+        KVARN_NATIVE_KERNEL_Q6_SPLIT_REDUCER_SPECIALIZED,
+        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
+        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
+        KVARN_NATIVE_KERNEL_Q6_SIMD_UNPACK,
+        KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE,
+        KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
+        KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
+        KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
+        KVARN_NATIVE_KERNEL_Q6_PAGE_METADATA_CURSOR,
+        KVARN_NATIVE_KERNEL_Q6_PAIRED_NIBBLE_HALF2,
+    }
+)
+_KVARN_NATIVE_IMPLEMENTED_KERNEL_VARIANTS = frozenset(
+    _KVARN_NATIVE_KERNEL_VARIANTS.values()
+)
+
+
+def _kvarn_native_work_unit_tokens(kernel_variant: int) -> int:
+    """Return the C++ decoder's scheduling granularity for one variant."""
+    if kernel_variant == _KVARN_NATIVE_KERNEL_PAGE128_RESERVED:
+        raise ValueError("KVarN kernel variant 5 is reserved and cannot be selected")
+    if kernel_variant not in _KVARN_NATIVE_IMPLEMENTED_KERNEL_VARIANTS:
+        raise ValueError(f"unknown KVarN native kernel variant: {kernel_variant}")
+    return 128 if kernel_variant == KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR else 64
+
+
+def _kvarn_native_master_enabled() -> bool:
+    """Return the platform-aware native KVarN master selection."""
+    native_default = "1" if current_platform.is_xpu() else "0"
+    return os.environ.get("KVARN_NATIVE_XPU", native_default) == "1"
+
+
+def kvarn_native_feature_enabled(feature: str) -> bool:
+    """Return whether a native KVarN XPU sub-feature is enabled.
+
+    Native dispatch is the XPU beta default. ``KVARN_NATIVE_XPU=0`` disables it
+    for rollback or comparison; individual sub-features can also be disabled.
+    Unsupported shapes and missing custom ops still fall back to Triton.
+    """
+    return (
+        _kvarn_native_master_enabled()
+        and os.environ.get(f"KVARN_NATIVE_XPU_{feature}", "1") == "1"
+    )
+
+
+def kvarn_cache_layout_requested(
+    default: str = KVARN_CACHE_LAYOUT_NATURAL,
+) -> str:
+    """Resolve the process configuration to a named cache-layout ABI.
+
+    This is intended to be called once by ``KVarNAttentionImpl``. Hot paths
+    must consume the immutable selection stored on that implementation rather
+    than reading environment state again. The named selector leaves room for
+    future layout variants without conflating them with decoder-kernel choices.
+    """
+    named = os.environ.get("KVARN_NATIVE_XPU_CACHE_LAYOUT")
+    legacy = os.environ.get("KVARN_NATIVE_XPU_DPAS_LAYOUT")
+    if named is None:
+        if legacy not in (None, "0", "1"):
+            raise ValueError("KVARN_NATIVE_XPU_DPAS_LAYOUT must be 0 or 1")
+        if legacy is None:
+            return default
+        return (
+            KVARN_CACHE_LAYOUT_XE2_DPAS if legacy == "1" else KVARN_CACHE_LAYOUT_NATURAL
+        )
+    if named not in _KVARN_CACHE_LAYOUTS:
+        choices = ", ".join(sorted(_KVARN_CACHE_LAYOUTS))
+        raise ValueError(f"KVARN_NATIVE_XPU_CACHE_LAYOUT must be one of: {choices}")
+    if legacy is not None:
+        legacy_layout = (
+            KVARN_CACHE_LAYOUT_XE2_DPAS if legacy == "1" else KVARN_CACHE_LAYOUT_NATURAL
+        )
+        if legacy not in ("0", "1") or legacy_layout != named:
+            raise ValueError(
+                "KVARN_NATIVE_XPU_CACHE_LAYOUT conflicts with "
+                "KVARN_NATIVE_XPU_DPAS_LAYOUT"
+            )
+    return named
+
+
+def kvarn_dpas_layout_requested() -> bool:
+    """Compatibility predicate for the named cache-layout selector."""
+    return kvarn_cache_layout_requested() == KVARN_CACHE_LAYOUT_XE2_DPAS
+
+
+def kvarn_frontend_variant_requested(
+    default: str = KVARN_FRONTEND_REFERENCE,
+) -> str:
+    """Resolve the immutable Q/K/V transform/store frontend selection."""
+    variant = os.environ.get("KVARN_NATIVE_XPU_FRONTEND", default)
+    if variant not in _KVARN_FRONTEND_VARIANTS:
+        choices = ", ".join(sorted(_KVARN_FRONTEND_VARIANTS))
+        raise ValueError(f"KVARN_NATIVE_XPU_FRONTEND must be one of: {choices}")
+    return variant
+
+
+def kvarn_prefill_store_variant_requested(
+    default: str = KVARN_PREFILL_STORE_REFERENCE,
+) -> str:
+    """Resolve the immutable multi-token K/V prefill-store selection."""
+    variant = os.environ.get("KVARN_NATIVE_XPU_PREFILL_STORE", default)
+    if variant not in _KVARN_PREFILL_STORE_VARIANTS:
+        choices = ", ".join(sorted(_KVARN_PREFILL_STORE_VARIANTS))
+        raise ValueError("KVARN_NATIVE_XPU_PREFILL_STORE must be one of: " + choices)
+    return variant
+
+
+def _require_kvarn_dpas_reader(dpas_layout: bool, selected: bool, reader: str) -> None:
+    if dpas_layout and not selected:
+        raise RuntimeError(
+            "The selected xe2_dpas KVarN cache layout requires a matching "
+            f"reader; refusing the natural-layout {reader} fallback"
+        )
+
+
+def _kvarn_dpas_layout_for_problem(
+    dpas_layout: bool,
+    head_dim: int,
+    group: int,
+    key_bits: int,
+    value_bits: int,
+) -> bool:
+    """Validate and return the DPAS-layout selection for one cache ABI."""
+    if not dpas_layout:
+        return False
+    actual = (head_dim, group, key_bits, value_bits)
+    if actual != (256, 128, 4, 4):
+        raise RuntimeError(
+            "The xe2_dpas KVarN cache layout requires D256/G128/K4V4; "
+            f"got D{actual[0]}/G{actual[1]}/K{actual[2]}V{actual[3]}"
+        )
+    return True
+
+
+def kvarn_native_split_policy_requested(
+    default: str = KVARN_NATIVE_SPLIT_POLICY_FIXED,
+) -> tuple[str, int]:
+    """Resolve the split policy and scratch capacity once per engine."""
+    policy = os.environ.get("KVARN_NATIVE_XPU_SPLIT_POLICY", default)
+    if policy not in _KVARN_NATIVE_SPLIT_POLICIES:
+        choices = ", ".join(sorted(_KVARN_NATIVE_SPLIT_POLICIES))
+        raise ValueError(f"KVARN_NATIVE_XPU_SPLIT_POLICY must be one of: {choices}")
+    if policy in _KVARN_NATIVE_B70_Q6_POLICIES:
+        if "KVARN_NATIVE_XPU_SPLITS" in os.environ:
+            raise ValueError(
+                "KVARN_NATIVE_XPU_SPLITS conflicts with "
+                f"KVARN_NATIVE_XPU_SPLIT_POLICY={policy}"
+            )
+        return policy, 32
+
+    text = os.environ.get("KVARN_NATIVE_XPU_SPLITS", "16")
+    try:
+        splits = int(text)
+    except ValueError as exc:
+        raise ValueError(
+            "KVARN_NATIVE_XPU_SPLITS must be one of 1, 2, 4, 8, 16, 17, 24, or 32"
+        ) from exc
+    if splits not in _KVARN_NATIVE_SPLIT_COUNTS:
+        raise ValueError(
+            "KVARN_NATIVE_XPU_SPLITS must be one of 1, 2, 4, 8, 16, 17, 24, or 32"
+        )
+    return policy, splits
+
+
+def kvarn_native_kernel_variant_requested(default: str = "baseline") -> tuple[str, int]:
+    """Resolve the native implementation independently from cache layout."""
+    name = os.environ.get("KVARN_NATIVE_XPU_KERNEL_VARIANT", default)
+    try:
+        return name, _KVARN_NATIVE_KERNEL_VARIANTS[name]
+    except KeyError as exc:
+        choices = ", ".join(sorted(_KVARN_NATIVE_KERNEL_VARIANTS))
+        raise ValueError(
+            f"KVARN_NATIVE_XPU_KERNEL_VARIANT must be one of: {choices}"
+        ) from exc
+
+
+def validate_kvarn_native_factory_selection(
+    cache_layout: str,
+    kernel_variant_name: str,
+    kernel_variant: int,
+    split_policy: str = KVARN_NATIVE_SPLIT_POLICY_FIXED,
+) -> None:
+    """Fail before cache allocation when a kernel/layout ABI is incompatible."""
+    if kernel_variant == _KVARN_NATIVE_KERNEL_PAGE128_RESERVED:
+        raise ValueError("KVarN kernel variant 5 is reserved and cannot be selected")
+    registered_variant = _KVARN_NATIVE_KERNEL_VARIANTS.get(kernel_variant_name)
+    if registered_variant != kernel_variant:
+        raise ValueError(
+            "KVarN kernel variant name/id pair is not registered: "
+            f"{kernel_variant_name!r}({kernel_variant})"
+        )
+    if (
+        kernel_variant in _KVARN_NATIVE_DPAS_ONLY_KERNEL_VARIANTS
+        and cache_layout != KVARN_CACHE_LAYOUT_XE2_DPAS
+    ):
+        raise ValueError(
+            f"KVarN kernel variant {kernel_variant_name!r} requires "
+            f"KVARN_NATIVE_XPU_CACHE_LAYOUT={KVARN_CACHE_LAYOUT_XE2_DPAS}"
+        )
+    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES and (
+        kernel_variant not in _KVARN_NATIVE_Q6_KERNEL_VARIANTS
+    ):
+        raise ValueError(
+            f"KVarN split policy {split_policy!r} requires a Q6 kernel variant"
+        )
+    if (
+        split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2
+        and kernel_variant not in _KVARN_NATIVE_B70_Q6_V2_KERNEL_VARIANTS
+    ):
+        raise ValueError(
+            "KVarN split policy 'b70_q6_v2' requires kernel variant "
+            "'q6_next_page_prefetch'(12) or "
+            "'q6_next_page_prefetch_split_reducer'(13)"
+        )
+    if (
+        split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1
+        and kernel_variant != KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR
+    ):
+        raise ValueError(
+            "KVarN split policy 'b70_q6_id18_v1' requires kernel variant "
+            "'q6_prefetch_record_cursor'(18)"
+        )
+
+
+@functools.lru_cache(maxsize=256)
+def _kvarn_native_split_count_cached(
+    max_seq_len: int,
+    max_splits: int,
+    batch_size: int,
+    split_policy: str,
+    kernel_variant: int,
+) -> int:
+    splits = max_splits
+    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES:
+        if not 1 <= batch_size <= _KVARN_NATIVE_MAX_BATCH:
+            raise ValueError(
+                f"{split_policy} split policy supports batch sizes 1 through 12"
+            )
+        if batch_size == 1:
+            splits = 32
+        elif batch_size == 2:
+            splits = 16
+        elif batch_size == 3:
+            splits = 8
+        elif batch_size == 4:
+            if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1:
+                splits = 24
+            elif (
+                split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2
+                and max_seq_len > _KVARN_NATIVE_B70_Q6_V2_B4_SPLIT32_AFTER
+            ):
+                splits = 32
+            else:
+                splits = 8
+        elif batch_size <= 8:
+            splits = 4
+        else:
+            splits = 2
+
+    # Mirror the C++ wrapper's variant-specific work-unit rule exactly. The
+    # paired-page kernel schedules K128 pages; every other current native
+    # implementation schedules K64 tiles. Using K64 unconditionally can make
+    # Python enable the multi-split output reducer after C++ has collapsed the
+    # launch to one split, which C++ correctly rejects as an ABI mismatch.
+    work_unit_tokens = _kvarn_native_work_unit_tokens(kernel_variant)
+    kv_tiles = (max_seq_len + work_unit_tokens - 1) // work_unit_tokens
+    return 1 if splits > 1 and kv_tiles < splits else splits
+
+
+def kvarn_native_split_count(
+    max_seq_len: int,
+    max_splits: int | None = None,
+    *,
+    batch_size: int = 1,
+    split_policy: str | None = None,
+    kernel_variant: int = KVARN_NATIVE_KERNEL_BASELINE,
+) -> int:
+    """Select the explicit native split count for one context extent.
+
+    Production callers pass the policy and kernel variant frozen by
+    ``KVarNAttentionImpl``. The defaults keep this helper source-compatible for
+    focused tests and direct callers while matching the baseline K64 kernel.
+    """
+    if max_splits is None:
+        requested_policy, max_splits = kvarn_native_split_policy_requested()
+        if split_policy is None:
+            split_policy = requested_policy
+    elif split_policy is None:
+        split_policy = KVARN_NATIVE_SPLIT_POLICY_FIXED
+    if split_policy not in _KVARN_NATIVE_SPLIT_POLICIES:
+        raise ValueError(f"unknown KVarN native split policy: {split_policy}")
+    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES and max_splits != 32:
+        raise ValueError(f"{split_policy} split policy requires max_splits=32")
+    return _kvarn_native_split_count_cached(
+        max_seq_len, max_splits, batch_size, split_policy, kernel_variant
+    )
+
+
+def kvarn_native_split_scratch_count(
+    max_seq_len: int,
+    max_splits: int,
+    split_policy: str,
+    kernel_variant: int = KVARN_NATIVE_KERNEL_BASELINE,
+) -> int:
+    """Return persistent scratch capacity for the engine-lifetime policy."""
+    _kvarn_native_work_unit_tokens(kernel_variant)
+    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES:
+        if max_splits != 32:
+            raise ValueError(f"{split_policy} split policy requires max_splits=32")
+        return max_splits
+    return kvarn_native_split_count(
+        max_seq_len,
+        max_splits,
+        kernel_variant=kernel_variant,
+    )
+
+
+def _kvarn_native_scratch_views(
+    native_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    batch_size: int,
+    num_query_heads: int,
+    num_splits: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """View capacity-sized scratch through the custom operator's exact ABI.
+
+    Narrowing an inner dimension of the capacity allocation leaves gaps between
+    batches and is therefore non-contiguous whenever ``num_splits`` is below
+    the allocation maximum.  The scratch contents are disposable, so remap a
+    contiguous prefix of each allocation instead.  ``view`` deliberately fails
+    rather than copying if a future caller supplies non-contiguous storage.
+    """
+    temp_output, exp_sums, max_logits = native_scratch
+    head_dim = temp_output.shape[-1]
+    temp_elements = batch_size * num_query_heads * num_splits * head_dim
+    stats_elements = batch_size * num_query_heads * num_splits
+    return (
+        temp_output.view(-1)[:temp_elements].view(
+            batch_size, num_query_heads * num_splits, head_dim
+        ),
+        exp_sums.view(-1)[:stats_elements].view(
+            batch_size, num_query_heads, num_splits
+        ),
+        max_logits.view(-1)[:stats_elements].view(
+            batch_size, num_query_heads, num_splits
+        ),
+    )
+
+
+def _kvarn_op_supports_argument(op: object, argument: str) -> bool:
+    """Return whether an installed custom-op schema has a named argument."""
+    try:
+        arguments = op.default._schema.arguments  # type: ignore[attr-defined]
+    except (AttributeError, RuntimeError):
+        return False
+    return any(schema_arg.name == argument for schema_arg in arguments)
+
+
+@functools.lru_cache(maxsize=8)
+def kvarn_native_layout_abi_supported(op_name: str) -> bool:
+    """Require the immutable-layout ABI before selecting a native cache op."""
+    if not hasattr(torch.ops._vllm_fa2_C, op_name):
+        return False
+    return _kvarn_op_supports_argument(
+        getattr(torch.ops._vllm_fa2_C, op_name), "dpas_layout"
+    )
+
+
+@functools.lru_cache(maxsize=2)
+def kvarn_native_decode_abi_supported(with_scratch: bool) -> bool:
+    """Require explicit layout and split-count decode provenance."""
+    op_name = "kvarn_decode_with_scratch" if with_scratch else "kvarn_decode"
+    if not kvarn_native_layout_abi_supported(op_name):
+        return False
+    op = getattr(torch.ops._vllm_fa2_C, op_name)
+    return _kvarn_op_supports_argument(
+        op, "num_kv_splits"
+    ) and _kvarn_op_supports_argument(op, "kernel_variant")
+
+
+@functools.lru_cache(maxsize=2)
+def kvarn_native_output_hadamard_supported(with_scratch: bool) -> bool:
+    """Detect the opt-in fused reducer ABI without assuming a kernel version."""
+    op_name = "kvarn_decode_with_scratch" if with_scratch else "kvarn_decode"
+    if not hasattr(torch.ops._vllm_fa2_C, op_name):
+        return False
+    op = getattr(torch.ops._vllm_fa2_C, op_name)
+    return _kvarn_op_supports_argument(op, "unrotate_output")
+
+
+@functools.lru_cache(maxsize=2)
+def kvarn_native_bf16_output_supported(with_scratch: bool) -> bool:
+    """Detect direct public-output support without assuming extension parity."""
+    op_name = "kvarn_decode_with_scratch" if with_scratch else "kvarn_decode"
+    if not hasattr(torch.ops._vllm_fa2_C, op_name):
+        return False
+    op = getattr(torch.ops._vllm_fa2_C, op_name)
+    return _kvarn_op_supports_argument(op, "write_bf16_output")
+
+
+def _kvarn_native_output_hadamard_enabled(
+    num_kv_splits: int, with_scratch: bool
+) -> bool:
+    return num_kv_splits > 1 and kvarn_native_output_hadamard_supported(with_scratch)
+
+
+def kvarn_native_problem_supported(
+    *,
+    device_type: str,
+    batch_size: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    group: int,
+    key_bits: int,
+    value_bits: int,
+    record_bytes: int,
+    sliding_window: int,
+    has_lookup: bool,
+    has_tail_pool: bool,
+    is_capturing: bool,
+) -> bool:
+    """Pure eligibility check for the narrow Xe2 qlen=1 decoder ABI."""
+    return (
+        device_type == "xpu"
+        and 1 <= batch_size <= _KVARN_NATIVE_MAX_BATCH
+        and num_query_heads == 24
+        and num_kv_heads == 4
+        and head_dim == 256
+        and group == 128
+        and key_bits == 4
+        and value_bits == 4
+        and record_bytes >= _KVARN_NATIVE_RECORD_BYTES
+        and record_bytes % 4 == 0
+        and sliding_window == 0
+        and has_lookup
+        and has_tail_pool
+        and not is_capturing
+    )
+
+
+def kvarn_native_store_supported(
+    *,
+    device_type: str,
+    num_tokens: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    group: int,
+    key_bits: int,
+    value_bits: int,
+    record_bytes: int,
+    sliding_window: int,
+    key_dtype: torch.dtype,
+    value_dtype: torch.dtype,
+    has_lookup: bool,
+    has_tail_pool: bool,
+    is_capturing: bool,
+    op_available: bool,
+) -> bool:
+    """Pure eligibility check for the native qlen=1 K/V transform/store."""
+    return (
+        kvarn_native_feature_enabled("DECODE")
+        and kvarn_native_problem_supported(
+            device_type=device_type,
+            batch_size=num_tokens,
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            group=group,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            record_bytes=record_bytes,
+            sliding_window=sliding_window,
+            has_lookup=has_lookup,
+            has_tail_pool=has_tail_pool,
+            is_capturing=is_capturing,
+        )
+        and key_dtype in (torch.float16, torch.bfloat16)
+        and value_dtype == key_dtype
+        and op_available
+    )
+
+
+def kvarn_native_prefill_store_supported(
+    *,
+    device_type: str,
+    num_tokens: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    group: int,
+    key_bits: int,
+    value_bits: int,
+    record_bytes: int,
+    sliding_window: int,
+    key_dtype: torch.dtype,
+    value_dtype: torch.dtype,
+    has_lookup: bool,
+    has_tail_pool: bool,
+    is_capturing: bool,
+    op_available: bool,
+) -> bool:
+    """Pure eligibility check for the opt-in Xe2 multi-token K/V writer.
+
+    Unlike the qlen=1 decoder/store contract this path has no B<=12 limit: the
+    writer launches one independent subgroup per (token, K/V, KV head), and
+    its ABI carries the token count as an int64. Runtime tensor-shape checks
+    remain in the backend before the custom op is called.
+    """
+    return (
+        _kvarn_native_master_enabled()
+        and device_type == "xpu"
+        and num_tokens > 1
+        and num_query_heads == 24
+        and num_kv_heads == 4
+        and head_dim == 256
+        and group == 128
+        and key_bits == 4
+        and value_bits == 4
+        and record_bytes >= _KVARN_NATIVE_RECORD_BYTES
+        and record_bytes % 4 == 0
+        and sliding_window == 0
+        and key_dtype in (torch.float16, torch.bfloat16)
+        and value_dtype == key_dtype
+        and has_lookup
+        and has_tail_pool
+        and not is_capturing
+        and op_available
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def kvarn_native_layer_selected(layer_name: str, layer_filter: str) -> bool:
+    """Match comma-separated layer paths on dot-component boundaries."""
+    if not layer_filter:
+        return True
+    dotted_name = f".{layer_name.strip('.')}."
+    return any(
+        f".{candidate.strip().strip('.')}." in dotted_name
+        for candidate in layer_filter.split(",")
+        if candidate.strip()
+    )
+
+
+@dataclass(frozen=True)
+class KVarNTrustedNativeDecodePlan:
+    """Engine-lifetime native decode facts proven by the inline frontend."""
+
+    max_batch: int
+    use_native_hadamard: bool
+    use_scratch_op: bool
+    output_hadamard_supported: bool
+    bf16_output_supported: bool
+
+
+@dataclass(frozen=True)
+class KVarNBoundNativeDecodePlanV2:
+    """Immutable native bindings qualified by the Variant H frontend."""
+
+    max_batch: int
+    dpas_layout: bool
+    q_rot_fp16: torch.Tensor
+    fused_out: torch.Tensor
+    native_output_fp16: torch.Tensor
+    native_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+    block_to_slot: torch.Tensor
+    tail_key: torch.Tensor
+    tail_value: torch.Tensor
+    use_native_hadamard: bool
+    use_scratch_op: bool
+    output_hadamard_supported: bool
+    direct_bf16_output: bool
+    max_splits: int
+    split_policy: str
+    kernel_variant: int
+
+
+def build_kvarn_trusted_native_decode_plan(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    cfg,
+    impl,
+    md,
+) -> KVarNTrustedNativeDecodePlan | None:
+    """Prove immutable native decode facts for an opt-in eager inline route."""
+    if query.ndim != 3 or kv_cache.ndim != 3:
+        return None
+    batch_size, num_query_heads, head_dim = query.shape
+    num_kv_heads = kv_cache.shape[1]
+    group = cfg.group
+    try:
+        _kvarn_dpas_layout_for_problem(
+            impl._kvarn_dpas_layout,
+            head_dim,
+            group,
+            cfg.key_bits,
+            cfg.value_bits,
+        )
+    except RuntimeError:
+        return None
+
+    q_rot = getattr(impl, "_q_rot_fp16_buf", None)
+    fused_out = getattr(impl, "_fused_out_buf", None)
+    native_output = getattr(impl, "_native_output_fp16_buf", None)
+    block_to_slot = getattr(impl, "_block_to_slot_t", None)
+    tail_key = getattr(impl, "_tail_K_pool", None)
+    tail_value = getattr(impl, "_tail_V_pool", None)
+    required = (q_rot, fused_out, native_output, block_to_slot, tail_key, tail_value)
+    if not all(isinstance(tensor, torch.Tensor) for tensor in required):
+        return None
+    if (
+        q_rot.ndim != 2
+        or fused_out.ndim != 2
+        or native_output.ndim != 2
+        or q_rot.shape[1] != head_dim
+        or fused_out.shape[1] != head_dim
+        or native_output.shape[1] != head_dim
+    ):
+        return None
+
+    is_capturing = (
+        query.device.type == "xpu" and torch.xpu.is_current_stream_capturing()
+    )
+    native_supported = (
+        kvarn_native_feature_enabled("DECODE")
+        and kvarn_native_problem_supported(
+            device_type=query.device.type,
+            batch_size=batch_size,
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            group=group,
+            key_bits=cfg.key_bits,
+            value_bits=cfg.value_bits,
+            record_bytes=cfg.record_bytes,
+            sliding_window=int(getattr(impl, "sliding_window", 0) or 0),
+            has_lookup=True,
+            has_tail_pool=True,
+            is_capturing=is_capturing,
+        )
+        and kvarn_native_layer_selected(
+            getattr(impl, "layer_name", ""),
+            os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
+        )
+        and kv_cache.shape[-1] == cfg.record_bytes
+        and kv_cache.is_contiguous()
+        and md.block_table[:batch_size].is_contiguous()
+        and md.seq_lens[:batch_size].is_contiguous()
+        and block_to_slot.is_contiguous()
+        and tail_key.is_contiguous()
+        and tail_value.is_contiguous()
+        and q_rot.is_contiguous()
+        and fused_out.is_contiguous()
+        and int(md.max_seq_len) >= 1
+        and kvarn_native_decode_abi_supported(False)
+        and query.dtype in (torch.float16, torch.bfloat16)
+        and query.reshape(batch_size * num_query_heads, head_dim).stride(1) == 1
+    )
+    if not native_supported:
+        return None
+
+    max_batch = min(
+        _KVARN_NATIVE_MAX_BATCH,
+        q_rot.shape[0] // num_query_heads,
+        fused_out.shape[0] // num_query_heads,
+        native_output.shape[0] // num_query_heads,
+        max(int(getattr(impl, "_max_num_seqs", _KVARN_NATIVE_MAX_BATCH)), 1),
+    )
+    native_scratch = getattr(impl, "_native_decode_scratch", None)
+    use_scratch_op = (
+        native_scratch is not None
+        and len(native_scratch) == 3
+        and native_scratch[0].ndim == 3
+        and native_scratch[1].ndim == 3
+        and native_scratch[2].ndim == 3
+        and native_scratch[0].shape[0] >= max_batch
+        and native_scratch[0].shape[1]
+        >= num_query_heads * impl._kvarn_native_max_splits
+        and native_scratch[1].shape[0] >= max_batch
+        and native_scratch[1].shape[2] >= impl._kvarn_native_max_splits
+        and native_scratch[2].shape[0] >= max_batch
+        and native_scratch[2].shape[2] >= impl._kvarn_native_max_splits
+        and kvarn_native_decode_abi_supported(True)
+    )
+    if use_scratch_op:
+        max_batch = min(max_batch, *(tensor.shape[0] for tensor in native_scratch))
+
+    return KVarNTrustedNativeDecodePlan(
+        max_batch=max_batch,
+        use_native_hadamard=(
+            hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard")
+            and native_output.shape[1] == head_dim
+            and native_output.is_contiguous()
+        ),
+        use_scratch_op=use_scratch_op,
+        output_hadamard_supported=kvarn_native_output_hadamard_supported(
+            use_scratch_op
+        ),
+        bf16_output_supported=kvarn_native_bf16_output_supported(use_scratch_op),
+    )
+
+
+# Number of KV-sequence splits for the split-K flash-decoding kernel. More
+# splits = better load-balancing of ragged burst seqlens across SMs, at the cost
+# of a larger fp32 partial-output scratch + more stage-2 combine work.
+KVARN_NUM_KV_SPLITS = int(os.environ.get("KVARN_NUM_KV_SPLITS", "16"))
+KVARN_MAX_KV_SPLITS = 64  # cap of the context-adaptive schedule below
+
+# Shared autotune space for the decode kernels (single-token, split-K stage1,
+# and spec-verify). ncu on the burst single-stage kernel showed it pinned at
+# ~25% occupancy (register-limited to 3 blocks/SM) and bottlenecked on L1/TEX
+# transaction rate, not DRAM bandwidth. So beyond BLOCK_N x num_warps we let the
+# autotuner trade pipelining for occupancy: num_stages=1 (no pipeline buffers,
+# fewer registers) and a couple of maxnreg caps (more resident blocks to hide
+# the L1 latency). The autotuner keeps whichever is fastest per shape, so this
+# is pure upside; online-softmax / split-K make the output reduction-order
+# invariant (fp noise only), independent of the config chosen.
+_DECODE_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_N": bn}, num_warps=nw, num_stages=ns)
+    for bn in (16, 32, 64)
+    for nw in (2, 4)
+    for ns in (1, 2)
+] + (
+    []
+    if current_platform.is_xpu()
+    else [
+        triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2, maxnreg=mr)
+        for mr in (64, 96)
+    ]
+)
+
+
+def adaptive_num_kv_splits(max_blocks_per_req: int) -> int:
+    """Context-adaptive split-K count (single source of truth for the decode
+    driver AND the partial-buffer sizing, so they can never diverge).
+
+    Depends only on the deployment's max_model_len (via max_blocks_per_req =
+    ceil(max_model_len/group)), so it is CONSTANT per deployment -> CUDA-graph
+    safe and changes nothing for short-context deployments. 16 split under-
+    parallelized the stage-1 (B, Hk, SPLITS) grid at low batch: the single-token
+    decode microbench (Qwen3-4B, ctx 4.6K) measured 37us at 16 vs ~27us at 32,
+    a ~28% stage-1 win, growing at longer ctx (16K: 82->49us). Split-K is
+    log-sum-exp-combined, so the count never changes the OUTPUT, only occupancy;
+    32 is the floor up to 256 blocks. KVARN_NUM_KV_SPLITS overrides."""
+    env = os.environ.get("KVARN_NUM_KV_SPLITS")
+    if env is not None:
+        return int(env)
+    if max_blocks_per_req <= 256:
+        return 32
+    return KVARN_MAX_KV_SPLITS
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage α-2 scatter store: writes (already-rotated) k, v into the tail pool at
+# positions derived from slot_mapping. Replaces the Python for-loop in
+# do_kv_cache_update so the whole store path is capturable.
+#
+# Pool layout: [POOL_SIZE, group, Hk, D] fp16. The pool slot is found via the
+# sparse Block_to_slot lookup (block_id → slot, -1 if the block lives in the
+# int4 cache). pos = slot_mapping % group. The lookup table is mutated only by
+# the metadata builder (outside any captured region).
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@triton.jit
+def _kvarn_scatter_store_kernel(
+    K_in_ptr,  # [N, Hk, D]                    fp16 (already rotated)
+    V_in_ptr,  # [N, Hk, D]                    fp16
+    Slot_mapping_ptr,  # [N]                           int32   (slot < 0 ⇒ pad)
+    Block_to_slot_ptr,  # [num_blocks_lookup]           int32   (-1 = no slot)
+    Pool_K_ptr,  # [POOL_SIZE, group, Hk, D]     fp16
+    Pool_V_ptr,  # [POOL_SIZE, group, Hk, D]     fp16
+    # strides
+    stride_in_n,
+    stride_in_h,
+    stride_pool_b,
+    stride_pool_t,
+    stride_pool_h,
+    # constexprs
+    GROUP: tl.constexpr,
+    D: tl.constexpr,
+    NUM_BLOCKS_LOOKUP: tl.constexpr,
+):
+    """Scatter one (token, kv_head) row from k, v into pool[slot, pos, hk, :].
+    slot = Block_to_slot_ptr[slot_mapping[i] // GROUP],
+    pos  = slot_mapping[i] % GROUP.
+    Skips i where slot_mapping < 0 (padding) or block_to_slot < 0 (no slot
+    yet — shouldn't happen if the metadata builder pre-allocated correctly).
+    Grid: (N, Hk).
+    """
+    i = tl.program_id(0)
+    hk = tl.program_id(1)
+
+    sm = tl.load(Slot_mapping_ptr + i)
+    if sm < 0:
+        return
+
+    block_id = sm // GROUP
+    pos = (sm % GROUP).to(tl.int64)
+    in_range = (block_id >= 0) & (block_id < NUM_BLOCKS_LOOKUP)
+    if not in_range:
+        return
+    pool_slot = tl.load(Block_to_slot_ptr + block_id)
+    if pool_slot < 0:
+        return
+
+    d = tl.arange(0, D)
+    src_offs = i * stride_in_n + hk * stride_in_h + d
+    k_row = tl.load(K_in_ptr + src_offs)
+    v_row = tl.load(V_in_ptr + src_offs)
+
+    dst_offs = (
+        pool_slot.to(tl.int64) * stride_pool_b
+        + pos * stride_pool_t
+        + hk * stride_pool_h
+        + d
+    )
+    tl.store(Pool_K_ptr + dst_offs, k_row)
+    tl.store(Pool_V_ptr + dst_offs, v_row)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage α-2 capture-correct: ONE block_table-driven build-packed-KV kernel.
+# Reads vLLM's persistent block_table + seq_lens directly (so a captured CUDA
+# graph sees fresh data each replay), and writes the packed varlen fp16 K/V
+# that flash_attn_varlen consumes. Fixed grid (B * MAX_BLOCKS_PER_REQ, Hk) so
+# the launch dims are constant per captured batch size. Per (block, head):
+#   - pool_slot >= 0  → fp16 already-rotated tokens copied from the tail pool
+#                       (sink at k==0; in-progress tail at k==n_full).
+#   - pool_slot <  0  → block lives in the int4 cache; dequant it in-place.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@triton.jit
+def _kvarn_build_packed_kv_kernel(
+    Block_table_ptr,  # [B, max_blocks]                          int32
+    Seq_lens_ptr,  # [B]                                      int32
+    Cu_seqlens_ptr,  # [B+1] int32 (prefix sum of seq_lens)
+    Block_to_slot_ptr,  # [num_blocks_lookup] int32 (-1 = in int4 cache)
+    KV_cache_ptr,  # [num_blocks, num_kv_heads, TILE_BYTES]   uint8
+    Tail_K_pool_ptr,  # [POOL_SIZE, group, Hk, D]                fp16 (rotated)
+    Tail_V_pool_ptr,  # [POOL_SIZE, group, Hk, D]                fp16
+    K_out_ptr,  # [max_total_tokens, Hk, D]                fp16 (packed, rotated)
+    V_out_ptr,  # [max_total_tokens, Hk, D]                fp16
+    # strides
+    stride_bt_b,
+    stride_kv_b,
+    stride_kv_h,
+    stride_pool_b,
+    stride_pool_t,
+    stride_pool_h,
+    stride_out_t,
+    stride_out_h,
+    # constexprs
+    MAX_BLOCKS_PER_REQ: tl.constexpr,
+    D: tl.constexpr,
+    GROUP: tl.constexpr,
+    K_BITS: tl.constexpr,
+    V_BITS: tl.constexpr,
+    NUM_BLOCKS_LOOKUP: tl.constexpr,
+    K_PACKED_OFFSET: tl.constexpr,
+    K_S_COL_OFFSET: tl.constexpr,
+    K_ZP_OFFSET: tl.constexpr,
+    K_S_ROW_OFFSET: tl.constexpr,
+    V_PACKED_OFFSET: tl.constexpr,
+    V_S_COL_OFFSET: tl.constexpr,
+    V_S_ROW_OFFSET: tl.constexpr,
+    V_ZP_OFFSET: tl.constexpr,
+    DPAS_LAYOUT: tl.constexpr = False,
+):
+    """Grid: (B * MAX_BLOCKS_PER_REQ, Hk). One (request-block, head) per program.
+    b is always < B by construction (grid dim 0 == B*MAX_BLOCKS_PER_REQ), so no
+    runtime-B guard is needed — avoiding it keeps the kernel free of a
+    non-constexpr early-return that Triton's type inference mishandles."""
+    bk = tl.program_id(0)
+    hk = tl.program_id(1)
+    b = bk // MAX_BLOCKS_PER_REQ
+    k = bk % MAX_BLOCKS_PER_REQ
+
+    seq_len = tl.load(Seq_lens_ptr + b)
+    # tokens this block contributes = clamp(seq_len - k*GROUP, 0, GROUP).
+    # n_tok <= 0 ⇒ padding program (block beyond this request's length).
+    rem = seq_len - k * GROUP
+    n_tok = tl.minimum(tl.maximum(rem, 0), GROUP)
+    if n_tok <= 0:
+        return
+
+    block_id = tl.load(Block_table_ptr + b * stride_bt_b + k)
+    dst_base = tl.load(Cu_seqlens_ptr + b).to(tl.int64) + k.to(tl.int64) * GROUP
+
+    d_offs = tl.arange(0, D)
+    g_offs = tl.arange(0, GROUP)
+    g_mask = g_offs < n_tok
+
+    # Always-tensor slot lookup (masked load → -1 when block_id out of range).
+    # Avoids mixing a Python int with a tensor across the branch below, which
+    # Triton's type inference rejects in the general-batch compilation.
+    in_range = (block_id >= 0) & (block_id < NUM_BLOCKS_LOOKUP)
+    safe_bid = tl.where(in_range, block_id, 0)
+    pool_slot = tl.load(Block_to_slot_ptr + safe_bid, mask=in_range, other=-1)
+
+    out_addrs = (
+        (dst_base + g_offs)[:, None] * stride_out_t
+        + hk * stride_out_h
+        + d_offs[None, :]
+    )
+
+    if pool_slot >= 0:
+        # ── fp16 tokens already rotated in the pool (sink / in-progress tail) ──
+        pool_base = pool_slot.to(tl.int64) * stride_pool_b + hk * stride_pool_h
+        src_addrs = pool_base + g_offs[:, None] * stride_pool_t + d_offs[None, :]
+        K_chunk = tl.load(Tail_K_pool_ptr + src_addrs, mask=g_mask[:, None], other=0.0)
+        V_chunk = tl.load(Tail_V_pool_ptr + src_addrs, mask=g_mask[:, None], other=0.0)
+        tl.store(K_out_ptr + out_addrs, K_chunk, mask=g_mask[:, None])
+        tl.store(V_out_ptr + out_addrs, V_chunk, mask=g_mask[:, None])
+    else:
+        # ── quantised block: dequant in-place to rotated fp16. Bit-width-aware:
+        # the K/V packing strides follow K_BITS / V_BITS exactly as
+        # in the fused decode kernels. The old hardcoded 4-bit V layout (stride
+        # D//2, shift (d%2)*4, mask 0xF) read past the 2-bit-V packed region of
+        # the default k4v2 preset into the V scales -> garbage V on this path.
+        PACK_K: tl.constexpr = 8 // K_BITS
+        PACK_V: tl.constexpr = 8 // V_BITS
+        MASK_K: tl.constexpr = (1 << K_BITS) - 1
+        MASK_V: tl.constexpr = (1 << V_BITS) - 1
+        tile_base = block_id.to(tl.int64) * stride_kv_b + hk * stride_kv_h
+        g_byte_k = g_offs // PACK_K
+        g_shift_k = (g_offs % PACK_K) * K_BITS
+        d_byte_v = d_offs // PACK_V
+        d_shift_v = (d_offs % PACK_V) * V_BITS
+
+        sk_lo = tl.load(KV_cache_ptr + tile_base + K_S_COL_OFFSET + d_offs * 2).to(
+            tl.uint16
+        )
+        sk_hi = tl.load(KV_cache_ptr + tile_base + K_S_COL_OFFSET + d_offs * 2 + 1).to(
+            tl.uint16
+        )
+        s_col_K = ((sk_lo | (sk_hi << 8)).to(tl.float16, bitcast=True)).to(tl.float32)
+        zk_lo = tl.load(KV_cache_ptr + tile_base + K_ZP_OFFSET + d_offs * 2).to(
+            tl.uint16
+        )
+        zk_hi = tl.load(KV_cache_ptr + tile_base + K_ZP_OFFSET + d_offs * 2 + 1).to(
+            tl.uint16
+        )
+        zp_K = ((zk_lo | (zk_hi << 8)).to(tl.float16, bitcast=True)).to(tl.float32)
+        srk_lo = tl.load(KV_cache_ptr + tile_base + K_S_ROW_OFFSET + g_offs * 2).to(
+            tl.uint16
+        )
+        srk_hi = tl.load(KV_cache_ptr + tile_base + K_S_ROW_OFFSET + g_offs * 2 + 1).to(
+            tl.uint16
+        )
+        s_row_K = ((srk_lo | (srk_hi << 8)).to(tl.float16, bitcast=True)).to(tl.float32)
+
+        if DPAS_LAYOUT:
+            k_local_token = g_offs % 64
+            k_local_dim = d_offs % 64
+            k_lane = 2 * ((k_local_token[None, :] % 16) % 8) + k_local_dim[:, None] % 2
+            k_byte = (
+                (
+                    (
+                        (g_offs[None, :] // 64 * 4 + d_offs[:, None] // 64) * 4
+                        + k_local_token[None, :] // 16
+                    )
+                    * 16
+                    + k_lane
+                )
+                * 32
+            ) + k_local_dim[:, None] // 2
+            k_addrs = tile_base + K_PACKED_OFFSET + k_byte
+            g_shift_k = ((k_local_token % 16) // 8) * 4
+        else:
+            k_addrs = (
+                tile_base
+                + K_PACKED_OFFSET
+                + d_offs[:, None] * (GROUP // PACK_K)
+                + g_byte_k[None, :]
+            )
+        k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
+        q_K = ((k_bytes >> g_shift_k[None, :]) & MASK_K).to(tl.float32)
+        K_rot = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[
+            None, :
+        ]  # [D, GROUP]
+        K_rot_out = tl.trans(K_rot)  # [GROUP, D]
+
+        scv_lo = tl.load(KV_cache_ptr + tile_base + V_S_COL_OFFSET + d_offs * 2).to(
+            tl.uint16
+        )
+        scv_hi = tl.load(KV_cache_ptr + tile_base + V_S_COL_OFFSET + d_offs * 2 + 1).to(
+            tl.uint16
+        )
+        s_col_V = ((scv_lo | (scv_hi << 8)).to(tl.float16, bitcast=True)).to(tl.float32)
+        srv_lo = tl.load(KV_cache_ptr + tile_base + V_S_ROW_OFFSET + g_offs * 2).to(
+            tl.uint16
+        )
+        srv_hi = tl.load(KV_cache_ptr + tile_base + V_S_ROW_OFFSET + g_offs * 2 + 1).to(
+            tl.uint16
+        )
+        s_row_V = ((srv_lo | (srv_hi << 8)).to(tl.float16, bitcast=True)).to(tl.float32)
+        zpv_lo = tl.load(KV_cache_ptr + tile_base + V_ZP_OFFSET + g_offs * 2).to(
+            tl.uint16
+        )
+        zpv_hi = tl.load(KV_cache_ptr + tile_base + V_ZP_OFFSET + g_offs * 2 + 1).to(
+            tl.uint16
+        )
+        zp_V = ((zpv_lo | (zpv_hi << 8)).to(tl.float16, bitcast=True)).to(tl.float32)
+
+        if DPAS_LAYOUT:
+            v_local_token = g_offs % 64
+            v_local_dim = d_offs % 32
+            v_lane = 2 * (v_local_dim[None, :] % 8) + v_local_token[:, None] % 2
+            v_byte = (
+                (
+                    (
+                        (
+                            (g_offs[:, None] // 64 * 8 + d_offs[None, :] // 32) * 4
+                            + v_local_token[:, None] // 16
+                        )
+                        * 16
+                        + v_lane
+                    )
+                    * 16
+                )
+                + 8 * (v_local_dim[None, :] // 16)
+                + (v_local_token[:, None] % 16) // 2
+            )
+            v_addrs = tile_base + V_PACKED_OFFSET + v_byte
+            d_shift_v = ((v_local_dim % 16) // 8) * 4
+        else:
+            v_addrs = (
+                tile_base
+                + V_PACKED_OFFSET
+                + g_offs[:, None] * (D // PACK_V)
+                + d_byte_v[None, :]
+            )
+        v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
+        q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
+        V_rot = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[
+            None, :
+        ]  # [GROUP, D]
+
+        tl.store(K_out_ptr + out_addrs, K_rot_out.to(tl.float16), mask=g_mask[:, None])
+        tl.store(V_out_ptr + out_addrs, V_rot.to(tl.float16), mask=g_mask[:, None])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FUSED decode: dequant int4 in registers + flash-decoding online softmax.
+# Reads the int4 cache (history) and the fp16 tail pool (sink / partial tail)
+# directly — NEVER materializes a full fp16 K/V buffer to HBM. This is the path
+# that can beat FP16/TurboQuant: per step it moves ~int4 (0.25x FP16) KV traffic
+# for the bulk history instead of the materialize path's ~2.25x.
+#
+# One-stage flash-decode (correctness-first): grid (B, Hq). Each program handles
+# one (request, query-head), loops that request's KV blocks with online softmax.
+# Split-K parallelism over KV is a later optimization for long context.
+#
+# AUTO-TUNED across BLOCK_N ∈ {16, 32, 64}. The autotune key (D, GROUP, Q_PER_KV,
+# K_BITS, V_BITS) makes Triton re-tune per model architecture × quant config:
+# - Q_PER_KV=2 (Qwen3-0.6B) / =4 (Qwen3-4B) / =8 (Qwen3-30B-A3B, 32B) typically
+#   favour different BLOCK_N; the autotuner picks once on first call and caches.
+# - num_warps=8 was empirically slower at Q_PER_KV=8 (tl.dot with small M
+#   under-utilises threads), so we only include 4 warps; if that turns out wrong
+#   for some model, extending the config list is cheap.
+# - num_stages=3 vs 2 showed no difference in the micro-bench; we keep =2.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@triton.autotune(
+    configs=_DECODE_AUTOTUNE_CONFIGS,
+    key=["D", "GROUP", "Q_PER_KV", "K_BITS", "V_BITS"],
+)
+@triton.jit
+def _kvarn_fused_decode_kernel(
+    Q_ptr,  # [B, Hq, D]                               fp16 (rotated)
+    Req_row_ptr,  # [B] int32 — block-table row per program row (VQ_INDIRECT)
+    Block_table_ptr,  # [B, max_blocks]                          int32
+    Seq_lens_ptr,  # [B]                                      int32
+    Block_to_slot_ptr,  # [num_blocks_lookup]                      int32 (-1 = int4)
+    KV_cache_ptr,  # [num_blocks, num_kv_heads, TILE_BYTES]   uint8
+    Tail_K_pool_ptr,  # [POOL_SIZE, group, Hk, D]                fp16 (rotated)
+    Tail_V_pool_ptr,  # [POOL_SIZE, group, Hk, D]                fp16
+    Out_ptr,  # [B, Hq, D]                               fp16 (rotated out)
+    scale,
+    # strides
+    stride_q_b,
+    stride_q_h,
+    stride_bt_b,
+    stride_kv_b,
+    stride_kv_h,
+    stride_pool_b,
+    stride_pool_t,
+    stride_pool_h,
+    stride_o_b,
+    stride_o_h,
+    # constexprs
+    MAX_BLOCKS_PER_REQ: tl.constexpr,
+    D: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    Q_PER_KV: tl.constexpr,
+    Q_PER_KV_PAD: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    K_BITS: tl.constexpr,
+    V_BITS: tl.constexpr,
+    NUM_BLOCKS_LOOKUP: tl.constexpr,
+    K_PACKED_OFFSET: tl.constexpr,
+    K_S_COL_OFFSET: tl.constexpr,
+    K_ZP_OFFSET: tl.constexpr,
+    K_S_ROW_OFFSET: tl.constexpr,
+    V_PACKED_OFFSET: tl.constexpr,
+    V_S_COL_OFFSET: tl.constexpr,
+    V_S_ROW_OFFSET: tl.constexpr,
+    V_ZP_OFFSET: tl.constexpr,
+    VQ_INDIRECT: tl.constexpr,
+):
+    # GQA head-grouping: ONE program per (request, KV head) serves all Q_PER_KV
+    # query heads that share this KV head, so each int4 K/V tile is dequantized
+    # ONCE (not Q_PER_KV times). The redundant-dequant penalty of the per-Q-head
+    # version scales with Q_PER_KV (4× on Qwen3-4B) and was the dominant cost.
+    # Q_PER_KV is padded to a power of 2 (Q_PER_KV_PAD) because tl.arange / tl.dot
+    # require pow2 dims; padded query heads are masked off (e.g. Qwen3.5 GQA 24/4
+    # = ratio 6 -> pad to 8).
+    #
+    # VQ_INDIRECT (multi-query verify): program row b is a QUERY TOKEN, not a
+    # request — Req_row_ptr[b] gives its block-table row and Seq_lens_ptr[b] its
+    # bottom-right causal length (cached_len + token_idx + 1). Q/Out stay
+    # token-major, so everything else is unchanged: the speculative-decode
+    # verify step runs the same dual-source (int4 + pool) online-softmax read
+    # instead of materializing the whole context to fp16 scratch (O(context)
+    # per step — the long-context MTP slowdown).
+    b = tl.program_id(0)
+    hk = tl.program_id(1)
+    qh = tl.arange(0, Q_PER_KV_PAD)  # padded query-head lane
+    qmask = qh < Q_PER_KV  # real heads in this group
+    hq0 = hk * Q_PER_KV
+
+    bt_row = b
+    if VQ_INDIRECT:
+        bt_row = tl.load(Req_row_ptr + b)
+    seq_len = tl.load(Seq_lens_ptr + b)
+    # Padded rows (uniform-batch graph capture/replay pads the token count)
+    # carry seq_len <= 0: nothing to attend, the output row is never read.
+    if seq_len <= 0:
+        return
+
+    d_offs = tl.arange(0, D)
+    PACK_K: tl.constexpr = 8 // K_BITS
+    PACK_V: tl.constexpr = 8 // V_BITS
+    MASK_K: tl.constexpr = (1 << K_BITS) - 1
+    MASK_V: tl.constexpr = (1 << V_BITS) - 1
+    d_byte_v = d_offs // PACK_V
+    d_shift_v = (d_offs % PACK_V) * V_BITS
+
+    # q: [Q_PER_KV_PAD, D] — padded lanes masked to 0 (no OOB read past Hq).
+    q = tl.load(
+        Q_ptr + b * stride_q_b + (hq0 + qh)[:, None] * stride_q_h + d_offs[None, :],
+        mask=qmask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    m_i = tl.full([Q_PER_KV_PAD], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([Q_PER_KV_PAD], dtype=tl.float32)
+    acc = tl.zeros([Q_PER_KV_PAD, D], dtype=tl.float32)
+
+    n_blocks = (seq_len + GROUP - 1) // GROUP
+    # Sliding-window: this query (last token) only attends to the last
+    # SLIDING_WINDOW keys, so start the block loop at the first block that
+    # overlaps the window (massive saving: ~window/GROUP blocks instead of all).
+    win_start = 0
+    blk_lo = 0
+    if SLIDING_WINDOW > 0:
+        win_start = tl.maximum(seq_len - SLIDING_WINDOW, 0)
+        blk_lo = win_start // GROUP
+    for k in range(blk_lo, n_blocks):
+        rem = seq_len - k * GROUP
+        n_tok = tl.minimum(tl.maximum(rem, 0), GROUP)
+
+        block_id = tl.load(Block_table_ptr + bt_row * stride_bt_b + k)
+        in_range = (block_id >= 0) & (block_id < NUM_BLOCKS_LOOKUP)
+        safe_bid = tl.where(in_range, block_id, 0)
+        pool_slot = tl.load(Block_to_slot_ptr + safe_bid, mask=in_range, other=-1)
+
+        tile_base = block_id.to(tl.int64) * stride_kv_b + hk * stride_kv_h
+        safe_slot = tl.where(pool_slot >= 0, pool_slot, 0)
+        pool_base = safe_slot.to(tl.int64) * stride_pool_b + hk * stride_pool_h
+
+        # Per-channel (per-d) K/V scales — constant across the 128 tokens; load
+        # once. fp16 fields live at even byte offsets in the uint8 tile, so load
+        # them as a single uint16 (half the L1 transactions of the lo/hi byte
+        # pair). (Garbage but unused for pool blocks.)
+        ku16 = (KV_cache_ptr + tile_base).to(tl.pointer_type(tl.uint16))
+        s_col_K = (
+            tl.load(ku16 + (K_S_COL_OFFSET // 2) + d_offs)
+            .to(tl.float16, bitcast=True)
+            .to(tl.float32)
+        )
+        zp_K = (
+            tl.load(ku16 + (K_ZP_OFFSET // 2) + d_offs)
+            .to(tl.float16, bitcast=True)
+            .to(tl.float32)
+        )
+        s_col_V = (
+            tl.load(ku16 + (V_S_COL_OFFSET // 2) + d_offs)
+            .to(tl.float16, bitcast=True)
+            .to(tl.float32)
+        )
+
+        for c0 in range(0, GROUP, BLOCK_N):
+            cols = c0 + tl.arange(0, BLOCK_N)  # [BN] token indices in tile
+            cmask = cols < n_tok
+            if SLIDING_WINDOW > 0:  # mask keys before the window boundary
+                cmask = cmask & ((k * GROUP + cols) >= win_start)
+
+            if pool_slot >= 0:
+                # fp16 already-rotated tokens in the pool (sink / partial tail).
+                src = pool_base + cols[:, None] * stride_pool_t + d_offs[None, :]
+                Kc = tl.load(Tail_K_pool_ptr + src, mask=cmask[:, None], other=0.0).to(
+                    tl.float32
+                )  # [BN, D]
+                Vc = tl.load(Tail_V_pool_ptr + src, mask=cmask[:, None], other=0.0).to(
+                    tl.float32
+                )  # [BN, D]
+                K_dg = tl.trans(Kc)  # [D, BN]
+            else:
+                # int4 dequant for this chunk of tokens (ONCE, shared by all q heads).
+                cb_k = cols // PACK_K
+                cs_k = (cols % PACK_K) * K_BITS
+                s_row_K = (
+                    tl.load(ku16 + (K_S_ROW_OFFSET // 2) + cols)
+                    .to(tl.float16, bitcast=True)
+                    .to(tl.float32)
+                )  # [BN]
+                k_addrs = (
+                    tile_base
+                    + K_PACKED_OFFSET
+                    + d_offs[:, None] * (GROUP // PACK_K)
+                    + cb_k[None, :]
+                )
+                k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)  # [D, BN]
+                q_K = ((k_bytes >> cs_k[None, :]) & MASK_K).to(tl.float32)
+                K_dg = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[
+                    None, :
+                ]  # [D, BN]
+
+                s_row_V = (
+                    tl.load(ku16 + (V_S_ROW_OFFSET // 2) + cols)
+                    .to(tl.float16, bitcast=True)
+                    .to(tl.float32)
+                )  # [BN]
+                zp_V = (
+                    tl.load(ku16 + (V_ZP_OFFSET // 2) + cols)
+                    .to(tl.float16, bitcast=True)
+                    .to(tl.float32)
+                )  # [BN]
+                v_addrs = (
+                    tile_base
+                    + V_PACKED_OFFSET
+                    + cols[:, None] * (D // PACK_V)
+                    + d_byte_v[None, :]
+                )
+                v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)  # [BN, D]
+                q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
+                Vc = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[
+                    None, :
+                ]  # [BN, D]
+
+            # scores[h,c] = q·Kᵀ via tensor cores (q [Q_PER_KV,D] · K_dg [D,BN]).
+            scores = tl.dot(q, K_dg)  # [Q_PER_KV, BN]
+            scores = tl.where(cmask[None, :], scores * scale, -float("inf"))
+            m_new = tl.maximum(m_i, tl.max(scores, axis=1))  # [Q_PER_KV]
+            p = tl.exp(scores - m_new[:, None])  # [Q_PER_KV, BN]
+            alpha = tl.exp(m_i - m_new)  # [Q_PER_KV]
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p, Vc)  # [Q_PER_KV, D]
+            m_i = m_new
+
+    out = (acc / l_i[:, None]).to(tl.float16)  # [Q_PER_KV_PAD, D]
+    tl.store(
+        Out_ptr + b * stride_o_b + (hq0 + qh)[:, None] * stride_o_h + d_offs[None, :],
+        out,
+        mask=qmask[:, None],
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SPLIT-K (flash-decoding) variant: stage 1 computes partial attention over a
+# contiguous slice of each request's KV blocks; the extra grid dim parallelizes
+# the KV sequence so ragged burst seqlens are load-balanced across SMs. Stage 2
+# combines the per-split partials via the log-sum-exp trick. This is what makes
+# the decode kernel competitive with TurboQuant's _tq_decode_stage1 at burst.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# AUTO-TUNED across BLOCK_N x num_warps x num_stages (keyed per model arch ×
+# quant config, like the single-stage kernel). Stage1 was previously launched
+# with a hardcoded BLOCK_N=16 / num_warps=4; the microbench (Qwen3-4B) showed
+# BLOCK_N=32 / num_warps=2 is ~25-40% faster across 4.6K-32K ctx. Split-K is
+# LSE-combined so BLOCK_N never affects the output. Warmed in
+# _warm_decode_kernels (pre-CUDA-graph-capture), so autotune never triggers
+# mid-capture.
+@triton.autotune(
+    configs=_DECODE_AUTOTUNE_CONFIGS,
+    key=["D", "GROUP", "Q_PER_KV", "K_BITS", "V_BITS"],
+)
+@triton.jit
+def _kvarn_fused_decode_stage1(
+    Q_ptr,
+    Req_row_ptr,
+    Block_table_ptr,
+    Seq_lens_ptr,
+    Block_to_slot_ptr,
+    KV_cache_ptr,
+    Tail_K_pool_ptr,
+    Tail_V_pool_ptr,
+    MidO_ptr,  # [N, NUM_KV_SPLITS, D]            fp32 (O_s = acc/l per split)
+    MidLse_ptr,  # [N, NUM_KV_SPLITS]               fp32 (lse_s = m + log l)
+    scale,
+    stride_q_b,
+    stride_q_h,
+    stride_bt_b,
+    stride_kv_b,
+    stride_kv_h,
+    stride_pool_b,
+    stride_pool_t,
+    stride_pool_h,
+    stride_mo_n,
+    stride_mo_s,  # MidO: row (N), split
+    stride_ml_n,  # MidLse: row (N)
+    MAX_BLOCKS_PER_REQ: tl.constexpr,
+    D: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    Q_PER_KV: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    HQ: tl.constexpr,
+    K_BITS: tl.constexpr,
+    V_BITS: tl.constexpr,
+    Q_PER_KV_PAD: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    NUM_BLOCKS_LOOKUP: tl.constexpr,
+    K_PACKED_OFFSET: tl.constexpr,
+    K_S_COL_OFFSET: tl.constexpr,
+    K_ZP_OFFSET: tl.constexpr,
+    K_S_ROW_OFFSET: tl.constexpr,
+    V_PACKED_OFFSET: tl.constexpr,
+    V_S_COL_OFFSET: tl.constexpr,
+    V_S_ROW_OFFSET: tl.constexpr,
+    V_ZP_OFFSET: tl.constexpr,
+    VQ_INDIRECT: tl.constexpr,
+):
+    b = tl.program_id(0)
+    hk = tl.program_id(1)
+    split = tl.program_id(2)
+    qh = tl.arange(0, Q_PER_KV_PAD)  # padded to pow2; mask below
+    qmask = qh < Q_PER_KV
+    hq0 = hk * Q_PER_KV
+
+    # VQ_INDIRECT: row b is a query TOKEN (verify step); see the single-stage
+    # kernel's note. Block table via Req_row_ptr, causal length via Seq_lens.
+    bt_row = b
+    if VQ_INDIRECT:
+        bt_row = tl.load(Req_row_ptr + b)
+    seq_len = tl.load(Seq_lens_ptr + b)
+    n_blocks = (seq_len + GROUP - 1) // GROUP
+    blocks_per_split = (n_blocks + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS
+    blk_lo = split * blocks_per_split
+    blk_hi = tl.minimum(blk_lo + blocks_per_split, n_blocks)
+
+    d_offs = tl.arange(0, D)
+    PACK_K: tl.constexpr = 8 // K_BITS
+    PACK_V: tl.constexpr = 8 // V_BITS
+    MASK_K: tl.constexpr = (1 << K_BITS) - 1
+    MASK_V: tl.constexpr = (1 << V_BITS) - 1
+    d_byte_v = d_offs // PACK_V
+    d_shift_v = (d_offs % PACK_V) * V_BITS
+    q = tl.load(
+        Q_ptr + b * stride_q_b + (hq0 + qh)[:, None] * stride_q_h + d_offs[None, :],
+        mask=qmask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    m_i = tl.full([Q_PER_KV_PAD], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([Q_PER_KV_PAD], dtype=tl.float32)
+    acc = tl.zeros([Q_PER_KV_PAD, D], dtype=tl.float32)
+
+    for k in range(blk_lo, blk_hi):
+        rem = seq_len - k * GROUP
+        n_tok = tl.minimum(tl.maximum(rem, 0), GROUP)
+        block_id = tl.load(Block_table_ptr + bt_row * stride_bt_b + k)
+        in_range = (block_id >= 0) & (block_id < NUM_BLOCKS_LOOKUP)
+        safe_bid = tl.where(in_range, block_id, 0)
+        pool_slot = tl.load(Block_to_slot_ptr + safe_bid, mask=in_range, other=-1)
+        tile_base = block_id.to(tl.int64) * stride_kv_b + hk * stride_kv_h
+        safe_slot = tl.where(pool_slot >= 0, pool_slot, 0)
+        pool_base = safe_slot.to(tl.int64) * stride_pool_b + hk * stride_pool_h
+
+        # Single uint16 load per fp16 scale (half the L1 transactions of the
+        # lo/hi byte pair); fp16 fields are at even byte offsets in the tile.
+        ku16 = (KV_cache_ptr + tile_base).to(tl.pointer_type(tl.uint16))
+        s_col_K = (
+            tl.load(ku16 + (K_S_COL_OFFSET // 2) + d_offs)
+            .to(tl.float16, bitcast=True)
+            .to(tl.float32)
+        )
+        zp_K = (
+            tl.load(ku16 + (K_ZP_OFFSET // 2) + d_offs)
+            .to(tl.float16, bitcast=True)
+            .to(tl.float32)
+        )
+        s_col_V = (
+            tl.load(ku16 + (V_S_COL_OFFSET // 2) + d_offs)
+            .to(tl.float16, bitcast=True)
+            .to(tl.float32)
+        )
+
+        for c0 in range(0, GROUP, BLOCK_N):
+            cols = c0 + tl.arange(0, BLOCK_N)
+            cmask = cols < n_tok
+            if SLIDING_WINDOW > 0:
+                cmask = cmask & (
+                    (k * GROUP + cols) >= tl.maximum(seq_len - SLIDING_WINDOW, 0)
+                )
+            if pool_slot >= 0:
+                src = pool_base + cols[:, None] * stride_pool_t + d_offs[None, :]
+                Kc = tl.load(Tail_K_pool_ptr + src, mask=cmask[:, None], other=0.0).to(
+                    tl.float32
+                )
+                Vc = tl.load(Tail_V_pool_ptr + src, mask=cmask[:, None], other=0.0).to(
+                    tl.float32
+                )
+                K_dg = tl.trans(Kc)
+            else:
+                cb_k = cols // PACK_K
+                cs_k = (cols % PACK_K) * K_BITS
+                s_row_K = (
+                    tl.load(ku16 + (K_S_ROW_OFFSET // 2) + cols)
+                    .to(tl.float16, bitcast=True)
+                    .to(tl.float32)
+                )
+                k_addrs = (
+                    tile_base
+                    + K_PACKED_OFFSET
+                    + d_offs[:, None] * (GROUP // PACK_K)
+                    + cb_k[None, :]
+                )
+                k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
+                q_K = ((k_bytes >> cs_k[None, :]) & MASK_K).to(tl.float32)
+                K_dg = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]
+                s_row_V = (
+                    tl.load(ku16 + (V_S_ROW_OFFSET // 2) + cols)
+                    .to(tl.float16, bitcast=True)
+                    .to(tl.float32)
+                )
+                zp_V = (
+                    tl.load(ku16 + (V_ZP_OFFSET // 2) + cols)
+                    .to(tl.float16, bitcast=True)
+                    .to(tl.float32)
+                )
+                # FIX: V packed-row stride is D/PACK_V bytes (PACK_V = 8/V_BITS).
+                # Was hardcoded `D // 2` (correct only for 4-bit V); with the shipped
+                # k4v2 preset (V_BITS=2 -> PACK_V=4) it strode 2x too far -> read
+                # garbage V + indexed past the tile (OOB illegal-access at long ctx).
+                # The single-stage kernel already used (D // PACK_V); this matches it.
+                v_addrs = (
+                    tile_base
+                    + V_PACKED_OFFSET
+                    + cols[:, None] * (D // PACK_V)
+                    + d_byte_v[None, :]
+                )
+                v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
+                q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
+                Vc = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]
+
+            scores = tl.dot(q, K_dg)
+            scores = tl.where(cmask[None, :], scores * scale, -float("inf"))
+            m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+            p = tl.exp(scores - m_new[:, None])
+            alpha = tl.exp(m_i - m_new)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p, Vc)
+            m_i = m_new
+
+    # Partial output O_s = acc / l_i and lse_s = m_i + log(l_i); empty split → 0 / -inf.
+    nonempty = l_i > 0
+    O_s = acc / tl.where(nonempty, l_i, 1.0)[:, None]  # [Q_PER_KV, D]
+    lse_s = tl.where(
+        nonempty, m_i + tl.log(tl.where(nonempty, l_i, 1.0)), -float("inf")
+    )
+    rows = b * HQ + hq0 + qh  # [Q_PER_KV_PAD] (= N rows)
+    tl.store(
+        MidO_ptr + rows[:, None] * stride_mo_n + split * stride_mo_s + d_offs[None, :],
+        O_s,
+        mask=qmask[:, None],
+    )
+    tl.store(MidLse_ptr + rows * stride_ml_n + split, lse_s, mask=qmask)
+
+
+@triton.jit
+def _kvarn_fused_decode_stage2(
+    MidO_ptr,  # [N, NUM_KV_SPLITS, D] fp32
+    MidLse_ptr,  # [N, NUM_KV_SPLITS]    fp32
+    Out_ptr,  # [N, D] fp16
+    stride_mo_n,
+    stride_mo_s,
+    stride_ml_n,
+    stride_o_n,
+    D: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+):
+    # One program per output row (= one (request, query-head)). Combine splits.
+    n = tl.program_id(0)
+    d_offs = tl.arange(0, D)
+    s_offs = tl.arange(0, NUM_KV_SPLITS)
+    lse = tl.load(MidLse_ptr + n * stride_ml_n + s_offs)  # [SPLITS]
+    g = tl.max(lse, axis=0)  # global max lse
+    w = tl.exp(lse - g)  # [SPLITS] weights
+    denom = tl.sum(w, axis=0)
+    # weighted sum of partial outputs
+    o_parts = tl.load(
+        MidO_ptr + n * stride_mo_n + s_offs[:, None] * stride_mo_s + d_offs[None, :]
+    )  # [SPLITS, D]
+    out = tl.sum(w[:, None] * o_parts, axis=0) / denom  # [D]
+    tl.store(Out_ptr + n * stride_o_n + d_offs, out.to(tl.float16))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Python driver
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _kvarn_bound_native_decode_attention_v2(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    hadamard: torch.Tensor,
+    scale: float,
+    impl,
+    md,
+    output: torch.Tensor | None,
+    plan: KVarNBoundNativeDecodePlanV2,
+) -> torch.Tensor:
+    """Launch Variant H using only its immutable native bindings."""
+    B, Hq, D = query.shape
+    if not 1 <= B <= plan.max_batch:
+        raise RuntimeError("bound KVarN inline decode batch exceeds its proof")
+    N = B * Hq
+    native_splits = kvarn_native_split_count(
+        int(md.max_seq_len),
+        plan.max_splits,
+        batch_size=B,
+        split_policy=plan.split_policy,
+        kernel_variant=plan.kernel_variant,
+    )
+    fuse_output_hadamard = native_splits > 1 and plan.output_hadamard_supported
+    write_bf16_output = fuse_output_hadamard and plan.direct_bf16_output
+    if write_bf16_output:
+        assert output is not None
+    output_rot = output if write_bf16_output else plan.fused_out[:N].view(B, Hq, D)
+
+    if plan.use_scratch_op:
+        assert plan.native_scratch is not None
+        temp_output, exp_sums, max_logits = _kvarn_native_scratch_views(
+            plan.native_scratch, B, Hq, native_splits
+        )
+        torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+            plan.q_rot_fp16[:N].view(B, Hq, D),
+            kv_cache,
+            md.block_table[:B],
+            md.seq_lens[:B],
+            plan.block_to_slot,
+            plan.tail_key,
+            plan.tail_value,
+            temp_output,
+            exp_sums,
+            max_logits,
+            output_rot,
+            int(md.max_seq_len),
+            scale,
+            fuse_output_hadamard,
+            write_bf16_output,
+            native_splits,
+            plan.kernel_variant,
+            plan.dpas_layout,
+        )
+    else:
+        torch.ops._vllm_fa2_C.kvarn_decode(
+            plan.q_rot_fp16[:N].view(B, Hq, D),
+            kv_cache,
+            md.block_table[:B],
+            md.seq_lens[:B],
+            plan.block_to_slot,
+            plan.tail_key,
+            plan.tail_value,
+            output_rot,
+            int(md.max_seq_len),
+            scale,
+            fuse_output_hadamard,
+            write_bf16_output,
+            native_splits,
+            plan.kernel_variant,
+            plan.dpas_layout,
+        )
+    if fuse_output_hadamard:
+        return output_rot
+    if plan.use_native_hadamard:
+        out_unrot = plan.native_output_fp16[:N]
+        torch.ops._vllm_fa2_C.kvarn_hadamard(output_rot.reshape(N, D), out_unrot)
+    else:
+        H16 = impl._H_fp16 if impl._H_fp16 is not None else hadamard.to(torch.float16)
+        out_unrot = torch.mm(output_rot.reshape(N, D), H16)
+    return out_unrot.view(B, Hq, D)
+
+
+def kvarn_decode_attention(
+    query: torch.Tensor,  # [B, Hq, D]   fp16/bf16
+    kv_cache: torch.Tensor,  # [num_blocks, num_kv_heads, TILE_BYTES] uint8
+    hadamard: torch.Tensor,  # [D, D]       fp32
+    scale: float,
+    cfg,
+    impl,  # KVarNAttentionImpl (has pool + scratch buffers)
+    md,  # KVarNMetadata (carries the precomputed task plan)
+    output: torch.Tensor | None = None,  # optional caller-owned [B, Hq, D] bf16
+    query_rotation_precomputed: bool = False,
+    trusted_native_plan: KVarNTrustedNativeDecodePlan | None = None,
+    bound_native_plan_v2: KVarNBoundNativeDecodePlanV2 | None = None,
+) -> torch.Tensor:
+    """Decode driver — dequant + FlashAttention.
+
+    For each layer call:
+
+        1. Rotate the query: q_rot = q · H.
+        2. Build a packed varlen ``[total_kv_tokens, Hk, D]`` fp16 K, V with
+           ``_kvarn_build_packed_kv_kernel``: dequantise the int4 blocks and
+           copy sink + trailing-tail tokens from the rotated fp16 tail pool.
+        3. Call ``flash_attn_varlen_func`` with the assembled K, V.
+        4. Un-rotate the output: out = out_rot · H.
+
+    The task plan (dequant_block_ids, pool_block_ids, dst_offsets, lengths,
+    cu_seqlens) is precomputed once per batch in ``KVarNMetadataBuilder.build``
+    and passed in via ``md`` — no per-layer host→GPU allocations.
+
+    Output: ``[B, Hq, D]`` in the un-rotated frame. A compatible native
+    extension writes directly into a caller-owned bf16 output; older native
+    extensions and fallback paths return internal fp16 for the backend copy.
+    """
+    if bound_native_plan_v2 is not None:
+        return _kvarn_bound_native_decode_attention_v2(
+            query,
+            kv_cache,
+            hadamard,
+            scale,
+            impl,
+            md,
+            output,
+            bound_native_plan_v2,
+        )
+
+    from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+    B, Hq, D = query.shape
+    Hk = kv_cache.shape[1]
+    device = query.device
+    group = cfg.group
+    dpas_layout = _kvarn_dpas_layout_for_problem(
+        impl._kvarn_dpas_layout,
+        D,
+        group,
+        cfg.key_bits,
+        cfg.value_bits,
+    )
+    N = B * Hq  # rows for the 2D Q rotation matmul
+
+    # The dense fallback uses the same fp16 Hadamard as the K/V store so QKᵀ
+    # remains invariant. Native qlen=1 decode replaces both dense transforms
+    # below with the symmetric H256 FWHT operator.
+    H16 = impl._H_fp16 if impl._H_fp16 is not None else hadamard.to(torch.float16)
+    q_rot_fp16 = impl._q_rot_fp16_buf[:N]
+
+    if trusted_native_plan is not None:
+        if not 1 <= B <= trusted_native_plan.max_batch:
+            raise RuntimeError("trusted KVarN inline decode batch exceeds its proof")
+        use_native_xpu = True
+    else:
+        is_capturing = (
+            query.device.type == "xpu" and torch.xpu.is_current_stream_capturing()
+        )
+        native_layer_selected = kvarn_native_layer_selected(
+            getattr(impl, "layer_name", ""),
+            os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
+        )
+        use_native_xpu = (
+            kvarn_native_feature_enabled("DECODE")
+            and kvarn_native_problem_supported(
+                device_type=query.device.type,
+                batch_size=B,
+                num_query_heads=Hq,
+                num_kv_heads=Hk,
+                head_dim=D,
+                group=group,
+                key_bits=cfg.key_bits,
+                value_bits=cfg.value_bits,
+                record_bytes=cfg.record_bytes,
+                sliding_window=int(getattr(impl, "sliding_window", 0) or 0),
+                has_lookup=impl._block_to_slot_t is not None,
+                has_tail_pool=(
+                    impl._tail_K_pool is not None and impl._tail_V_pool is not None
+                ),
+                is_capturing=is_capturing,
+            )
+            and native_layer_selected
+            and kv_cache.shape[-1] == cfg.record_bytes
+            and kv_cache.is_contiguous()
+            and md.block_table[:B].is_contiguous()
+            and md.seq_lens[:B].is_contiguous()
+            and impl._block_to_slot_t.is_contiguous()
+            and impl._tail_K_pool.is_contiguous()
+            and impl._tail_V_pool.is_contiguous()
+            and q_rot_fp16.is_contiguous()
+            and int(md.max_seq_len) >= 1
+            and kvarn_native_decode_abi_supported(False)
+        )
+    native_output = getattr(impl, "_native_output_fp16_buf", None)
+    if trusted_native_plan is not None:
+        use_native_hadamard = trusted_native_plan.use_native_hadamard
+    else:
+        use_native_hadamard = (
+            use_native_xpu
+            and hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard")
+            and native_output is not None
+            and native_output.shape[0] >= N
+            and native_output.shape[1] == D
+            and native_output.is_contiguous()
+            and query.dtype in (torch.float16, torch.bfloat16)
+            and query.reshape(N, D).stride(1) == 1
+        )
+    with torch.profiler.record_function("kvarn_q_rotation"):
+        if query_rotation_precomputed:
+            pass
+        elif use_native_hadamard:
+            torch.ops._vllm_fa2_C.kvarn_hadamard(query.reshape(N, D), q_rot_fp16)
+        else:
+            q_input = query.reshape(N, D)
+            if q_input.dtype != torch.float16:
+                q_input = q_input.to(torch.float16)
+            torch.mm(q_input, H16, out=q_rot_fp16)
+
+    if use_native_xpu:
+        native_splits = kvarn_native_split_count(
+            int(md.max_seq_len),
+            impl._kvarn_native_max_splits,
+            batch_size=B,
+            split_policy=impl._kvarn_native_split_policy,
+            kernel_variant=impl._kvarn_native_kernel_variant,
+        )
+        native_scratch = impl._native_decode_scratch
+        if trusted_native_plan is not None:
+            use_scratch_op = trusted_native_plan.use_scratch_op
+            fuse_output_hadamard = (
+                native_splits > 1 and trusted_native_plan.output_hadamard_supported
+            )
+        else:
+            scratch_fits = (
+                native_scratch is not None
+                and native_scratch[0].shape[0] >= B
+                and native_scratch[0].shape[1] >= Hq * native_splits
+                and native_scratch[1].shape[0] >= B
+                and native_scratch[1].shape[2] >= native_splits
+                and native_scratch[2].shape[0] >= B
+                and native_scratch[2].shape[2] >= native_splits
+            )
+            use_scratch_op = scratch_fits and kvarn_native_decode_abi_supported(True)
+            fuse_output_hadamard = _kvarn_native_output_hadamard_enabled(
+                native_splits, use_scratch_op
+            )
+        write_bf16_output = (
+            fuse_output_hadamard
+            and output is not None
+            and output.shape == (B, Hq, D)
+            and output.dtype == torch.bfloat16
+            and output.device == query.device
+            and output.is_contiguous()
+            and (
+                trusted_native_plan.bf16_output_supported
+                if trusted_native_plan is not None
+                else kvarn_native_bf16_output_supported(use_scratch_op)
+            )
+        )
+        output_rot = (
+            output if write_bf16_output else impl._fused_out_buf[:N].view(B, Hq, D)
+        )
+        logger.info_once(
+            "Using the native Xe2 KVarN qlen=1 decoder (batch limit %d; "
+            "native H256 transforms=%s; fused output H256=%s; "
+            "direct bf16 output=%s; cache layout=%s; splits=%d)",
+            _KVARN_NATIVE_MAX_BATCH,
+            use_native_hadamard,
+            fuse_output_hadamard,
+            write_bf16_output,
+            impl._kvarn_cache_layout,
+            native_splits,
+        )
+        with torch.profiler.record_function("kvarn_native_xpu_decode"):
+            if use_scratch_op:
+                assert native_scratch is not None
+                temp_output, exp_sums, max_logits = _kvarn_native_scratch_views(
+                    native_scratch, B, Hq, native_splits
+                )
+                decode_args = (
+                    q_rot_fp16.view(B, Hq, D),
+                    kv_cache,
+                    md.block_table[:B],
+                    md.seq_lens[:B],
+                    impl._block_to_slot_t,
+                    impl._tail_K_pool,
+                    impl._tail_V_pool,
+                    temp_output,
+                    exp_sums,
+                    max_logits,
+                    output_rot,
+                    int(md.max_seq_len),
+                    scale,
+                )
+                torch.ops._vllm_fa2_C.kvarn_decode_with_scratch(
+                    *decode_args,
+                    fuse_output_hadamard,
+                    write_bf16_output,
+                    native_splits,
+                    impl._kvarn_native_kernel_variant,
+                    dpas_layout,
+                )
+            else:
+                # This wrapper owns temporary scratch internally. Its C++
+                # implementation records all three allocations on the current
+                # XPU stream before returning, so the caching allocator cannot
+                # recycle them while the asynchronous reducer still reads them.
+                decode_args = (
+                    q_rot_fp16.view(B, Hq, D),
+                    kv_cache,
+                    md.block_table[:B],
+                    md.seq_lens[:B],
+                    impl._block_to_slot_t,
+                    impl._tail_K_pool,
+                    impl._tail_V_pool,
+                    output_rot,
+                    int(md.max_seq_len),
+                    scale,
+                )
+                torch.ops._vllm_fa2_C.kvarn_decode(
+                    *decode_args,
+                    fuse_output_hadamard,
+                    write_bf16_output,
+                    native_splits,
+                    impl._kvarn_native_kernel_variant,
+                    dpas_layout,
+                )
+        if fuse_output_hadamard:
+            return output_rot
+        with torch.profiler.record_function("kvarn_output_unrotation"):
+            if use_native_hadamard:
+                out_unrot = native_output[:N]
+                torch.ops._vllm_fa2_C.kvarn_hadamard(
+                    output_rot.reshape(N, D), out_unrot
+                )
+            else:
+                out_unrot = torch.mm(output_rot.reshape(N, D), H16)
+            return out_unrot.view(B, Hq, D)
+
+    # 2+3. Attention. Two paths (KVARN_FUSED_DECODE, default fused):
+    #   FUSED      — one kernel reads int4/pool directly, dequants in registers,
+    #                online-softmax; never materializes fp16 K/V to HBM. Moves
+    #                ~0.25x FP16 KV traffic for the bulk history → the only path
+    #                that can beat FP16/TurboQuant on latency.
+    #   MATERIALIZE — build packed fp16 K/V then stock FlashAttention (≥2.25x
+    #                FP16 KV traffic; kept for A/B and as a fallback).
+    max_blocks_per_req = md.fa_max_blocks_per_req
+    use_fused = os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
+    # Both the single-stage kernel and stage1 are @triton.autotune'd over
+    # BLOCK_N/num_warps (keyed on D/GROUP/Q_PER_KV/K_BITS/V_BITS) — no
+    # BLOCK_N/num_warps/num_stages passed at the launch sites.
+    _qpk = Hq // Hk
+    # Pad Q_PER_KV to a power of 2 for tl.arange / tl.dot (e.g. Qwen3.5 GQA
+    # 24q/4kv = ratio 6 -> 8); padded query heads are masked off in-kernel.
+    _qpk_pad = 1 << (_qpk - 1).bit_length() if _qpk > 1 else 1
+    common = dict(
+        MAX_BLOCKS_PER_REQ=max_blocks_per_req,
+        D=D,
+        GROUP=group,
+        Q_PER_KV=_qpk,
+        Q_PER_KV_PAD=_qpk_pad,
+        SLIDING_WINDOW=int(getattr(impl, "sliding_window", 0) or 0),
+        K_BITS=cfg.key_bits,
+        V_BITS=cfg.value_bits,
+        NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
+        K_PACKED_OFFSET=cfg.k_packed_offset,
+        K_S_COL_OFFSET=cfg.k_s_col_offset,
+        K_ZP_OFFSET=cfg.k_zp_offset,
+        K_S_ROW_OFFSET=cfg.k_s_row_offset,
+        V_PACKED_OFFSET=cfg.v_packed_offset,
+        V_S_COL_OFFSET=cfg.v_s_col_offset,
+        V_S_ROW_OFFSET=cfg.v_s_row_offset,
+        V_ZP_OFFSET=cfg.v_zp_offset,
+        VQ_INDIRECT=False,
+    )
+    # SPLIT-K (KVARN_SPLIT_K=1): two-stage flash-decoding — only a win in the
+    # LOW-batch / long-context regime (few programs ⇒ the KV-split dim adds the
+    # missing parallelism). At BURST (high batch) the single-stage (B,Hk) grid
+    # already saturates the GPU, so split-K's mid-buffer round-trip + stage-2 +
+    # empty-split waste roughly HALVE throughput. Default: single-stage.
+    use_fused = use_fused and True
+    # Split-K decision. Single-stage grid is (B, Hk) programs, each serially
+    # walking the WHOLE context; at long context that serial loop dominates and
+    # leaves the GPU under-occupied -> split-K parallelizes the KV dim for a big
+    # win (Qwen3.5-27B head_dim256 16K: 0.59x -> 0.96x same-batch, and lets KVarN
+    # out-throughput FP16's max feasible batch). But at short context / high
+    # occupancy the mid-buffer round-trip + stage-2 + empty-split waste roughly
+    # HALVE throughput. So auto-enable only in the long-context, under-occupied
+    # regime; KVARN_SPLIT_K env (0/1) is an explicit override.
+    # The split-K mid buffers are sized for the pure-decode regime
+    # (max_num_seqs * Hq rows); never split if this batch would overflow them
+    # (defensive — real decode batches always fit, but a padded dummy run can
+    # be wider). The single-stage kernel handles any batch size.
+    _mid_fits = impl._mid_o_buf is not None and impl._mid_o_buf.shape[0] >= N
+    _sk_env = os.environ.get("KVARN_SPLIT_K")
+    if _sk_env is not None:
+        split_k = use_fused and _sk_env == "1" and _mid_fits
+    else:
+        compute_units = num_compute_units(device.index or 0)
+        # long context (>= ~16 blocks of group tokens) AND single-stage grid does
+        # not already fill the SMs.
+        # Sliding-window layers read only ~window/GROUP blocks (single-stage is
+        # plenty + the windowed loop is in the single-stage kernel), so never split.
+        _sw = int(getattr(impl, "sliding_window", 0) or 0)
+        split_k = (
+            use_fused
+            and (_sw <= 0)
+            and (max_blocks_per_req >= 16)
+            and (B * Hk <= compute_units)
+            and _mid_fits
+        )
+    _require_kvarn_dpas_reader(dpas_layout, not use_fused, "Triton fused decode")
+    if use_fused and not split_k:
+        fused_out = impl._fused_out_buf[:N]  # [N, D] fp16
+        with torch.profiler.record_function("kvarn_fused_decode"):
+            _kvarn_fused_decode_kernel[(B, Hk)](
+                q_rot_fp16,
+                md.seq_lens,
+                md.block_table,
+                md.seq_lens,
+                impl._block_to_slot_t,
+                kv_cache,
+                impl._tail_K_pool,
+                impl._tail_V_pool,
+                fused_out,
+                scale,
+                Hq * D,
+                D,
+                md.block_table.stride(0),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                impl._tail_K_pool.stride(0),
+                impl._tail_K_pool.stride(1),
+                impl._tail_K_pool.stride(2),
+                Hq * D,
+                D,
+                **common,  # autotune fills BLOCK_N + warps + stages
+            )
+        output_rot = fused_out
+    elif split_k:
+        SPLITS = adaptive_num_kv_splits(max_blocks_per_req)
+        mid_o = impl._mid_o_buf
+        mid_lse = impl._mid_lse_buf
+        fused_out = impl._fused_out_buf[:N]
+        with torch.profiler.record_function("kvarn_fused_decode_s1"):
+            _kvarn_fused_decode_stage1[(B, Hk, SPLITS)](
+                q_rot_fp16,
+                md.seq_lens,
+                md.block_table,
+                md.seq_lens,
+                impl._block_to_slot_t,
+                kv_cache,
+                impl._tail_K_pool,
+                impl._tail_V_pool,
+                mid_o,
+                mid_lse,
+                scale,
+                Hq * D,
+                D,
+                md.block_table.stride(0),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                impl._tail_K_pool.stride(0),
+                impl._tail_K_pool.stride(1),
+                impl._tail_K_pool.stride(2),
+                mid_o.stride(0),
+                mid_o.stride(1),
+                mid_lse.stride(0),
+                NUM_KV_SPLITS=SPLITS,
+                HQ=Hq,
+                **common,  # BLOCK_N/warps autotuned
+            )
+        with torch.profiler.record_function("kvarn_fused_decode_s2"):
+            _kvarn_fused_decode_stage2[(N,)](
+                mid_o,
+                mid_lse,
+                fused_out,
+                mid_o.stride(0),
+                mid_o.stride(1),
+                mid_lse.stride(0),
+                fused_out.stride(0),
+                D=D,
+                NUM_KV_SPLITS=SPLITS,
+                num_warps=2,
+            )
+        output_rot = fused_out
+    else:
+        K_packed = impl._fa_K_buf
+        V_packed = impl._fa_V_buf
+        fa_cu_seqlens_q = md.fa_cu_seqlens_q
+        fa_cu_seqlens_k = md.fa_cu_seqlens_k
+        if fa_cu_seqlens_q is None or fa_cu_seqlens_k is None:
+            # Pure qlen=1 direct decode deliberately skips the builder's pinned
+            # CPU staging. Preserve the forced-materializer fallback by deriving
+            # its prefix sums on device only when that diagnostic path is used.
+            seq_lens_i32 = md.seq_lens[:B].to(torch.int32)
+            fa_cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seq_lens_i32, dim=0, dtype=torch.int32), (1, 0)
+            )
+            fa_cu_seqlens_q = torch.arange(
+                B + 1, dtype=torch.int32, device=query.device
+            )
+        with torch.profiler.record_function("kvarn_build_packed_kv"):
+            use_native_materializer = (
+                kvarn_native_feature_enabled("MATERIALIZE")
+                and query.device.type == "xpu"
+                and not is_capturing
+                and native_layer_selected
+                and Hk == 4
+                and D == 256
+                and group == 128
+                and cfg.key_bits == 4
+                and cfg.value_bits == 4
+                and cfg.record_bytes >= _KVARN_NATIVE_RECORD_BYTES
+                and cfg.record_bytes % 4 == 0
+                and kv_cache.shape[-1] == cfg.record_bytes
+                and kv_cache.is_contiguous()
+                and md.block_table[:B].is_contiguous()
+                and md.seq_lens[:B].is_contiguous()
+                and fa_cu_seqlens_k[: B + 1].is_contiguous()
+                and impl._block_to_slot_t.is_contiguous()
+                and impl._tail_K_pool.is_contiguous()
+                and impl._tail_V_pool.is_contiguous()
+                and K_packed.is_contiguous()
+                and V_packed.is_contiguous()
+                and int(md.max_seq_len) >= 1
+                and kvarn_native_layout_abi_supported("kvarn_materialize_packed_kv")
+            )
+            _require_kvarn_dpas_reader(
+                dpas_layout,
+                use_native_materializer or dpas_layout,
+                "materializer",
+            )
+            if use_native_materializer:
+                logger.info_once("Using the native Xe2 KVarN FP16 materializer")
+                torch.ops._vllm_fa2_C.kvarn_materialize_packed_kv(
+                    kv_cache,
+                    md.block_table[:B],
+                    md.seq_lens[:B],
+                    fa_cu_seqlens_k[: B + 1],
+                    impl._block_to_slot_t,
+                    impl._tail_K_pool,
+                    impl._tail_V_pool,
+                    K_packed,
+                    V_packed,
+                    int(md.max_seq_len),
+                    dpas_layout,
+                )
+            else:
+                _kvarn_build_packed_kv_kernel[(B * max_blocks_per_req, Hk)](
+                    md.block_table,
+                    md.seq_lens,
+                    fa_cu_seqlens_k,
+                    impl._block_to_slot_t,
+                    kv_cache,
+                    impl._tail_K_pool,
+                    impl._tail_V_pool,
+                    K_packed,
+                    V_packed,
+                    md.block_table.stride(0),
+                    kv_cache.stride(0),
+                    kv_cache.stride(1),
+                    impl._tail_K_pool.stride(0),
+                    impl._tail_K_pool.stride(1),
+                    impl._tail_K_pool.stride(2),
+                    K_packed.stride(0),
+                    K_packed.stride(1),
+                    MAX_BLOCKS_PER_REQ=max_blocks_per_req,
+                    D=D,
+                    GROUP=group,
+                    K_BITS=cfg.key_bits,
+                    V_BITS=cfg.value_bits,
+                    NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
+                    K_PACKED_OFFSET=cfg.k_packed_offset,
+                    K_S_COL_OFFSET=cfg.k_s_col_offset,
+                    K_ZP_OFFSET=cfg.k_zp_offset,
+                    K_S_ROW_OFFSET=cfg.k_s_row_offset,
+                    V_PACKED_OFFSET=cfg.v_packed_offset,
+                    V_S_COL_OFFSET=cfg.v_s_col_offset,
+                    V_S_ROW_OFFSET=cfg.v_s_row_offset,
+                    V_ZP_OFFSET=cfg.v_zp_offset,
+                    DPAS_LAYOUT=dpas_layout,
+                    num_warps=4,
+                    num_stages=2,
+                )
+        with torch.profiler.record_function("kvarn_flash_attn"):
+            output_rot = flash_attn_varlen_func(
+                q=q_rot_fp16.view(B, Hq, D),
+                k=K_packed,
+                v=V_packed,
+                cu_seqlens_q=fa_cu_seqlens_q,
+                cu_seqlens_k=fa_cu_seqlens_k,
+                max_seqlen_q=1,
+                max_seqlen_k=md.fa_max_seqlen_k_fixed,
+                softmax_scale=scale,
+                causal=False,
+            )
+
+    # 4. Un-rotate output — single fp16 tensor-core matmul (V was rotated, so
+    #    the attention output lives in the rotated frame). out = out_rot · H.
+    with torch.profiler.record_function("kvarn_output_unrotation"):
+        out_unrot = torch.mm(output_rot.reshape(N, D), H16)  # fresh fp16
+        return out_unrot.view(B, Hq, D)
+
+
+def kvarn_verify_attention(
+    query: torch.Tensor,  # [NQ, Hq, D]  fp16/bf16 (token-major)
+    kv_cache: torch.Tensor,  # [num_blocks, Hk, TILE_BYTES] uint8
+    block_table: torch.Tensor,  # [B, max_blocks] int32
+    scale: float,
+    cfg,
+    impl,  # KVarNAttentionImpl
+    vq_req: torch.Tensor,  # [NQ] int32 — block-table row per token
+    vq_seqlen: torch.Tensor,  # [NQ] int32 — causal len: cached+i+1
+    max_ctx_blocks: int,  # ceil(max context / group) upper bound
+    qlen: int = 0,  # uniform query length (>= 2), else 0
+    seq_lens: torch.Tensor | None = None,  # [B] int32 (uniform path)
+) -> torch.Tensor:
+    """Fused multi-query verify (speculative decode), reading int4 tiles +
+    the fp16 tail pool directly — no fp16 materialization of the context
+    (whose O(context)-per-step cost dominated MTP decode).
+
+    Two modes:
+    - UNIFORM (qlen >= 2, the captured/common case): one program per
+      (request, kv head, split) — the request's QLEN tokens SHARE each
+      block's dequant, so KV bytes and dequant ALU match single-token decode.
+    - per-token fallback (qlen == 0, non-uniform eager batches): one program
+      per (query token, kv head) via the vq plan; QLEN-x redundant dequant.
+
+    Output: ``[NQ, Hq, D]`` in ``query``'s dtype, un-rotated frame.
+    """
+    _require_kvarn_dpas_reader(impl._kvarn_dpas_layout, False, "Triton verify")
+    NQ, Hq, D = query.shape
+    Hk = kv_cache.shape[1]
+    device = query.device
+    out_dtype = query.dtype
+    group = cfg.group
+    Nrows = NQ * Hq
+
+    H16 = (
+        impl._H_fp16
+        if impl._H_fp16 is not None
+        else impl._hadamard(device).to(torch.float16)
+    )
+    q_rot = torch.mm(query.reshape(Nrows, D).to(torch.float16), H16)
+
+    _qpk = Hq // Hk
+    _qpk_pad = 1 << (_qpk - 1).bit_length() if _qpk > 1 else 1
+    common = dict(
+        MAX_BLOCKS_PER_REQ=max_ctx_blocks,
+        D=D,
+        GROUP=group,
+        Q_PER_KV=_qpk,
+        Q_PER_KV_PAD=_qpk_pad,
+        SLIDING_WINDOW=int(getattr(impl, "sliding_window", 0) or 0),
+        K_BITS=cfg.key_bits,
+        V_BITS=cfg.value_bits,
+        NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
+        K_PACKED_OFFSET=cfg.k_packed_offset,
+        K_S_COL_OFFSET=cfg.k_s_col_offset,
+        K_ZP_OFFSET=cfg.k_zp_offset,
+        K_S_ROW_OFFSET=cfg.k_s_row_offset,
+        V_PACKED_OFFSET=cfg.v_packed_offset,
+        V_S_COL_OFFSET=cfg.v_s_col_offset,
+        V_S_ROW_OFFSET=cfg.v_s_row_offset,
+        V_ZP_OFFSET=cfg.v_zp_offset,
+    )
+
+    out_rot = torch.empty(NQ, Hq, D, dtype=torch.float16, device=device)
+
+    _m = qlen * (1 << ((Hq // Hk) - 1).bit_length() if Hq // Hk > 1 else 1)
+    if (
+        qlen >= 2
+        and seq_lens is not None
+        and NQ % qlen == 0
+        and (_m & (_m - 1)) == 0  # Q-tile rows must be a power of 2
+        # DEFAULT OFF: numerically validated in isolation (matches the
+        # per-token kernel within fp32 reduction noise on live inputs,
+        # incl. on the failing trajectory), but serving with it corrupts
+        # the MTP drafter's proposals (invalid [-1,...] spec tokens,
+        # embedding index asserts at temperature>0, degenerate greedy
+        # output) through a mechanism not yet isolated — suspicion is an
+        # interaction with async scheduling / drafter metadata rather
+        # than kernel math. Re-enable for debugging only.
+        and os.environ.get("KVARN_SHARED_VERIFY", "0") == "1"
+    ):
+        # SHARED-DEQUANT uniform path: split-K shaped (SPLITS=1 degenerates
+        # cleanly); stage2 combines into the flat [NQ*Hq, D] output.
+        B = NQ // qlen
+        SPLITS = (
+            adaptive_num_kv_splits(max_ctx_blocks)
+            if max_ctx_blocks >= 16 and B * Hk <= num_compute_units(device.index or 0)
+            else 1
+        )
+        mid_o = torch.empty(Nrows, SPLITS, D, dtype=torch.float32, device=device)
+        mid_lse = torch.empty(Nrows, SPLITS, dtype=torch.float32, device=device)
+        _kvarn_fused_verify_stage1[(B, Hk, SPLITS)](
+            q_rot,
+            block_table,
+            vq_seqlen,
+            impl._block_to_slot_t,
+            kv_cache,
+            impl._tail_K_pool,
+            impl._tail_V_pool,
+            mid_o,
+            mid_lse,
+            scale,
+            Hq * D,
+            D,
+            block_table.stride(0),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            impl._tail_K_pool.stride(0),
+            impl._tail_K_pool.stride(1),
+            impl._tail_K_pool.stride(2),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_lse.stride(0),
+            QLEN=qlen,
+            HQ=Hq,
+            NUM_KV_SPLITS=SPLITS,
+            **common,
+        )
+        out_flat = out_rot.view(Nrows, D)
+        _kvarn_fused_decode_stage2[(Nrows,)](
+            mid_o,
+            mid_lse,
+            out_flat,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_lse.stride(0),
+            out_flat.stride(0),
+            D=D,
+            NUM_KV_SPLITS=SPLITS,
+            num_warps=2,
+        )
+        out_unrot = torch.mm(out_rot.reshape(Nrows, D), H16)
+        return out_unrot.view(NQ, Hq, D).to(out_dtype)
+
+    common["VQ_INDIRECT"] = True
+
+    # Split-K mirrors the decode driver's heuristic: long context with too few
+    # programs to fill the SMs. Verify batches are tiny (NQ <= maxq * B), so
+    # long-context verify nearly always wants the split.
+    compute_units = num_compute_units(device.index or 0)
+    _sw = int(getattr(impl, "sliding_window", 0) or 0)
+    _sk_env = os.environ.get("KVARN_SPLIT_K")
+    if _sk_env is not None:
+        split_k = _sk_env == "1"
+    else:
+        split_k = (_sw <= 0) and (max_ctx_blocks >= 16) and (NQ * Hk <= compute_units)
+
+    if not split_k:
+        _kvarn_fused_decode_kernel[(NQ, Hk)](
+            q_rot,
+            vq_req,
+            block_table,
+            vq_seqlen,
+            impl._block_to_slot_t,
+            kv_cache,
+            impl._tail_K_pool,
+            impl._tail_V_pool,
+            out_rot,
+            scale,
+            Hq * D,
+            D,
+            block_table.stride(0),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            impl._tail_K_pool.stride(0),
+            impl._tail_K_pool.stride(1),
+            impl._tail_K_pool.stride(2),
+            Hq * D,
+            D,
+            **common,
+        )
+    else:
+        SPLITS = adaptive_num_kv_splits(max_ctx_blocks)
+        mid_o = torch.empty(Nrows, SPLITS, D, dtype=torch.float32, device=device)
+        mid_lse = torch.empty(Nrows, SPLITS, dtype=torch.float32, device=device)
+        _kvarn_fused_decode_stage1[(NQ, Hk, SPLITS)](
+            q_rot,
+            vq_req,
+            block_table,
+            vq_seqlen,
+            impl._block_to_slot_t,
+            kv_cache,
+            impl._tail_K_pool,
+            impl._tail_V_pool,
+            mid_o,
+            mid_lse,
+            scale,
+            Hq * D,
+            D,
+            block_table.stride(0),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            impl._tail_K_pool.stride(0),
+            impl._tail_K_pool.stride(1),
+            impl._tail_K_pool.stride(2),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_lse.stride(0),
+            NUM_KV_SPLITS=SPLITS,
+            HQ=Hq,
+            **common,  # BLOCK_N/warps autotuned
+        )
+        out_flat = out_rot.view(Nrows, D)
+        _kvarn_fused_decode_stage2[(Nrows,)](
+            mid_o,
+            mid_lse,
+            out_flat,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_lse.stride(0),
+            out_flat.stride(0),
+            D=D,
+            NUM_KV_SPLITS=SPLITS,
+            num_warps=2,
+        )
+
+    out_unrot = torch.mm(out_rot.reshape(Nrows, D), H16)
+    return out_unrot.view(NQ, Hq, D).to(out_dtype)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SHARED-DEQUANT verify kernel: one program per (REQUEST, kv-head, split) — all
+# QLEN verify tokens of a request share each block's dequant (the per-token
+# VQ_INDIRECT path above re-walks the context once per token, i.e. QLEN
+# redundant dequants). Q tile is [QLEN * Q_PER_KV_PAD, D] with a per-row
+# bottom-right causal limit: row (token j, lane h) attends kv positions
+# < seq_len - QLEN + j + 1. Uniform QLEN is a constexpr (uniform-batch graph
+# capture guarantees it); non-uniform eager batches fall back to the per-token
+# kernel. Scale vectors are loaded via fp16 pointer casts (the tile offsets are
+# 2-byte aligned) instead of the byte-pair loads of the older kernels.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@triton.autotune(
+    configs=_DECODE_AUTOTUNE_CONFIGS,
+    key=["D", "GROUP", "Q_PER_KV", "QLEN", "K_BITS", "V_BITS"],
+)
+@triton.jit
+def _kvarn_fused_verify_stage1(
+    Q_ptr,  # [NQ = B*QLEN, Hq, D] fp16 (rotated, token-major)
+    Block_table_ptr,  # [B, max_blocks] int32
+    Seq_lens_ptr,  # [NQ] int32 — the vq plan (per-token causal lengths);
+    # the request's FULL length is its LAST token's entry.
+    # Built CPU-side in the builder: under async spec
+    # decode the device seq_lens tensor can disagree with
+    # the builder's CPU view, and the CPU view is the one
+    # the (validated) per-token path uses.
+    Block_to_slot_ptr,
+    KV_cache_ptr,
+    Tail_K_pool_ptr,
+    Tail_V_pool_ptr,
+    MidO_ptr,  # [NQ*Hq, NUM_KV_SPLITS, D] fp32
+    MidLse_ptr,  # [NQ*Hq, NUM_KV_SPLITS]    fp32
+    scale,
+    stride_q_t,
+    stride_q_h,
+    stride_bt_b,
+    stride_kv_b,
+    stride_kv_h,
+    stride_pool_b,
+    stride_pool_t,
+    stride_pool_h,
+    stride_mo_n,
+    stride_mo_s,
+    stride_ml_n,
+    MAX_BLOCKS_PER_REQ: tl.constexpr,  # unused; kept for launch-dict parity
+    D: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    QLEN: tl.constexpr,
+    Q_PER_KV: tl.constexpr,
+    Q_PER_KV_PAD: tl.constexpr,
+    HQ: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    K_BITS: tl.constexpr,
+    V_BITS: tl.constexpr,
+    NUM_BLOCKS_LOOKUP: tl.constexpr,
+    K_PACKED_OFFSET: tl.constexpr,
+    K_S_COL_OFFSET: tl.constexpr,
+    K_ZP_OFFSET: tl.constexpr,
+    K_S_ROW_OFFSET: tl.constexpr,
+    V_PACKED_OFFSET: tl.constexpr,
+    V_S_COL_OFFSET: tl.constexpr,
+    V_S_ROW_OFFSET: tl.constexpr,
+    V_ZP_OFFSET: tl.constexpr,
+):
+    b = tl.program_id(0)
+    hk = tl.program_id(1)
+    split = tl.program_id(2)
+
+    seq_len = tl.load(Seq_lens_ptr + b * QLEN + (QLEN - 1))
+    # Padded rows (uniform-batch capture/replay) carry seq_len <= 0.
+    if seq_len <= 0:
+        return
+
+    M: tl.constexpr = QLEN * Q_PER_KV_PAD
+    r = tl.arange(0, M)
+    j = r // Q_PER_KV_PAD  # token idx in request
+    lane = r % Q_PER_KV_PAD  # query-head lane
+    rmask = lane < Q_PER_KV
+    limit = seq_len - QLEN + j + 1  # [M] causal kv limit
+    hq0 = hk * Q_PER_KV
+    d_offs = tl.arange(0, D)
+
+    PACK_K: tl.constexpr = 8 // K_BITS
+    PACK_V: tl.constexpr = 8 // V_BITS
+    MASK_K: tl.constexpr = (1 << K_BITS) - 1
+    MASK_V: tl.constexpr = (1 << V_BITS) - 1
+    d_byte_v = d_offs // PACK_V
+    d_shift_v = (d_offs % PACK_V) * V_BITS
+
+    tok_row = b * QLEN + j  # [M] token-major Q row
+    q = tl.load(
+        Q_ptr
+        + tok_row[:, None] * stride_q_t
+        + (hq0 + lane)[:, None] * stride_q_h
+        + d_offs[None, :],
+        mask=rmask[:, None],
+        other=0.0,
+    ).to(tl.float32)  # [M, D]
+
+    m_i = tl.full([M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([M], dtype=tl.float32)
+    acc = tl.zeros([M, D], dtype=tl.float32)
+
+    n_blocks = (seq_len + GROUP - 1) // GROUP
+    blocks_per_split = (n_blocks + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS
+    blk_lo = split * blocks_per_split
+    blk_hi = tl.minimum(blk_lo + blocks_per_split, n_blocks)
+
+    for k in range(blk_lo, blk_hi):
+        rem = seq_len - k * GROUP
+        n_tok = tl.minimum(tl.maximum(rem, 0), GROUP)
+        block_id = tl.load(Block_table_ptr + b * stride_bt_b + k)
+        in_range = (block_id >= 0) & (block_id < NUM_BLOCKS_LOOKUP)
+        safe_bid = tl.where(in_range, block_id, 0)
+        pool_slot = tl.load(Block_to_slot_ptr + safe_bid, mask=in_range, other=-1)
+        tile_base = block_id.to(tl.int64) * stride_kv_b + hk * stride_kv_h
+        safe_slot = tl.where(pool_slot >= 0, pool_slot, 0)
+        pool_base = safe_slot.to(tl.int64) * stride_pool_b + hk * stride_pool_h
+
+        # Per-channel scales — direct fp16 loads (2-byte-aligned offsets).
+        s_col_K = tl.load(
+            (KV_cache_ptr + tile_base + K_S_COL_OFFSET).to(tl.pointer_type(tl.float16))
+            + d_offs
+        ).to(tl.float32)
+        zp_K = tl.load(
+            (KV_cache_ptr + tile_base + K_ZP_OFFSET).to(tl.pointer_type(tl.float16))
+            + d_offs
+        ).to(tl.float32)
+        s_col_V = tl.load(
+            (KV_cache_ptr + tile_base + V_S_COL_OFFSET).to(tl.pointer_type(tl.float16))
+            + d_offs
+        ).to(tl.float32)
+
+        for c0 in range(0, GROUP, BLOCK_N):
+            cols = c0 + tl.arange(0, BLOCK_N)
+            cmask = cols < n_tok
+            kvpos = k * GROUP + cols  # [BN]
+
+            if pool_slot >= 0:
+                src = pool_base + cols[:, None] * stride_pool_t + d_offs[None, :]
+                Kc = tl.load(Tail_K_pool_ptr + src, mask=cmask[:, None], other=0.0).to(
+                    tl.float32
+                )  # [BN, D]
+                Vc = tl.load(Tail_V_pool_ptr + src, mask=cmask[:, None], other=0.0).to(
+                    tl.float32
+                )  # [BN, D]
+                K_dg = tl.trans(Kc)  # [D, BN]
+            else:
+                cb_k = cols // PACK_K
+                cs_k = (cols % PACK_K) * K_BITS
+                s_row_K = tl.load(
+                    (KV_cache_ptr + tile_base + K_S_ROW_OFFSET).to(
+                        tl.pointer_type(tl.float16)
+                    )
+                    + cols
+                ).to(tl.float32)
+                k_addrs = (
+                    tile_base
+                    + K_PACKED_OFFSET
+                    + d_offs[:, None] * (GROUP // PACK_K)
+                    + cb_k[None, :]
+                )
+                k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
+                q_K = ((k_bytes >> cs_k[None, :]) & MASK_K).to(tl.float32)
+                K_dg = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]
+                s_row_V = tl.load(
+                    (KV_cache_ptr + tile_base + V_S_ROW_OFFSET).to(
+                        tl.pointer_type(tl.float16)
+                    )
+                    + cols
+                ).to(tl.float32)
+                zp_V = tl.load(
+                    (KV_cache_ptr + tile_base + V_ZP_OFFSET).to(
+                        tl.pointer_type(tl.float16)
+                    )
+                    + cols
+                ).to(tl.float32)
+                v_addrs = (
+                    tile_base
+                    + V_PACKED_OFFSET
+                    + cols[:, None] * (D // PACK_V)
+                    + d_byte_v[None, :]
+                )
+                v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
+                q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
+                Vc = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]
+
+            scores = tl.dot(q, K_dg)  # [M, BN]
+            smask = cmask[None, :] & (kvpos[None, :] < limit[:, None])
+            if SLIDING_WINDOW > 0:
+                smask = smask & (
+                    kvpos[None, :] >= tl.maximum(limit[:, None] - SLIDING_WINDOW, 0)
+                )
+            scores = tl.where(smask, scores * scale, -float("inf"))
+            m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+            p = tl.exp(scores - m_new[:, None])
+            alpha = tl.exp(m_i - m_new)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p, Vc)
+            m_i = m_new
+
+    nonempty = l_i > 0
+    O_s = acc / tl.where(nonempty, l_i, 1.0)[:, None]
+    lse_s = tl.where(
+        nonempty, m_i + tl.log(tl.where(nonempty, l_i, 1.0)), -float("inf")
+    )
+    rows = tok_row * HQ + hq0 + lane  # [M] N-row index
+    tl.store(
+        MidO_ptr + rows[:, None] * stride_mo_n + split * stride_mo_s + d_offs[None, :],
+        O_s,
+        mask=rmask[:, None],
+    )
+    tl.store(MidLse_ptr + rows * stride_ml_n + split, lse_s, mask=rmask)

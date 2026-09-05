@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -168,6 +169,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
@@ -249,6 +251,7 @@ from .utils import (
     copy_kv_cache_blocks_inplace,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
+    zero_mamba_block_ids,
 )
 
 if TYPE_CHECKING:
@@ -257,6 +260,32 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _kvarn_incremental_lifecycle_metadata_enabled(
+    cache_dtype: str, metadata_lifecycle: str
+) -> bool:
+    """Resolve the runner-side B receipt switch once during engine init."""
+    return (
+        cache_dtype.startswith("kvarn_") and metadata_lifecycle == "incremental_qlen1"
+    )
+
+
+def _maybe_materialize_kvarn_lifecycle_metadata(
+    enabled: bool,
+    request_ids: Sequence[str],
+    block_table: Any,
+    num_reqs: int,
+) -> tuple[tuple[str, ...] | None, np.ndarray | None]:
+    """Materialize lifecycle receipts only for the selected B variant."""
+    if not enabled:
+        return None, None
+    return tuple(request_ids[:num_reqs]), block_table.get_row_versions(num_reqs)
+
+
+def _block_table_cpu_view(block_table: Any, num_reqs: int) -> np.ndarray:
+    """Return only live request rows from the authoritative CPU mirror."""
+    return block_table.get_numpy_array()[:num_reqs]
 
 
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
@@ -535,6 +564,12 @@ class GPUModelRunner(
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
         )
+        self._enable_kvarn_incremental_lifecycle_metadata = (
+            _kvarn_incremental_lifecycle_metadata_enabled(
+                cache_config.cache_dtype,
+                os.environ.get("KVARN_METADATA_LIFECYCLE", "reference"),
+            )
+        )
 
         self.is_pooling_model = model_config.runner_type == "pooling"
         self.enable_prompt_embeds = model_config.enable_prompt_embeds
@@ -784,6 +819,9 @@ class GPUModelRunner(
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 reasoning_config=self.vllm_config.reasoning_config,
                 use_replayssm=self.cache_config.use_replayssm,
+                track_block_table_row_versions=(
+                    self._enable_kvarn_incremental_lifecycle_metadata
+                ),
             )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -1160,13 +1198,38 @@ class GPUModelRunner(
             kernel_block_sizes=self._kernel_block_sizes,
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=self.compilation_config.static_forward_context,
-            num_blocks=self.kv_cache_config.num_blocks,
+            num_blocks=[
+                self.kv_cache_config.num_blocks_for_group(group_id)
+                for group_id in range(self.kv_cache_config.num_managed_groups)
+            ],
+            group_pool_ids=[
+                self.kv_cache_config.pool_id_for_group(group_id)
+                for group_id in range(self.kv_cache_config.num_managed_groups)
+            ],
+        )
+        self._zero_block_ids([NULL_BLOCK_ID])
+        zero_mamba_block_ids(
+            self.kv_cache_config,
+            self.compilation_config.static_forward_context,
+            [
+                (group_id, [NULL_BLOCK_ID])
+                for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ],
+            self.device,
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
-        """Zero the KV cache memory for the given block IDs."""
+        """Zero block IDs across all pools (used only for the null block)."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
+
+    def _zero_block_ids_by_group(
+        self, group_block_ids: list[tuple[int, list[int]]]
+    ) -> None:
+        """Zero group-qualified IDs only in their physical backing pools."""
+        if hasattr(self, "_kv_block_zeroer"):
+            self._kv_block_zeroer.zero_block_ids_by_group(group_block_ids)
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -1231,11 +1294,18 @@ class GPUModelRunner(
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            self._zero_block_ids_by_group(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.new_mamba_block_ids_to_zero:
+            zero_mamba_block_ids(
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
+                scheduler_output.new_mamba_block_ids_to_zero,
+                self.device,
+            )
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
                 scheduler_output.kv_cache_block_copies,
             )
 
@@ -2379,9 +2449,29 @@ class GPUModelRunner(
             blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)
             return blk_table_tensor
 
+        def _get_block_table_cpu(kv_cache_gid: int):
+            kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
+            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                return None
+            blk_table = self.input_batch.block_table[kv_cache_gid]
+            return _block_table_cpu_view(blk_table, num_reqs)
+
         assert slot_mappings is not None
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
+        kvarn_request_ids = None
+        block_table_row_versions_gid_0 = None
+        if self._enable_kvarn_incremental_lifecycle_metadata and not isinstance(
+            kv_cache_groups[0].kv_cache_spec, EncoderOnlyAttentionSpec
+        ):
+            kvarn_request_ids, block_table_row_versions_gid_0 = (
+                _maybe_materialize_kvarn_lifecycle_metadata(
+                    True,
+                    self.input_batch.req_ids,
+                    self.input_batch.block_table[0],
+                    num_reqs,
+                )
+            )
 
         if self.routed_experts_initialized:
             # Copy this step's attention slot_mapping into our private
@@ -2500,6 +2590,9 @@ class GPUModelRunner(
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
+            block_table_cpu=_get_block_table_cpu(0),
+            request_ids=kvarn_request_ids,
+            block_table_row_versions=block_table_row_versions_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
@@ -2633,6 +2726,18 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+                cm.block_table_cpu = _get_block_table_cpu(kv_cache_gid)
+                if self._enable_kvarn_incremental_lifecycle_metadata and not isinstance(
+                    kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
+                ):
+                    _, cm.block_table_row_versions = (
+                        _maybe_materialize_kvarn_lifecycle_metadata(
+                            True,
+                            self.input_batch.req_ids,
+                            self.input_batch.block_table[kv_cache_gid],
+                            num_reqs,
+                        )
+                    )
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
@@ -7396,6 +7501,9 @@ class GPUModelRunner(
                     reasoning_config=self.vllm_config.reasoning_config,
                     use_replayssm=self.cache_config.use_replayssm,
                     slot_mapping_modes=slot_mapping_modes,
+                    track_block_table_row_versions=(
+                        self._enable_kvarn_incremental_lifecycle_metadata
+                    ),
                 )
 
         assert self._init_block_sizes == block_sizes, (
@@ -7627,7 +7735,11 @@ class GPUModelRunner(
             )
             spec, layer_names = encoder_only_attn_specs.popitem()
             self.kv_cache_config.kv_cache_groups.append(
-                KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)
+                KVCacheGroupSpec(
+                    layer_names=layer_names,
+                    kv_cache_spec=spec,
+                    enable_kv_transfer=False,
+                )
             )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:

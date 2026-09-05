@@ -38,6 +38,20 @@ class GDNAttentionBackend(AttentionBackend):
         return True
 
 
+class QwenGDNAttentionBackend(GDNAttentionBackend):
+    """GDN backend for Qwen-specific execution constraints."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "QWEN_GDN_ATTN"
+
+    @classmethod
+    def get_required_prefill_chunk_size(cls) -> int:
+        from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+
+        return FLA_CHUNK_SIZE
+
+
 @dataclass
 class GDNAttentionMetadata:
     num_prefills: int
@@ -54,6 +68,11 @@ class GDNAttentionMetadata:
     non_spec_query_start_loc: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes + 1,]
     )
+    # Immutable CPU copy used by eager platform dispatch. The source is a view
+    # into a persistent runner buffer which is overwritten on the next step.
+    non_spec_query_start_loc_cpu: tuple[int, ...] | None = None
+    non_spec_num_computed_tokens_cpu: tuple[int, ...] | None = None
+    non_spec_is_prefilling_cpu: tuple[bool, ...] | None = None
 
     spec_state_indices_tensor: torch.Tensor | None = None  # shape: [batch, num_spec]
     non_spec_state_indices_tensor: torch.Tensor | None = (
@@ -218,6 +237,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
+        request_start_positions_cpu = m._num_computed_tokens_cpu
+        request_is_prefilling_cpu = m.is_prefilling
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         block_table_tensor = mamba_get_block_table_tensor(
             m.block_table_tensor,
@@ -509,6 +530,37 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_has_initial_state=prefill_has_initial_state,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu=(
+                tuple(int(value) for value in non_spec_query_start_loc_cpu.tolist())
+                if non_spec_query_start_loc_cpu is not None
+                else None
+            ),
+            non_spec_num_computed_tokens_cpu=(
+                tuple(
+                    int(value)
+                    for value in (
+                        request_start_positions_cpu
+                        if spec_sequence_masks_cpu is None
+                        else request_start_positions_cpu[~spec_sequence_masks_cpu]
+                    ).tolist()
+                )
+                if non_spec_query_start_loc_cpu is not None
+                and request_start_positions_cpu is not None
+                else None
+            ),
+            non_spec_is_prefilling_cpu=(
+                tuple(
+                    bool(value)
+                    for value in (
+                        request_is_prefilling_cpu
+                        if spec_sequence_masks_cpu is None
+                        else request_is_prefilling_cpu[~spec_sequence_masks_cpu]
+                    ).tolist()
+                )
+                if non_spec_query_start_loc_cpu is not None
+                and request_is_prefilling_cpu is not None
+                else None
+            ),
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             spec_sequence_masks=spec_sequence_masks,
