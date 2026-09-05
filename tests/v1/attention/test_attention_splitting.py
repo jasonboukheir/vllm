@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 
 from tests.v1.attention.test_attention_backends import BATCH_SPECS
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.v1.attention.backends.utils import (
+    make_kv_sharing_fast_prefill_common_attn_metadata,
     split_decodes_and_prefills,
 )
 from vllm.v1.worker.ubatch_utils import (
@@ -67,6 +69,23 @@ def test_full_tensor_slice(sample_query_start_loc):
 
     expected = torch.tensor([0, 5, 12, 20, 35, 50])
     assert torch.equal(result, expected)
+
+
+def test_fast_kv_sharing_preserves_cpu_block_table_mirror():
+    metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[4, 6], query_lens=[4, 6]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    block_table_cpu = np.array([[3], [5]], dtype=np.int32)
+    metadata.block_table_cpu = block_table_cpu
+    metadata.logits_indices_padded = torch.tensor([3, 9], dtype=torch.int64)
+    metadata.num_logits_indices = 2
+    metadata.max_logits_per_req = 1
+
+    result = make_kv_sharing_fast_prefill_common_attn_metadata(metadata)
+
+    assert result.block_table_cpu is block_table_cpu
 
 
 def test_slice_bounds_edge_cases(sample_query_start_loc):

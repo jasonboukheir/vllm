@@ -116,8 +116,9 @@ class KVBlockZeroer:
         attn_groups_iter: Iterable["AttentionGroup"],
         kernel_block_sizes: list[int],
         static_forward_context: dict[str, Any],
-        num_blocks: int,
+        num_blocks: int | Sequence[int],
         runner_only_attn_layers: set[str] | None = None,
+        group_pool_ids: Sequence[int] | None = None,
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
 
@@ -130,8 +131,10 @@ class KVBlockZeroer:
         also covers the block's other layers -- safe, since block IDs are global pool
         indices and a newly allocated block owns its whole tile.
 
-        Block IDs from the scheduler reference logical blocks whose size
-        may differ from the kernel block size (virtual block splitting).
+        ``num_blocks`` is either the legacy shared-pool block count or one
+        logical block count per KV cache group. Block IDs from the scheduler
+        reference logical blocks whose size may differ from the kernel block
+        size (virtual block splitting).
         Each virtual block is represented as an independent segment so its
         physical block stride and zeroed page span remain independent.
 
@@ -141,38 +144,66 @@ class KVBlockZeroer:
         self._meta: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
         ) = None
+        self._meta_by_pool: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]
+        ] = {}
+        self._group_pool_ids = (
+            tuple(group_pool_ids) if group_pool_ids is not None else None
+        )
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
         # Overlaid layers (packed layouts) share a base address but may have
         # different page sizes; keep the widest span per address so newly
         # allocated blocks are fully zeroed for every overlaying group.
-        seen_ptrs: dict[int, int] = {}
+        seen_ptrs: dict[tuple[int, int], int] = {}
         seg_addrs: list[int] = []
         seg_block_strides: list[int] = []
         seg_page_sizes: list[int] = []
+        seg_pool_ids: list[int] = []
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
             if not isinstance(spec, AttentionSpec):
                 continue
+            managed_layer_names = [
+                layer_name
+                for layer_name in group.layer_names
+                if layer_name not in runner_only_attn_layers
+            ]
+            if not managed_layer_names:
+                continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
+            if self._group_pool_ids is None:
+                pool_id = 0
+            else:
+                if group.kv_cache_group_id >= len(self._group_pool_ids):
+                    raise ValueError(
+                        "physical pool ids must cover every KV cache group"
+                    )
+                pool_id = self._group_pool_ids[group.kv_cache_group_id]
+            if isinstance(num_blocks, int):
+                group_num_blocks = num_blocks
+            else:
+                if group.kv_cache_group_id >= len(num_blocks):
+                    raise ValueError(
+                        "logical block counts must cover every KV cache group"
+                    )
+                group_num_blocks = num_blocks[group.kv_cache_group_id]
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
             assert spec.block_size % kernel_bs == 0
-            for layer_name in group.layer_names:
-                if layer_name in runner_only_attn_layers:
-                    continue
+            for layer_name in managed_layer_names:
                 kv = static_forward_context[layer_name].kv_cache
                 if not isinstance(kv, torch.Tensor):
                     continue
                 dp = kv.data_ptr()
 
-                assert kv.shape[0] % num_blocks == 0, (
+                assert kv.shape[0] % group_num_blocks == 0, (
                     f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
-                    f"multiple of {num_blocks} logical blocks"
+                    f"multiple of {group_num_blocks} logical blocks"
                 )
-                ratio = kv.shape[0] // num_blocks
+                ratio = kv.shape[0] // group_num_blocks
 
                 el = kv.element_size()
                 block_stride_bytes = kv.stride(0) * el
@@ -195,7 +226,8 @@ class KVBlockZeroer:
                     assert (dp + off_bytes) % 4 == 0
                     for virtual_index in range(ratio):
                         addr = dp + off_bytes + virtual_index * block_stride_bytes
-                        if (idx := seen_ptrs.get(addr)) is not None:
+                        segment_key = (pool_id, addr)
+                        if (idx := seen_ptrs.get(segment_key)) is not None:
                             assert (
                                 seg_block_strides[idx]
                                 == logical_block_stride_bytes // 4
@@ -204,29 +236,54 @@ class KVBlockZeroer:
                                 seg_page_sizes[idx], kernel_page_bytes // 4
                             )
                             continue
-                        seen_ptrs[addr] = len(seg_addrs)
+                        seen_ptrs[segment_key] = len(seg_addrs)
                         seg_addrs.append(addr)
                         seg_block_strides.append(logical_block_stride_bytes // 4)
                         seg_page_sizes.append(kernel_page_bytes // 4)
+                        seg_pool_ids.append(pool_id)
 
         if not seg_addrs:
             self._meta = None
             return
 
-        max_page_size_el = max(seg_page_sizes)
-        blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
-        self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
-            torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
-            (max_page_size_el + blk_size - 1) // blk_size,
-            blk_size,
-            len(seg_addrs),
-        )
+        def make_meta(indices: Sequence[int]):
+            page_sizes = [seg_page_sizes[index] for index in indices]
+            max_page_size_el = max(page_sizes)
+            blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
+            return (
+                torch.tensor(
+                    [seg_addrs[index] for index in indices],
+                    dtype=torch.uint64,
+                    device=self.device,
+                ),
+                torch.tensor(
+                    [seg_block_strides[index] for index in indices],
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                torch.tensor(page_sizes, dtype=torch.int64, device=self.device),
+                (max_page_size_el + blk_size - 1) // blk_size,
+                blk_size,
+                len(indices),
+            )
 
-    def zero_block_ids(self, block_ids: list[int]) -> None:
-        """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+        all_indices = list(range(len(seg_addrs)))
+        self._meta = make_meta(all_indices)
+        for pool_id in dict.fromkeys(seg_pool_ids):
+            self._meta_by_pool[pool_id] = make_meta(
+                [
+                    index
+                    for index, segment_pool_id in enumerate(seg_pool_ids)
+                    if segment_pool_id == pool_id
+                ]
+            )
+
+    def _zero_with_meta(
+        self,
+        meta: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int],
+        block_ids: list[int],
+    ) -> None:
+        if not block_ids:
             return
         (
             seg_addrs,
@@ -235,7 +292,7 @@ class KVBlockZeroer:
             max_chunks,
             blk_size,
             n_segs,
-        ) = self._meta
+        ) = meta
         n_blocks = len(block_ids)
         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
         grid = (n_blocks, n_segs, max_chunks)
@@ -246,6 +303,40 @@ class KVBlockZeroer:
             idx,
             BLOCK_SIZE=blk_size,
         )
+
+    def zero_block_ids(self, block_ids: list[int]) -> None:
+        """Zero block IDs across every pool (used for the null block)."""
+        if not block_ids or self._meta is None:
+            return
+        self._zero_with_meta(self._meta, block_ids)
+
+    def zero_block_ids_by_group(
+        self, group_block_ids: Sequence[tuple[int, list[int]]]
+    ) -> None:
+        """Zero group-qualified IDs only in their physical backing pools."""
+        if not group_block_ids:
+            return
+        if self._group_pool_ids is None:
+            self.zero_block_ids(
+                list(
+                    dict.fromkeys(
+                        block_id
+                        for _, block_ids in group_block_ids
+                        for block_id in block_ids
+                    )
+                )
+            )
+            return
+
+        block_ids_by_pool: defaultdict[int, list[int]] = defaultdict(list)
+        for group_id, block_ids in group_block_ids:
+            if not 0 <= group_id < len(self._group_pool_ids):
+                raise ValueError(f"Invalid KV cache group id: {group_id}")
+            block_ids_by_pool[self._group_pool_ids[group_id]].extend(block_ids)
+        for pool_id, block_ids in block_ids_by_pool.items():
+            meta = self._meta_by_pool.get(pool_id)
+            if meta is not None:
+                self._zero_with_meta(meta, list(dict.fromkeys(block_ids)))
 
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""
@@ -402,31 +493,39 @@ def allocate_kv_cache(
 ) -> dict[str, torch.Tensor]:
     """Allocate the KV cache and view it as ``[B, H, N, C]`` per layer.
 
-    Every KVCacheTensor places its layers in the same backing allocation: layer ``l`` of
-    block ``b`` starts at ``offset + l * layer_stride + b * block_stride``. Cache
-    groups overlay each other, so tensors may address the same bytes.
+    Every KVCacheTensor places its layers in its pool's backing allocation:
+    layer ``l`` of block ``b`` starts at
+    ``offset + l * layer_stride + b * block_stride``. Cache groups in a shared
+    pool overlay each other, while independent KVarN/Mamba groups use distinct
+    buffers and local block-ID namespaces.
     """
     if not kv_cache_config.kv_cache_tensors:
         return {}
 
-    sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
-    assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
-    raw_size = sizes.pop()
-    # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
-    # are created lazily on the first qualifying GEMM. Force that now, before
-    # the giant backing allocation below: if one landed in this segment's
-    # rounding tail it would pin the whole segment at engine shutdown.
+    # wvSplitKrc's process-lifetime static workspaces are created lazily on
+    # the first qualifying GEMM. Initialize them before any large ROCm pool.
     if current_platform.is_rocm():
         warmup_rocm_skinny_gemm_workspaces(device)
-        # Pad to the page granularity MoRIIO needs to register the shared
-        # backing as a single RDMA memory region. Other platforms keep the
-        # exact-size allocation: NIXL and SimpleCPUOffload rely on
-        # storage.nbytes() matching the logical KV size (see #53974).
-        page_size = 4096
-        buf_size = ((raw_size + page_size - 1) // page_size) * page_size
-    else:
+
+    tensors_by_pool: defaultdict[int, list] = defaultdict(list)
+    for tensor in kv_cache_config.kv_cache_tensors:
+        tensors_by_pool[tensor.pool_id].append(tensor)
+
+    buffers: dict[int, torch.Tensor] = {}
+    for pool_id, tensors in tensors_by_pool.items():
+        sizes = {tensor.size for tensor in tensors}
+        assert len(sizes) == 1, (
+            f"KV cache tensors in pool {pool_id} must share one backing allocation."
+        )
+        raw_size = sizes.pop()
+        # MoRIIO registers each backing allocation as one RDMA region and
+        # requires page granularity. Other platforms retain exact logical
+        # sizes for NIXL and SimpleCPUOffload.
         buf_size = raw_size
-    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+        if current_platform.is_rocm():
+            page_size = 4096
+            buf_size = ((raw_size + page_size - 1) // page_size) * page_size
+        buffers[pool_id] = torch.zeros(buf_size, dtype=torch.int8, device=device)
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
@@ -440,7 +539,7 @@ def allocate_kv_cache(
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.kv_cache_specs[layer_name]
 
-        num_blocks = kv_cache_config.num_blocks
+        num_blocks = kv_cache_config.num_blocks_for_group(group_id)
         kernel_block_size = None
         if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[group_id]
@@ -448,7 +547,7 @@ def allocate_kv_cache(
             kernel_block_size = spec.storage_block_size
 
         views = create_kv_cache_views(
-            buf,
+            buffers[tensor.pool_id],
             spec,
             num_blocks,
             layout,
@@ -669,14 +768,44 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
 
 
 def copy_kv_cache_blocks_inplace(
-    kv_caches: Iterable[torch.Tensor],
-    num_blocks: int,
+    kv_caches: Iterable[torch.Tensor] | KVCacheConfig,
+    num_blocks: int | Mapping[str, Attention],
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
 ) -> None:
     if not kv_cache_block_copies:
         return
 
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    if isinstance(kv_caches, KVCacheConfig):
+        kv_cache_config = kv_caches
+        if not isinstance(num_blocks, Mapping):
+            raise TypeError("forward context is required with KVCacheConfig")
+        forward_context = num_blocks
+        copies_by_pool: defaultdict[int, list[KVCacheBlockCopy]] = defaultdict(list)
+        for copy in kv_cache_block_copies:
+            pool_id = kv_cache_config.pool_id_for_group(copy.group_id)
+            copies_by_pool[pool_id].append(copy)
+
+        assert kv_cache_config.kv_cache_pools is not None
+        for pool_id, copies in copies_by_pool.items():
+            pool = kv_cache_config.kv_cache_pools[pool_id]
+            pool_caches: list[torch.Tensor] = []
+            for group_id in pool.group_ids:
+                group = kv_cache_config.kv_cache_groups[group_id]
+                for layer_name in group.layer_names:
+                    entry = forward_context[layer_name].kv_cache
+                    if isinstance(entry, (list, tuple)):
+                        pool_caches.extend(entry)
+                    else:
+                        pool_caches.append(entry)
+            copy_kv_cache_blocks_inplace(pool_caches, pool.num_blocks, copies)
+        return
+
+    if not isinstance(num_blocks, int):
+        raise TypeError("num_blocks must be an integer with a cache iterable")
+    indices_np = np.asarray(
+        [(copy.src_block_id, copy.dst_block_id) for copy in kv_cache_block_copies],
+        dtype=np.int64,
+    )
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
@@ -715,6 +844,34 @@ def copy_kv_cache_blocks_inplace(
             # scheduler blocks; unflatten of dim 0 is always a view.
             blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
         blocks[dst] = blocks[src]
+
+
+def zero_mamba_block_ids(
+    kv_cache_config: KVCacheConfig,
+    forward_context: Mapping[str, Attention],
+    blocks_by_group: Sequence[tuple[int, list[int]]],
+    device: torch.device,
+) -> None:
+    """Zero recurrent states without applying local IDs to another pool."""
+    for group_id, block_ids in blocks_by_group:
+        if not block_ids:
+            continue
+        group = kv_cache_config.kv_cache_groups[group_id]
+        if not isinstance(group.kv_cache_spec, MambaSpec):
+            continue
+        indices = async_tensor_h2d(
+            sorted(set(block_ids)), device=device, dtype=torch.int64
+        )
+        seen_ptrs: set[int] = set()
+        for layer_name in group.layer_names:
+            entry = forward_context[layer_name].kv_cache
+            states = entry if isinstance(entry, (list, tuple)) else (entry,)
+            for state in states:
+                ptr = state.data_ptr()
+                if ptr in seen_ptrs:
+                    continue
+                seen_ptrs.add(ptr)
+                state.index_fill_(0, indices, 0)
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:

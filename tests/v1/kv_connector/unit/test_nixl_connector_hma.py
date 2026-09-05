@@ -1133,6 +1133,11 @@ def _make_fake_kv_cache_manager():
         _FakeSingleTypeManager(True, 16, [10, 11, 12, 13, 14, 15]),  # attention
         _FakeSingleTypeManager(False, 16, [20, 21, 22, 23, 24, 25]),  # mamba
     )
+    manager.kv_cache_config = MagicMock()
+    manager.kv_cache_config.kv_cache_groups = (
+        MagicMock(enable_kv_transfer=True),
+        MagicMock(enable_kv_transfer=False),
+    )
     return manager
 
 
@@ -1143,7 +1148,40 @@ def test_zeroing_block_ids_cover_only_loaded_attention_blocks():
     manager = _make_fake_kv_cache_manager()
 
     # Tokens [0, 16) are locally cached; the load covers tokens [16, 56).
-    assert manager.get_zeroing_block_ids_in_range("req-1", 16, 56) == [11, 12, 13]
+    assert manager.get_zeroing_block_ids_in_range("req-1", 16, 56) == [
+        (0, 11),
+        (0, 12),
+        (0, 13),
+    ]
+
+
+@pytest.mark.cpu_test
+def test_zeroing_skip_excludes_nontransfer_attention_groups():
+    """Async loads only suppress zeroing for groups the connector overwrites."""
+    manager = _make_fake_kv_cache_manager()
+    manager.coordinator.single_type_managers = (
+        _FakeSingleTypeManager(True, 16, [10, 11, 12, 13]),
+        _FakeSingleTypeManager(True, 16, [20, 21, 22, 23]),
+    )
+
+    assert manager.get_zeroing_block_ids_in_range("req-1", 16, 48) == [
+        (0, 11),
+        (0, 12),
+    ]
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.needs_kv_cache_zeroing = True
+    scheduler.kv_cache_manager = manager
+    scheduler._skip_zero_block_ids = {(0, 11), (0, 12)}
+    manager.coordinator.single_type_managers[0].new_block_ids = [10, 11, 12]
+    manager.coordinator.single_type_managers[1].new_block_ids = [20, 21, 22]
+
+    assert scheduler._get_new_block_ids_to_zero() == [
+        (0, [10]),
+        (1, [20, 21, 22]),
+    ]
 
 
 @pytest.mark.cpu_test
@@ -1153,14 +1191,14 @@ def test_scheduler_filters_connector_loaded_blocks_from_zeroing():
 
     class FakeKVCacheManager:
         def take_new_block_ids(self):
-            return [9, 10, 11, 12]
+            return [(0, [9, 10, 11, 12])]
 
     scheduler = object.__new__(Scheduler)
     scheduler.needs_kv_cache_zeroing = True
     scheduler.kv_cache_manager = FakeKVCacheManager()
-    scheduler._skip_zero_block_ids = {10, 12}
+    scheduler._skip_zero_block_ids = {(0, 10), (0, 12)}
 
-    assert scheduler._get_new_block_ids_to_zero() == [9, 11]
+    assert scheduler._get_new_block_ids_to_zero() == [(0, [9, 11])]
     assert not scheduler._skip_zero_block_ids
 
 
@@ -1189,7 +1227,7 @@ def test_failed_load_rezeroes_unwritten_skipped_blocks():
     # Attention blocks covering tokens >= 48 are re-recorded for zeroing
     # and flow into the next step's zero list; Mamba blocks are not.
     scheduler._skip_zero_block_ids = set()
-    assert scheduler._get_new_block_ids_to_zero() == [13, 14, 15]
+    assert scheduler._get_new_block_ids_to_zero() == [(0, [13, 14, 15])]
 
 
 # ── Mamba N-1 prefill tests ──────────────────────────────────────────────
@@ -1387,7 +1425,7 @@ def test_compute_physical_blocks_per_logical(ssm_sizes, block_len, expected_rati
         # Qwen/Qwen3.5-0.8B (GDN, symmetric: num_v=num_k=16)
         # key_dim=2048, value_dim=2048, conv_dim=6144
         pytest.param(
-            "gdn_attention",
+            "qwen_gdn_attention",
             1,
             6144,
             3,
@@ -1396,7 +1434,7 @@ def test_compute_physical_blocks_per_logical(ssm_sizes, block_len, expected_rati
             id="qwen35_08b_tp1",
         ),
         pytest.param(
-            "gdn_attention",
+            "qwen_gdn_attention",
             4,
             1536,
             3,
@@ -1404,10 +1442,19 @@ def test_compute_physical_blocks_per_logical(ssm_sizes, block_len, expected_rati
             (512, 512, 512),
             id="qwen35_08b_tp4",
         ),
+        pytest.param(
+            "gdn_attention",
+            1,
+            6144,
+            3,
+            (16, 128, 128),
+            (2048, 2048, 2048),
+            id="generic_gdn_tp1",
+        ),
         # Qwen/Qwen3.5-4B (GDN, asymmetric: num_v=32, num_k=16, K:V=1:2)
         # key_dim=2048, value_dim=4096, conv_dim=8192
         pytest.param(
-            "gdn_attention",
+            "qwen_gdn_attention",
             1,
             8192,
             3,
@@ -1418,7 +1465,7 @@ def test_compute_physical_blocks_per_logical(ssm_sizes, block_len, expected_rati
         # Qwen/Qwen3.5-27B (GDN, asymmetric: num_v=48, num_k=16, K:V=1:3)
         # key_dim=2048, value_dim=6144, conv_dim=10240
         pytest.param(
-            "gdn_attention",
+            "qwen_gdn_attention",
             1,
             10240,
             3,
@@ -1427,7 +1474,7 @@ def test_compute_physical_blocks_per_logical(ssm_sizes, block_len, expected_rati
             id="qwen35_27b_tp1",
         ),
         pytest.param(
-            "gdn_attention",
+            "qwen_gdn_attention",
             8,
             1280,
             3,
@@ -1492,6 +1539,7 @@ def test_derive_mamba_conv_split(
         "mamba1": MambaAttentionBackendEnum.MAMBA1,
         "mamba2": MambaAttentionBackendEnum.MAMBA2,
         "gdn_attention": MambaAttentionBackendEnum.GDN_ATTN,
+        "qwen_gdn_attention": MambaAttentionBackendEnum.QWEN_GDN_ATTN,
     }
     mamba_type_enum = _TYPE_MAP[mamba_type]
 

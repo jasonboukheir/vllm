@@ -2614,6 +2614,10 @@ class VllmConfig:
         if self.cache_config.mamba_cache_mode == "all":
             unsupported.append("mamba cache mode 'all'")
 
+        cache_dtype = self.cache_config.cache_dtype
+        if isinstance(cache_dtype, str) and cache_dtype.startswith("kvarn_"):
+            unsupported.append("KVarN KV cache (requires Model Runner V1)")
+
         return unsupported
 
     def _get_v1_model_runner_unsupported_features(self) -> list[str]:

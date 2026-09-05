@@ -229,9 +229,11 @@ def test_v1_block_table_move_row_clears_vacated_row():
         device=torch.device("cuda"),
         kernel_block_size=16,
         cp_kv_cache_interleave_size=1,
+        track_row_versions=True,
     )
     block_table.add_row([7, 8, 9], row_idx=0)
     block_table.add_row([4, 5], row_idx=1)
+    assert block_table.get_row_versions(2).tolist() == [1, 1]
 
     block_table.move_row(1, 0)
 
@@ -240,6 +242,10 @@ def test_v1_block_table_move_row_clears_vacated_row():
     # The vacated source row routes to the reserved null block.
     assert block_table.num_blocks_per_row[1] == 0
     assert (block_table.block_table.np[1] == 0).all()
+    assert block_table.get_row_versions(2).tolist() == [2, 2]
+
+    block_table.add_row([], row_idx=1)
+    assert block_table.get_row_versions(2).tolist() == [2, 3]
 
 
 def test_get_dummy_block_tables_returns_zeroed_rows():

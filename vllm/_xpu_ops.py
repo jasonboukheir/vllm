@@ -25,6 +25,169 @@ else:
     except ImportError:
         from torch.library import impl_abstract as register_fake
 
+
+# The Xe2 KVarN operators are registered by vllm-xpu-kernels. They mutate
+# caller-owned outputs and intentionally return nothing, so their fake kernels
+# only need to preserve that schema contract for Dynamo/FakeTensor tracing.
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode"):
+
+    @register_fake("_vllm_fa2_C::kvarn_decode")
+    def _kvarn_decode_fake(
+        query: torch.Tensor,
+        packed_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        output: torch.Tensor,
+        max_seq_len: int,
+        softmax_scale: float,
+        unrotate_output: bool = False,
+        write_bf16_output: bool = False,
+        num_kv_splits: int = 0,
+        kernel_variant: int = 0,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch"):
+
+    @register_fake("_vllm_fa2_C::kvarn_decode_with_scratch")
+    def _kvarn_decode_with_scratch_fake(
+        query: torch.Tensor,
+        packed_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        temp_output: torch.Tensor,
+        exp_sums: torch.Tensor,
+        max_logits: torch.Tensor,
+        output: torch.Tensor,
+        max_seq_len: int,
+        softmax_scale: float,
+        unrotate_output: bool = False,
+        write_bf16_output: bool = False,
+        num_kv_splits: int = 0,
+        kernel_variant: int = 0,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_materialize_packed_kv"):
+
+    @register_fake("_vllm_fa2_C::kvarn_materialize_packed_kv")
+    def _kvarn_materialize_packed_kv_fake(
+        packed_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        max_seq_len: int,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_dequant"):
+
+    @register_fake("_vllm_fa2_C::kvarn_dequant")
+    def _kvarn_dequant_fake(
+        packed_cache: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_scatter"):
+
+    @register_fake("_vllm_fa2_C::kvarn_hadamard_scatter")
+    def _kvarn_hadamard_scatter_fake(
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        group: int,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_qkv_scatter"):
+
+    @register_fake("_vllm_fa2_C::kvarn_hadamard_qkv_scatter")
+    def _kvarn_hadamard_qkv_scatter_fake(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        query_output: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        group: int,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_qkv_scatter_current_stream"):
+
+    @register_fake("_vllm_fa2_C::kvarn_hadamard_qkv_scatter_current_stream")
+    def _kvarn_hadamard_qkv_scatter_current_stream_fake(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        query_output: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        group: int,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_pack_balanced_kv"):
+
+    @register_fake("_vllm_fa2_C::kvarn_pack_balanced_kv")
+    def _kvarn_pack_balanced_kv_fake(
+        key_balanced: torch.Tensor,
+        key_sinkhorn_col: torch.Tensor,
+        key_sinkhorn_row: torch.Tensor,
+        value_balanced: torch.Tensor,
+        value_sinkhorn_col: torch.Tensor,
+        value_sinkhorn_row: torch.Tensor,
+        block_ids: torch.Tensor,
+        packed_cache: torch.Tensor,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard"):
+
+    @register_fake("_vllm_fa2_C::kvarn_hadamard")
+    def _kvarn_hadamard_fake(
+        input: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        return
+
+
 if hasattr(torch.ops._xpu_C, "fp8_gemm"):
 
     @register_fake("_xpu_C::fp8_gemm")
@@ -178,7 +341,9 @@ def _gdn_attention_core_xpu_impl(
     num_accepted_tokens = attn_metadata.num_accepted_tokens
 
     num_prefills = attn_metadata.num_prefills
+    num_prefill_tokens = attn_metadata.num_prefill_tokens
     num_decodes = attn_metadata.num_decodes
+    num_decode_tokens = attn_metadata.num_decode_tokens
     num_spec_decodes = attn_metadata.num_spec_decodes
 
     has_initial_state = attn_metadata.has_initial_state
@@ -205,6 +370,38 @@ def _gdn_attention_core_xpu_impl(
 
     conv_weights = self.conv1d.weight.view(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+    )
+
+    # vLLM's shared GDN attention backend pads everything handed to a captured
+    # CUDAGraph out to the captured batch size, while num_actual_tokens stays at
+    # the real (unpadded) count (see vllm/v1/attention/backends/gdn_attn.py).
+    # The SYCL kernel already narrows the padded data tensors (core_attn_out / z
+    # / projected_states_{qkvz,ba}) internally, so leave those alone. The index /
+    # metadata tensors are different: the kernel still enforces exact sizes on
+    # them, so strip the cudagraph padding here in the adapter. The active
+    # lengths differ per tensor (token counts vs. request counts) and must stay
+    # distinct. Slicing dim 0 of a contiguous tensor yields a contiguous view
+    # sharing storage, so the padded tail is left untouched.
+    num_non_spec = num_prefills + num_decodes
+    if non_spec_query_start_loc is not None:
+        non_spec_query_start_loc = non_spec_query_start_loc[: num_non_spec + 1]
+    if non_spec_state_indices_tensor is not None:
+        non_spec_state_indices_tensor = non_spec_state_indices_tensor[:num_non_spec]
+    if spec_query_start_loc is not None:
+        spec_query_start_loc = spec_query_start_loc[: num_spec_decodes + 1]
+    if spec_state_indices_tensor is not None:
+        spec_state_indices_tensor = spec_state_indices_tensor[:num_spec_decodes]
+    if num_accepted_tokens is not None:
+        num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
+
+    split_mixed_non_spec = (
+        num_prefills > 0
+        and num_decodes > 0
+        and num_decode_tokens == num_decodes
+        and num_decode_tokens + num_prefill_tokens == num_actual_tokens
+        and num_spec_decodes == 0
+        and non_spec_token_indx is None
+        and spec_sequence_masks is None
     )
 
     torch.ops._xpu_C.gdn_attention(
@@ -237,6 +434,7 @@ def _gdn_attention_core_xpu_impl(
         num_actual_tokens=num_actual_tokens,  # type: ignore[attr-defined]
         tp_size=self.tp_size,
         reorder_input=not self.gqa_interleaved_layout,
+        split_mixed_non_spec=split_mixed_non_spec,
     )
 
 

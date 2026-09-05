@@ -1381,7 +1381,10 @@ def test_hybrid_attention_mamba_tensor_shapes():
             assert torch.equal(actual_ssm, expected_ssm)
 
 
-def test_input_batch_reinitialized_after_late_interleave_adjustment(monkeypatch):
+@pytest.mark.parametrize("track_row_versions", [False, True])
+def test_input_batch_reinitialized_after_late_interleave_adjustment(
+    monkeypatch, track_row_versions
+):
     runner = object.__new__(GPUModelRunner)
     runner.vllm_config = SimpleNamespace(reasoning_config=None)
     runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=16)
@@ -1394,6 +1397,7 @@ def test_input_batch_reinitialized_after_late_interleave_adjustment(monkeypatch)
     runner.num_spec_tokens = 0
     runner.device = torch.device("cpu")
     runner.is_pooling_model = False
+    runner._enable_kvarn_incremental_lifecycle_metadata = track_row_versions
     runner._init_block_sizes = [16]
     runner._init_kernel_block_sizes = [16]
     runner._init_max_num_blocks = [4]
@@ -1427,6 +1431,10 @@ def test_input_batch_reinitialized_after_late_interleave_adjustment(monkeypatch)
 
     assert input_batch_cls.call_count == 1
     assert input_batch_cls.call_args.kwargs["cp_kv_cache_interleave_size"] == 16
+    assert (
+        input_batch_cls.call_args.kwargs["track_block_table_row_versions"]
+        is track_row_versions
+    )
 
 
 def test_v2_runner_snapshots_late_interleave_adjustment(monkeypatch):
