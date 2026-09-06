@@ -790,7 +790,6 @@ class GPUModelRunner(
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 reasoning_config=self.vllm_config.reasoning_config,
                 use_replayssm=self.cache_config.use_replayssm,
-                track_block_table_row_versions=False,
             )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -2428,8 +2427,6 @@ class GPUModelRunner(
         assert slot_mappings is not None
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
-        kvarn_request_ids = None
-        block_table_row_versions_gid_0 = None
 
         if self.routed_experts_initialized:
             # Copy this step's attention slot_mapping into our private
@@ -2549,8 +2546,6 @@ class GPUModelRunner(
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
             block_table_cpu=_get_block_table_cpu(0),
-            request_ids=kvarn_request_ids,
-            block_table_row_versions=block_table_row_versions_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
@@ -7448,7 +7443,6 @@ class GPUModelRunner(
                     reasoning_config=self.vllm_config.reasoning_config,
                     use_replayssm=self.cache_config.use_replayssm,
                     slot_mapping_modes=slot_mapping_modes,
-                    track_block_table_row_versions=False,
                 )
 
         assert self._init_block_sizes == block_sizes, (

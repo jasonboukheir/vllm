@@ -41,6 +41,7 @@ _RETIRED_KVARN_ENV_VARS = (
     "KVARN_METADATA_LIFECYCLE",
     "KVARN_NATIVE_XPU_LAYER",
     "KVARN_FAST_FLUSH",
+    "KVARN_DUMP_TILES",
     "KVARN_FUSED_VERIFY",
     "KVARN_FUSED_VERIFY_MAXQ",
     "KVARN_FUSED_VERIFY_MIN_BLOCKS",
@@ -70,9 +71,7 @@ def _check_kvarn_beta_unsupported_config(
         return
 
     retired = [name for name in _RETIRED_KVARN_ENV_VARS if name in os.environ]
-    retired.extend(
-        name for name in os.environ if name.startswith("KVARN_NATIVE_XPU_")
-    )
+    retired.extend(name for name in os.environ if name.startswith("KVARN_NATIVE_XPU_"))
     if retired:
         raise ValueError(
             "retired KVarN experiment environment override(s): "
@@ -112,7 +111,7 @@ def _check_kvarn_beta_unsupported_config(
         if multimodal_config.get_limit_per_prompt("video") != 0:
             raise ValueError(
                 "XPU KVarN beta vision requires video inputs disabled; "
-                'use --limit-mm-per-prompt \'{"video":0}\' or --kv-cache-dtype=auto'
+                "use --limit-mm-per-prompt '{\"video\":0}' or --kv-cache-dtype=auto"
             )
 
 
