@@ -94,47 +94,10 @@ def test_configure_kvarn_onednn_determinism_safe_default(
         torch.backends.mkldnn.deterministic = previous
 
 
-@pytest.mark.parametrize(("raw_value", "expected"), [("0", False), ("1", True)])
-def test_configure_kvarn_onednn_determinism_explicit_selection(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_value: str,
-    expected: bool,
-) -> None:
-    monkeypatch.setenv("KVARN_ONEDNN_DETERMINISTIC", raw_value)
-    previous = torch.backends.mkldnn.deterministic
-    try:
-        torch.backends.mkldnn.deterministic = not expected
-        assert (
-            _configure_kvarn_onednn_determinism("kvarn_k4v4_g128_compact") is expected
-        )
-        assert torch.backends.mkldnn.deterministic is expected
-    finally:
-        torch.backends.mkldnn.deterministic = previous
-
-
-@pytest.mark.parametrize("raw_value", ["", "false", "2", " 0"])
-def test_configure_kvarn_onednn_determinism_rejects_invalid_value(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_value: str,
-) -> None:
-    monkeypatch.setenv("KVARN_ONEDNN_DETERMINISTIC", raw_value)
-    previous = torch.backends.mkldnn.deterministic
-    try:
-        torch.backends.mkldnn.deterministic = True
-        with pytest.raises(
-            ValueError,
-            match="KVARN_ONEDNN_DETERMINISTIC must be exactly '0' or '1'",
-        ):
-            _configure_kvarn_onednn_determinism("kvarn_k4v4_g128_compact")
-        assert torch.backends.mkldnn.deterministic is True
-    finally:
-        torch.backends.mkldnn.deterministic = previous
-
-
 def test_configure_kvarn_onednn_determinism_logs_factory_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("KVARN_ONEDNN_DETERMINISTIC", "0")
+    monkeypatch.delenv("KVARN_ONEDNN_DETERMINISTIC", raising=False)
     calls: list[tuple[str, str, str]] = []
     monkeypatch.setattr(
         "vllm.v1.worker.xpu_worker.logger.info_once",
@@ -152,8 +115,8 @@ def test_configure_kvarn_onednn_determinism_logs_factory_selection(
                 "[KVARN_FACTORY] selected_onednn_deterministic=%s; "
                 "selector_source=%s; immutable for engine lifetime"
             ),
-            "false",
-            "KVARN_ONEDNN_DETERMINISTIC",
+            "true",
+            "release-default",
         )
     ]
 

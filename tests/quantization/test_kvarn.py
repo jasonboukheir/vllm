@@ -25,7 +25,6 @@ from vllm.v1.attention.backends.kvarn_attn import (
     _can_elide_fa_cu_seqlens,
     _cast_kvarn_activations,
     _coordinate_kvarn_decode_window_blocks,
-    _defer_kvarn_prefill_history_blocks,
     _is_pure_kvarn_cached_prefill_step,
     _is_pure_kvarn_decode_step,
     _is_pure_kvarn_prefill_step,
@@ -35,15 +34,9 @@ from vllm.v1.attention.backends.kvarn_attn import (
     _kvarn_decode_fp16_low_water_blocks,
     _kvarn_decode_fp16_window_blocks,
     _kvarn_decode_resident_suffix,
-    _kvarn_flush_index_materialization_requested,
-    _kvarn_flush_writer_requested,
-    _kvarn_forward_pool_ensure_requested,
-    _kvarn_metadata_lifecycle_requested,
     _kvarn_native_balanced_writer_supported,
     _kvarn_prefill_fp16_window_blocks,
-    _kvarn_qlen1_inline_plan_requested,
     _kvarn_reclaimable_block_ids,
-    _kvarn_sinkhorn_source_requested,
     _kvarn_walk_back_flush_blocks,
     _KVarNMetadataStageRing,
     _KVarNQlen1MetadataKind,
@@ -51,7 +44,6 @@ from vllm.v1.attention.backends.kvarn_attn import (
     _protect_kvarn_decode_window_blocks,
     _protect_kvarn_prefill_window_blocks,
     _reconcile_kvarn_sink_ownership,
-    _resolve_kvarn_cache_layout,
     _rotate_kvarn_kv_into_scratch,
     _use_kvarn_fused_verify,
 )
@@ -62,6 +54,19 @@ from vllm.v1.attention.ops.kvarn_store import (
     _pack_dpas_v4,
     kvarn_store_tile_k_batch_from_sinkhorn,
     kvarn_store_tile_v_batch_from_sinkhorn,
+)
+from vllm.v1.attention.ops.triton_kvarn_decode import (
+    KVARN_CACHE_LAYOUT_XE2_DPAS,
+    KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
+    KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
+    KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1,
+    KVARN_PREFILL_STORE_HADAMARD_SCATTER,
+    kvarn_cache_layout_requested,
+    kvarn_frontend_variant_requested,
+    kvarn_native_kernel_variant_requested,
+    kvarn_native_split_count,
+    kvarn_native_split_policy_requested,
+    kvarn_prefill_store_variant_requested,
 )
 from vllm.v1.attention.selector import AttentionSelectorConfig
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
@@ -76,10 +81,37 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
     is_quantized_kv_cache,
 )
-from vllm.v1.worker.gpu_model_runner import (
-    _kvarn_incremental_lifecycle_metadata_enabled,
-    _maybe_materialize_kvarn_lifecycle_metadata,
-)
+
+
+def test_kvarn_xpu_decode_uses_only_qualified_native_configuration():
+    assert kvarn_cache_layout_requested(KVARN_CACHE_LAYOUT_XE2_DPAS) == "xe2_dpas"
+    assert (
+        kvarn_frontend_variant_requested(
+            KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM
+        )
+        == "qkv_scatter_inline_current_stream"
+    )
+    assert (
+        kvarn_prefill_store_variant_requested(KVARN_PREFILL_STORE_HADAMARD_SCATTER)
+        == "hadamard_scatter"
+    )
+    assert kvarn_native_kernel_variant_requested("q6_prefetch_record_cursor") == (
+        "q6_prefetch_record_cursor",
+        KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
+    )
+    assert kvarn_native_split_policy_requested(
+        KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1
+    ) == ("b70_q6_id18_v1", 32)
+    assert [
+        kvarn_native_split_count(
+            65_023,
+            32,
+            batch_size=batch_size,
+            split_policy=KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1,
+            kernel_variant=KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
+        )
+        for batch_size in (1, 2, 3, 4, 8, 12)
+    ] == [32, 16, 8, 24, 4, 2]
 
 
 def _shared_q_output_maps():
@@ -514,7 +546,6 @@ def test_native_cached_prefill_materializer_eligibility_fails_closed(
         "unsupported_cache_abi",
     )
     impl._kvarn_cache_layout = "xe2_dpas"
-    monkeypatch.setattr(kvarn_attn, "kvarn_native_layer_selected", lambda *_: True)
     monkeypatch.setattr(
         kvarn_attn, "kvarn_native_layout_abi_supported", lambda *_: False
     )
@@ -742,7 +773,6 @@ def test_native_prefill_scatter_eligibility_fails_closed(
     monkeypatch.setattr(
         kvarn_attn, "kvarn_native_prefill_store_supported", lambda **_: True
     )
-    monkeypatch.setattr(kvarn_attn, "kvarn_native_layer_selected", lambda *_: True)
 
     assert impl._native_prefill_scatter_eligible(layer, key, value, slots, metadata)
     impl._kvarn_prefill_store_variant = "reference"
@@ -854,7 +884,6 @@ def test_fused_qkv_frontend_eligibility_fails_closed(
     )
     monkeypatch.setattr(kvarn_attn, "kvarn_native_decode_abi_supported", lambda _: True)
     monkeypatch.setattr(kvarn_attn, "kvarn_native_layout_abi_supported", lambda _: True)
-    monkeypatch.setattr(kvarn_attn, "kvarn_native_layer_selected", lambda *_: True)
 
     assert impl._native_qkv_scatter_eligible(layer, query, key, value, slots, metadata)
     assert not impl._native_qkv_scatter_eligible(
@@ -1028,190 +1057,6 @@ def _configure_native_qkv_receipt_lifecycle(
     return pool_ensure, launch, decode
 
 
-def test_native_qkv_update_mints_pool_proof_consumed_by_forward(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    impl = _fused_frontend_impl()
-    impl._kvarn_forward_pool_ensure = "fused_qkv_proof"
-    metadata = _pure_decode_metadata()
-    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
-    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
-    value = torch.empty_like(key)
-    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
-    slots = torch.tensor([0, 129], dtype=torch.int64)
-    events: list[str] = []
-    pool_ensure, launch, decode = _configure_native_qkv_receipt_lifecycle(
-        monkeypatch, impl, metadata, events
-    )
-
-    impl.do_qkv_cache_update(SimpleNamespace(), query, key, value, cache, slots)
-    assert impl._pending_fused_qkv_signature is not None
-    output = impl.forward(
-        SimpleNamespace(),
-        query,
-        key,
-        value,
-        cache,
-        metadata,
-        output=torch.empty(2, 24, 256, dtype=torch.bfloat16),
-    )
-
-    assert events == ["ensure", "launch", "decode"]
-    pool_ensure.assert_called_once_with(query.device, num_blocks_hint=cache.shape[0])
-    launch.assert_called_once_with(query, key, value, slots)
-    assert decode.call_args.kwargs["query_rotation_precomputed"] is True
-    assert impl._pending_fused_qkv_signature is None
-    assert output.eq(7).all()
-
-
-def test_inline_qkv_path_produces_and_consumes_pool_proof(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import vllm.model_executor.layers.attention.attention as attention_module
-    import vllm.model_executor.layers.attention.kv_transfer_utils as kv_transfer_utils
-
-    impl = _fused_frontend_impl()
-    impl.use_inline_qkv_cache_update = True
-    impl._kvarn_forward_pool_ensure = "fused_qkv_proof"
-    metadata = _pure_decode_metadata()
-    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
-    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
-    value = torch.empty_like(key)
-    output = torch.empty(2, 24, 256, dtype=torch.bfloat16)
-    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
-    slots = torch.tensor([0, 129], dtype=torch.int64)
-    events: list[str] = []
-    pool_ensure, launch, decode = _configure_native_qkv_receipt_lifecycle(
-        monkeypatch, impl, metadata, events
-    )
-    layer = SimpleNamespace(
-        impl=impl,
-        _inline_qkv_attention_active_logged=False,
-    )
-    context = Mock(return_value=(metadata, layer, cache, slots))
-    monkeypatch.setattr(attention_module, "get_attention_context", context)
-    monkeypatch.setattr(kv_transfer_utils, "has_kv_transfer_group", lambda: False)
-
-    with (
-        patch(
-            "vllm.model_executor.layers.attention.attention.logger.info"
-        ) as inline_marker,
-        patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as pool_marker,
-    ):
-        for _ in range(2):
-            attention_module.unified_qkv_attention_with_output(
-                query,
-                key,
-                value,
-                output,
-                "model.layers.0.self_attn",
-            )
-
-    assert context.call_count == 2
-    context.assert_called_with("model.layers.0.self_attn")
-    assert events == ["ensure", "launch", "decode"] * 2
-    assert pool_ensure.call_count == 2
-    pool_ensure.assert_called_with(query.device, num_blocks_hint=cache.shape[0])
-    assert launch.call_count == 2
-    launch.assert_called_with(query, key, value, slots)
-    assert decode.call_args.kwargs["query_rotation_precomputed"] is True
-    assert impl._pending_fused_qkv_signature is None
-    assert output.eq(7).all()
-    inline_marker.assert_called_once_with(
-        "[KVARN_FRONTEND_INLINE] active=qkv_scatter_inline; "
-        "wrapper=unified_qkv_attention_with_output; layer=%s",
-        "model.layers.0.self_attn",
-    )
-    pool_marker.assert_any_call(
-        "[KVARN_FORWARD_POOL_ENSURE] active=fused_qkv_proof; "
-        "action=elide_ensure_pool; layer=%s",
-        "model.layers.0.self_attn",
-    )
-    assert (
-        sum(
-            entry.args
-            and entry.args[0].startswith("[KVARN_FORWARD_POOL_ENSURE] active=")
-            for entry in pool_marker.call_args_list
-        )
-        == 1
-    )
-
-
-def test_trusted_qlen1_inline_binds_once_and_skips_repeated_proofs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
-
-    impl = _fused_frontend_impl()
-    impl._kvarn_qlen1_inline_plan = "trusted_native"
-    impl.use_trusted_qlen1_inline_plan = True
-    metadata = _pure_decode_metadata()
-    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
-    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
-    value = torch.empty_like(key)
-    output = torch.empty_like(query)
-    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
-    slots = torch.tensor([0, 129], dtype=torch.int64)
-    native_decode = SimpleNamespace(max_batch=12)
-    pool_ensure = Mock()
-    eligibility = Mock(return_value=True)
-    plan_builder = Mock(return_value=native_decode)
-    pool_receipt = object()
-    launch = Mock()
-    decode = Mock(
-        side_effect=lambda _q, _cache, _metadata, output=None, **_: output.fill_(7)
-    )
-    signature = Mock(side_effect=AssertionError("signature path was used"))
-
-    monkeypatch.setattr(impl, "_ensure_pool", pool_ensure)
-    monkeypatch.setattr(impl, "_native_qkv_scatter_eligible", eligibility)
-    monkeypatch.setattr(
-        kvarn_attn, "build_kvarn_trusted_native_decode_plan", plan_builder
-    )
-    monkeypatch.setattr(
-        impl,
-        "_capture_trusted_inline_pool_receipt",
-        Mock(return_value=pool_receipt),
-    )
-    monkeypatch.setattr(
-        impl,
-        "_trusted_inline_pool_receipt_is_current",
-        lambda receipt: receipt is pool_receipt,
-    )
-    monkeypatch.setattr(impl, "_launch_native_qkv_scatter", launch)
-    monkeypatch.setattr(impl, "_decode_path", decode)
-    monkeypatch.setattr(impl, "_fused_qkv_signature", signature)
-
-    with patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as marker:
-        for _ in range(2):
-            assert impl.forward_trusted_qlen1_inline(
-                SimpleNamespace(),
-                query,
-                key,
-                value,
-                cache,
-                slots,
-                metadata,
-                output,
-            )
-
-    pool_ensure.assert_called_once_with(query.device, num_blocks_hint=cache.shape[0])
-    assert eligibility.call_count == 1
-    assert plan_builder.call_count == 1
-    assert launch.call_count == 2
-    assert decode.call_count == 2
-    assert decode.call_args.kwargs["query_rotation_precomputed"] is True
-    assert decode.call_args.kwargs["trusted_native_plan"] is native_decode
-    signature.assert_not_called()
-    assert output.eq(7).all()
-    marker.assert_called_once_with(
-        "[KVARN_TRUSTED_QLEN1_INLINE] active=trusted_native; "
-        "layer=%s; cached=pool_ready+cache_abi+qkv_eligibility+"
-        "decode_eligibility; fallback=reference",
-        "model.layers.0.self_attn",
-    )
-
-
 @pytest.mark.parametrize("engine_batch_cap", [1, 4])
 def test_trusted_native_decode_plan_caches_static_dispatch_facts(
     monkeypatch: pytest.MonkeyPatch,
@@ -1238,7 +1083,6 @@ def test_trusted_native_decode_plan_caches_static_dispatch_facts(
     monkeypatch.setattr(
         decode_module, "kvarn_native_problem_supported", lambda **_: True
     )
-    monkeypatch.setattr(decode_module, "kvarn_native_layer_selected", lambda *_: True)
     monkeypatch.setattr(
         decode_module, "kvarn_native_decode_abi_supported", lambda _: True
     )
@@ -1338,7 +1182,6 @@ def test_bound_native_decode_v2_consumes_cached_bindings_without_reproof(
         "_kvarn_dpas_layout_for_problem",
         "kvarn_native_feature_enabled",
         "kvarn_native_problem_supported",
-        "kvarn_native_layer_selected",
         "kvarn_native_decode_abi_supported",
         "kvarn_native_output_hadamard_supported",
         "kvarn_native_bf16_output_supported",
@@ -1371,53 +1214,6 @@ def test_bound_native_decode_v2_consumes_cached_bindings_without_reproof(
     assert native_launch.call_args.args[4] is block_to_slot
     assert native_launch.call_args.args[5] is tail_key
     assert native_launch.call_args.args[6] is tail_value
-
-
-@pytest.mark.parametrize("failure", ["multi_query", "cache_rebound", "generation"])
-def test_trusted_qlen1_inline_plan_miss_fails_before_store(failure: str) -> None:
-    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
-
-    impl = _fused_frontend_impl()
-    impl._kvarn_qlen1_inline_plan = "trusted_native"
-    impl.use_trusted_qlen1_inline_plan = True
-    metadata = _pure_decode_metadata()
-    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
-    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
-    value = torch.empty_like(key)
-    output = torch.empty_like(query)
-    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
-    slots = torch.tensor([0, 129], dtype=torch.int64)
-    native_decode = SimpleNamespace(max_batch=12)
-    plan = kvarn_attn._KVarNTrustedQlen1InlinePlan(
-        process_generation=KVarNAttentionImpl._process_generation,
-        cache_owner=cache,
-        cache_view=cache,
-        device=query.device,
-        activation_dtype=query.dtype,
-        native_decode=native_decode,
-    )
-    impl._trusted_qlen1_inline_bound = plan
-    launch = Mock()
-    impl._launch_native_qkv_scatter = launch
-
-    if failure == "multi_query":
-        metadata.max_query_len = 2
-    elif failure == "cache_rebound":
-        cache = torch.empty_like(cache)
-    else:
-        impl._trusted_qlen1_inline_bound = kvarn_attn._KVarNTrustedQlen1InlinePlan(
-            process_generation=plan.process_generation - 1,
-            cache_owner=plan.cache_owner,
-            cache_view=plan.cache_view,
-            device=plan.device,
-            activation_dtype=plan.activation_dtype,
-            native_decode=plan.native_decode,
-        )
-
-    assert not impl.forward_trusted_qlen1_inline(
-        SimpleNamespace(), query, key, value, cache, slots, metadata, output
-    )
-    launch.assert_not_called()
 
 
 def test_bound_qlen1_inline_v2_binds_once_with_exact_fp16_output(
@@ -1776,33 +1572,6 @@ def test_captured_native_qkv_fallback_does_not_publish_pool_proof(
     assert native_store.call_args.kwargs["is_capturing"] is True
     fallback.assert_called_once_with(layer, key, value, cache, slots)
     assert impl._pending_fused_qkv_signature is None
-
-
-def test_fused_qkv_pool_proof_elides_second_forward_ensure_once_logged() -> None:
-    impl = _fused_frontend_impl()
-    impl._kvarn_forward_pool_ensure = "fused_qkv_proof"
-    metadata = _pure_decode_metadata()
-    query = torch.empty(2, 24, 256, dtype=torch.bfloat16)
-    key = torch.empty(2, 4, 256, dtype=torch.bfloat16)
-    value = torch.empty_like(key)
-    cache = torch.empty(2, 4, 35_072, dtype=torch.uint8)
-    impl._pending_fused_qkv_signature = impl._fused_qkv_signature(query, metadata)
-    pool_ensure, decode = _configure_fused_forward_test(impl)
-
-    with patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as marker:
-        output = impl.forward(SimpleNamespace(), query, key, value, cache, metadata)
-        impl._pending_fused_qkv_signature = impl._fused_qkv_signature(query, metadata)
-        impl.forward(SimpleNamespace(), query, key, value, cache, metadata)
-
-    pool_ensure.assert_not_called()
-    assert output.eq(7).all()
-    assert decode.call_args.kwargs["query_rotation_precomputed"] is True
-    assert impl._pending_fused_qkv_signature is None
-    marker.assert_called_once_with(
-        "[KVARN_FORWARD_POOL_ENSURE] active=fused_qkv_proof; "
-        "action=elide_ensure_pool; layer=%s",
-        "model.layers.0.self_attn",
-    )
 
 
 @pytest.mark.parametrize("receipt", ["missing", "query_mismatch"])
@@ -2487,23 +2256,18 @@ def test_fa_metadata_elision_requires_fused_eager_without_capture_history():
         pure_qlen1=True,
         has_built_cudagraph_metadata=False,
     )
-    with patch.dict(os.environ, {"KVARN_FUSED_DECODE": "0"}):
-        # Capture stages the persistent buffers, and the later ordinary build
-        # must keep refreshing them for materializer graph replay.
-        assert not _can_elide_fa_cu_seqlens(for_cudagraph_capture=True, **kwargs)
-        assert not _can_elide_fa_cu_seqlens(for_cudagraph_capture=False, **kwargs)
-    with patch.dict(os.environ, {"KVARN_FUSED_DECODE": "1"}):
-        assert _can_elide_fa_cu_seqlens(for_cudagraph_capture=False, **kwargs)
-        assert not _can_elide_fa_cu_seqlens(
-            pure_qlen1=False,
-            for_cudagraph_capture=False,
-            has_built_cudagraph_metadata=False,
-        )
-        assert not _can_elide_fa_cu_seqlens(
-            pure_qlen1=True,
-            for_cudagraph_capture=False,
-            has_built_cudagraph_metadata=True,
-        )
+    assert not _can_elide_fa_cu_seqlens(for_cudagraph_capture=True, **kwargs)
+    assert _can_elide_fa_cu_seqlens(for_cudagraph_capture=False, **kwargs)
+    assert not _can_elide_fa_cu_seqlens(
+        pure_qlen1=False,
+        for_cudagraph_capture=False,
+        has_built_cudagraph_metadata=False,
+    )
+    assert not _can_elide_fa_cu_seqlens(
+        pure_qlen1=True,
+        for_cudagraph_capture=False,
+        has_built_cudagraph_metadata=True,
+    )
 
 
 def test_cudagraph_builder_forces_persistent_fa_metadata_staging():
@@ -2517,12 +2281,11 @@ def test_cudagraph_builder_forces_persistent_fa_metadata_staging():
 
     build.assert_called_once_with(0, common, _for_cudagraph_capture=True)
     assert builder._has_built_cudagraph_metadata
-    with patch.dict(os.environ, {"KVARN_FUSED_DECODE": "1"}):
-        assert not _can_elide_fa_cu_seqlens(
-            pure_qlen1=True,
-            for_cudagraph_capture=False,
-            has_built_cudagraph_metadata=builder._has_built_cudagraph_metadata,
-        )
+    assert not _can_elide_fa_cu_seqlens(
+        pure_qlen1=True,
+        for_cudagraph_capture=False,
+        has_built_cudagraph_metadata=builder._has_built_cudagraph_metadata,
+    )
 
 
 def test_pure_qlen1_builder_skips_fa_staging_and_slot_mapping_d2h():
@@ -2685,21 +2448,6 @@ def test_dpas_store_preserves_metadata_and_fails_closed_on_wrong_shape():
         _pack_dpas_v4(torch.zeros(1, 64, 256, dtype=torch.int32))
 
 
-def test_dpas_layout_dispatch_requires_exact_cache_config(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    cfg = SimpleNamespace(head_dim=256, group=128, key_bits=4, value_bits=4)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
-    assert _resolve_kvarn_cache_layout(cfg) == "natural"
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", "xe2_dpas")
-    assert _resolve_kvarn_cache_layout(cfg) == "xe2_dpas"
-    cfg.value_bits = 2
-    with pytest.raises(RuntimeError, match="requires D256/G128/K4V4"):
-        _resolve_kvarn_cache_layout(cfg)
-
-
 def test_cache_layout_is_frozen_at_attention_initialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2747,10 +2495,8 @@ def test_cache_layout_is_frozen_at_attention_initialization(
         KVarNAttentionImpl.reset_process_state()
 
 
-@pytest.mark.parametrize("writer_override", [None, "reference"])
 def test_compact_kvarn_dtype_selects_xpu_beta_profile_without_env(
     monkeypatch: pytest.MonkeyPatch,
-    writer_override: str | None,
 ) -> None:
     import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
 
@@ -2769,8 +2515,6 @@ def test_compact_kvarn_dtype_selects_xpu_beta_profile_without_env(
         "KVARN_QLEN1_INLINE_PLAN",
     ):
         monkeypatch.delenv(name, raising=False)
-    if writer_override is not None:
-        monkeypatch.setenv("KVARN_FLUSH_WRITER", writer_override)
     monkeypatch.setattr(kvarn_attn.current_platform, "is_xpu", lambda: True)
     monkeypatch.setattr(
         kvarn_attn, "kvarn_native_layout_abi_supported", lambda _op: True
@@ -2797,729 +2541,12 @@ def test_compact_kvarn_dtype_selects_xpu_beta_profile_without_env(
         assert impl._kvarn_native_max_splits == 32
         assert impl._kvarn_native_kernel_variant_name == "q6_prefetch_record_cursor"
         assert impl._kvarn_native_kernel_variant == 18
-        assert impl._kvarn_flush_writer == (writer_override or "native_xe2")
-        assert impl._kvarn_sinkhorn_source == (
-            "materialized" if writer_override == "reference" else "fused_materialized"
-        )
+        assert impl._kvarn_flush_writer == "native_xe2"
+        assert impl._kvarn_sinkhorn_source == "fused_materialized"
         assert impl._kvarn_forward_pool_ensure == "always"
         assert impl._kvarn_qlen1_inline_plan == "bound_native_v2"
         assert impl.use_bound_qlen1_inline_plan_v2
         assert KVarNAttentionImpl._flush_index_materialization == "shared"
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_fused_qkv_frontend_is_frozen_and_reported(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter")
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with (
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
-                return_value=2,
-            ),
-            patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as marker,
-        ):
-            impl = KVarNAttentionImpl(
-                num_heads=24,
-                head_size=256,
-                scale=1.0 / 16.0,
-                num_kv_heads=4,
-                kv_cache_dtype="kvarn_k4v4_g128",
-            )
-            selected = impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
-
-        assert impl._kvarn_frontend_variant == "qkv_scatter"
-        assert selected
-        assert impl.use_fused_qkv_cache_update
-        marker.assert_any_call(
-            "[KVARN_FRONTEND] configured=%s; layer=%s; selected=%s; "
-            "native_op=%s; fallback=reference; immutable for engine lifetime",
-            "qkv_scatter",
-            "model.layers.0.self_attn",
-            True,
-            "kvarn_hadamard_qkv_scatter",
-        )
-
-        monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "reference")
-        assert impl._kvarn_frontend_variant == "qkv_scatter"
-        assert impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
-        assert impl.use_fused_qkv_cache_update
-        with pytest.raises(RuntimeError, match="layer binding is immutable"):
-            impl.configure_fused_qkv_cache_update("model.layers.1.self_attn")
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_inline_qkv_frontend_is_frozen_and_reports_single_context_route(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter_inline")
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with (
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
-                return_value=2,
-            ),
-            patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as marker,
-        ):
-            impl = KVarNAttentionImpl(
-                num_heads=24,
-                head_size=256,
-                scale=1.0 / 16.0,
-                num_kv_heads=4,
-                kv_cache_dtype="kvarn_k4v4_g128",
-            )
-            selected = impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
-
-        assert selected
-        assert impl.use_fused_qkv_cache_update
-        assert impl.use_inline_qkv_cache_update
-        marker.assert_any_call(
-            "[KVARN_FRONTEND_INLINE] configured=%s; layer=%s; "
-            "route=single_attention_context; "
-            "native_op=%s; "
-            "immutable for engine lifetime",
-            "qkv_scatter_inline",
-            "model.layers.0.self_attn",
-            "kvarn_hadamard_qkv_scatter",
-        )
-
-        monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "reference")
-        assert impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
-        assert impl._kvarn_frontend_variant == "qkv_scatter_inline"
-        assert impl.use_inline_qkv_cache_update
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_current_stream_qkv_frontend_is_explicit_and_frozen(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter_inline_current_stream")
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with (
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
-                return_value=2,
-            ),
-            patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as marker,
-        ):
-            impl = KVarNAttentionImpl(
-                num_heads=24,
-                head_size=256,
-                scale=1.0 / 16.0,
-                num_kv_heads=4,
-                kv_cache_dtype="kvarn_k4v4_g128",
-            )
-            selected = impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
-
-        assert selected
-        assert impl.use_inline_qkv_cache_update
-        assert (
-            impl._kvarn_qkv_scatter_op_name
-            == "kvarn_hadamard_qkv_scatter_current_stream"
-        )
-        marker.assert_any_call(
-            "[KVARN_FRONTEND_INLINE] configured=%s; layer=%s; "
-            "route=single_attention_context; "
-            "native_op=%s; "
-            "immutable for engine lifetime",
-            "qkv_scatter_inline_current_stream",
-            "model.layers.0.self_attn",
-            "kvarn_hadamard_qkv_scatter_current_stream",
-        )
-
-        monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter_inline")
-        assert impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
-        assert (
-            impl._kvarn_qkv_scatter_op_name
-            == "kvarn_hadamard_qkv_scatter_current_stream"
-        )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_prefill_store_is_frozen_and_reported(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_PREFILL_STORE", "hadamard_scatter")
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with (
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
-                return_value=2,
-            ),
-            patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker,
-        ):
-            impl = KVarNAttentionImpl(
-                num_heads=24,
-                head_size=256,
-                scale=1.0 / 16.0,
-                num_kv_heads=4,
-                kv_cache_dtype="kvarn_k4v4_g128",
-            )
-
-        assert impl._kvarn_prefill_store_variant == "hadamard_scatter"
-        marker.assert_any_call(
-            "[KVARN_FACTORY] selected_prefill_store=%s; "
-            "selector=KVARN_NATIVE_XPU_PREFILL_STORE; "
-            "fallback=reference; immutable for engine lifetime",
-            "hadamard_scatter",
-        )
-        monkeypatch.setenv("KVARN_NATIVE_XPU_PREFILL_STORE", "reference")
-        assert impl._kvarn_prefill_store_variant == "hadamard_scatter"
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-@pytest.mark.parametrize(
-    ("raw_value", "expected", "source"),
-    [
-        (None, "always", "reference-default"),
-        ("always", "always", "KVARN_FORWARD_POOL_ENSURE"),
-        ("epoch_latch", "epoch_latch", "KVARN_FORWARD_POOL_ENSURE"),
-        (
-            "fused_qkv_proof",
-            "fused_qkv_proof",
-            "KVARN_FORWARD_POOL_ENSURE",
-        ),
-    ],
-)
-def test_forward_pool_ensure_selector(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_value: str | None,
-    expected: str,
-    source: str,
-) -> None:
-    if raw_value is None:
-        monkeypatch.delenv("KVARN_FORWARD_POOL_ENSURE", raising=False)
-    else:
-        monkeypatch.setenv("KVARN_FORWARD_POOL_ENSURE", raw_value)
-
-    assert _kvarn_forward_pool_ensure_requested() == (expected, source)
-
-
-@pytest.mark.parametrize(
-    "raw_value", ["", "proof", "ALWAYS", "epoch", " fused_qkv_proof"]
-)
-def test_forward_pool_ensure_selector_rejects_invalid_values(
-    monkeypatch: pytest.MonkeyPatch, raw_value: str
-) -> None:
-    monkeypatch.setenv("KVARN_FORWARD_POOL_ENSURE", raw_value)
-    with pytest.raises(
-        ValueError,
-        match=(
-            "KVARN_FORWARD_POOL_ENSURE must be exactly 'always' or "
-            "'epoch_latch' or 'fused_qkv_proof'"
-        ),
-    ):
-        _kvarn_forward_pool_ensure_requested()
-
-
-def test_forward_pool_ensure_selection_is_frozen_and_logged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVARN_FORWARD_POOL_ENSURE", "fused_qkv_proof")
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker:
-            assert KVarNAttentionImpl._select_forward_pool_ensure() == (
-                "fused_qkv_proof"
-            )
-            monkeypatch.setenv("KVARN_FORWARD_POOL_ENSURE", "always")
-            assert KVarNAttentionImpl._select_forward_pool_ensure() == (
-                "fused_qkv_proof"
-            )
-
-        marker.assert_called_once_with(
-            "[KVARN_FACTORY] selected_forward_pool_ensure=%s; "
-            "selector_source=%s; epoch_guard="
-            "generation+group+capacity+mirror+shared_scratch+runtime; "
-            "fallback=full_validation; immutable for engine lifetime",
-            "fused_qkv_proof",
-            "KVARN_FORWARD_POOL_ENSURE",
-        )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_fused_qkv_pool_proof_requires_a_fused_frontend_at_initialization(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "reference")
-    monkeypatch.setenv("KVARN_FORWARD_POOL_ENSURE", "fused_qkv_proof")
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with (
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
-                return_value=2,
-            ),
-            pytest.raises(
-                RuntimeError,
-                match=(
-                    "KVARN_FORWARD_POOL_ENSURE=fused_qkv_proof requires "
-                    "KVARN_NATIVE_XPU_FRONTEND=qkv_scatter"
-                ),
-            ),
-        ):
-            KVarNAttentionImpl(
-                num_heads=24,
-                head_size=256,
-                scale=1.0 / 16.0,
-                num_kv_heads=4,
-                kv_cache_dtype="kvarn_k4v4_g128",
-            )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-@pytest.mark.parametrize(
-    ("raw_value", "expected", "source"),
-    [
-        (None, "reference", "reference-default"),
-        ("reference", "reference", "KVARN_QLEN1_INLINE_PLAN"),
-        ("trusted_native", "trusted_native", "KVARN_QLEN1_INLINE_PLAN"),
-        ("bound_native_v2", "bound_native_v2", "KVARN_QLEN1_INLINE_PLAN"),
-    ],
-)
-def test_qlen1_inline_plan_selector(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_value: str | None,
-    expected: str,
-    source: str,
-) -> None:
-    if raw_value is None:
-        monkeypatch.delenv("KVARN_QLEN1_INLINE_PLAN", raising=False)
-    else:
-        monkeypatch.setenv("KVARN_QLEN1_INLINE_PLAN", raw_value)
-
-    assert _kvarn_qlen1_inline_plan_requested() == (expected, source)
-
-
-@pytest.mark.parametrize("raw_value", ["", "trusted", "TRUSTED_NATIVE", " reference"])
-def test_qlen1_inline_plan_selector_rejects_invalid_values(
-    monkeypatch: pytest.MonkeyPatch, raw_value: str
-) -> None:
-    monkeypatch.setenv("KVARN_QLEN1_INLINE_PLAN", raw_value)
-    with pytest.raises(
-        ValueError,
-        match=(
-            "KVARN_QLEN1_INLINE_PLAN must be exactly 'reference' or "
-            "'trusted_native' or 'bound_native_v2'"
-        ),
-    ):
-        _kvarn_qlen1_inline_plan_requested()
-
-
-@pytest.mark.parametrize(
-    ("raw_value", "expected", "source"),
-    [
-        (None, "reference", "reference-default"),
-        ("reference", "reference", "KVARN_METADATA_LIFECYCLE"),
-        (
-            "incremental_qlen1",
-            "incremental_qlen1",
-            "KVARN_METADATA_LIFECYCLE",
-        ),
-    ],
-)
-def test_metadata_lifecycle_selector(monkeypatch, raw_value, expected, source):
-    if raw_value is None:
-        monkeypatch.delenv("KVARN_METADATA_LIFECYCLE", raising=False)
-    else:
-        monkeypatch.setenv("KVARN_METADATA_LIFECYCLE", raw_value)
-
-    assert _kvarn_metadata_lifecycle_requested() == (expected, source)
-
-
-def test_metadata_lifecycle_selector_rejects_invalid_value(monkeypatch):
-    monkeypatch.setenv("KVARN_METADATA_LIFECYCLE", "incremental")
-
-    with pytest.raises(ValueError, match="must be exactly 'reference' or"):
-        _kvarn_metadata_lifecycle_requested()
-
-
-def test_metadata_lifecycle_selector_coexists_with_factory_selectors(monkeypatch):
-    monkeypatch.setenv("KVARN_METADATA_LIFECYCLE", "incremental_qlen1")
-    monkeypatch.setenv("KVARN_FLUSH_INDEX_MATERIALIZATION", "shared")
-    monkeypatch.setenv("KVARN_FLUSH_WRITER", "native_xe2")
-    monkeypatch.setenv("KVARN_FORWARD_POOL_ENSURE", "fused_qkv_proof")
-    monkeypatch.setenv("KVARN_QLEN1_INLINE_PLAN", "trusted_native")
-
-    assert _kvarn_metadata_lifecycle_requested()[0] == "incremental_qlen1"
-    assert _kvarn_flush_index_materialization_requested()[0] == "shared"
-    assert _kvarn_flush_writer_requested()[0] == "native_xe2"
-    assert _kvarn_forward_pool_ensure_requested()[0] == "fused_qkv_proof"
-    assert _kvarn_qlen1_inline_plan_requested()[0] == "trusted_native"
-
-
-@pytest.mark.parametrize(
-    ("cache_dtype", "lifecycle"),
-    [
-        ("auto", "incremental_qlen1"),
-        ("fp8", "incremental_qlen1"),
-        ("kvarn_k4v4_g128", "reference"),
-    ],
-)
-def test_control_does_not_materialize_lifecycle_metadata(cache_dtype, lifecycle):
-    class UnreadableRequestIds:
-        def __getitem__(self, index):
-            raise AssertionError(f"request IDs were materialized at {index!r}")
-
-    block_table = SimpleNamespace(
-        get_row_versions=Mock(side_effect=AssertionError("row versions were read"))
-    )
-
-    enabled = _kvarn_incremental_lifecycle_metadata_enabled(cache_dtype, lifecycle)
-    assert not enabled
-    assert _maybe_materialize_kvarn_lifecycle_metadata(
-        enabled, UnreadableRequestIds(), block_table, 4
-    ) == (None, None)
-    block_table.get_row_versions.assert_not_called()
-
-
-def test_incremental_kvarn_materializes_lifecycle_metadata():
-    block_table = SimpleNamespace(
-        get_row_versions=Mock(return_value=np.asarray([3, 7], dtype=np.uint64))
-    )
-    enabled = _kvarn_incremental_lifecycle_metadata_enabled(
-        "kvarn_k4v4_g128", "incremental_qlen1"
-    )
-
-    request_ids, row_versions = _maybe_materialize_kvarn_lifecycle_metadata(
-        enabled, ["request-a", "request-b", "unused"], block_table, 2
-    )
-
-    assert request_ids == ("request-a", "request-b")
-    assert row_versions.tolist() == [3, 7]
-    block_table.get_row_versions.assert_called_once_with(2)
-
-
-def test_qlen1_inline_plan_selection_is_frozen_and_logged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVARN_QLEN1_INLINE_PLAN", "trusted_native")
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker:
-            assert KVarNAttentionImpl._select_qlen1_inline_plan() == "trusted_native"
-            monkeypatch.setenv("KVARN_QLEN1_INLINE_PLAN", "reference")
-            assert KVarNAttentionImpl._select_qlen1_inline_plan() == "trusted_native"
-
-        marker.assert_called_once_with(
-            "[KVARN_FACTORY] selected_qlen1_inline_plan=%s; "
-            "selector_source=%s; cached_invariants="
-            "pool+cache_abi+qkv_eligibility+decode_eligibility; "
-            "dynamic_guards=qlen1+tensor_schema+cache_identity+generation+"
-            "pool_epochs+lookup_capacity; "
-            "fallback=reference; immutable for engine lifetime",
-            "trusted_native",
-            "KVARN_QLEN1_INLINE_PLAN",
-        )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_bound_qlen1_inline_v2_selection_is_frozen_and_logged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVARN_QLEN1_INLINE_PLAN", "bound_native_v2")
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker:
-            assert KVarNAttentionImpl._select_qlen1_inline_plan() == ("bound_native_v2")
-            monkeypatch.setenv("KVARN_QLEN1_INLINE_PLAN", "reference")
-            assert KVarNAttentionImpl._select_qlen1_inline_plan() == ("bound_native_v2")
-
-        marker.assert_called_once_with(
-            "[KVARN_FACTORY] selected_qlen1_inline_plan=%s; "
-            "selector_source=%s; variant=H; cached_invariants="
-            "layout+abi+device+dtype+split+output; "
-            "dynamic_guards=process_generation+binding_epoch+"
-            "cache_identity+metadata_kind+batch_limit; "
-            "fallback=reference; immutable for engine lifetime",
-            "bound_native_v2",
-            "KVARN_QLEN1_INLINE_PLAN",
-        )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-@pytest.mark.parametrize(
-    "frontend", ["qkv_scatter_inline", "qkv_scatter_inline_current_stream"]
-)
-def test_bound_qlen1_inline_v2_is_an_independent_startup_variant(
-    monkeypatch: pytest.MonkeyPatch, frontend: str
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", frontend)
-    monkeypatch.setenv("KVARN_QLEN1_INLINE_PLAN", "bound_native_v2")
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with patch(
-            "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
-            return_value=2,
-        ):
-            impl = KVarNAttentionImpl(
-                num_heads=24,
-                head_size=256,
-                scale=1.0 / 16.0,
-                num_kv_heads=4,
-                kv_cache_dtype="kvarn_k4v4_g128",
-            )
-            assert impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
-
-        assert impl.use_bound_qlen1_inline_plan_v2
-        assert not impl.use_trusted_qlen1_inline_plan
-        assert impl.use_inline_qkv_cache_update
-        assert impl._bound_qlen1_inline_v2_plan is None
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-@pytest.mark.parametrize("plan", ["trusted_native", "bound_native_v2"])
-def test_qlen1_inline_plan_requires_inline_frontend_at_initialization(
-    monkeypatch: pytest.MonkeyPatch, plan: str
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter")
-    monkeypatch.setenv("KVARN_QLEN1_INLINE_PLAN", plan)
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with (
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
-                return_value=2,
-            ),
-            pytest.raises(
-                RuntimeError,
-                match=(
-                    f"KVARN_QLEN1_INLINE_PLAN={plan} requires "
-                    "KVARN_NATIVE_XPU_FRONTEND=qkv_scatter_inline"
-                ),
-            ),
-        ):
-            KVarNAttentionImpl(
-                num_heads=24,
-                head_size=256,
-                scale=1.0 / 16.0,
-                num_kv_heads=4,
-                kv_cache_dtype="kvarn_k4v4_g128",
-            )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-@pytest.mark.parametrize(
-    ("raw_value", "expected", "source"),
-    [
-        (None, "per_layer", "reference-default"),
-        ("per_layer", "per_layer", "KVARN_FLUSH_INDEX_MATERIALIZATION"),
-        ("shared", "shared", "KVARN_FLUSH_INDEX_MATERIALIZATION"),
-    ],
-)
-def test_flush_index_materialization_selector(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_value: str | None,
-    expected: str,
-    source: str,
-) -> None:
-    if raw_value is None:
-        monkeypatch.delenv("KVARN_FLUSH_INDEX_MATERIALIZATION", raising=False)
-    else:
-        monkeypatch.setenv("KVARN_FLUSH_INDEX_MATERIALIZATION", raw_value)
-
-    assert _kvarn_flush_index_materialization_requested() == (expected, source)
-
-
-@pytest.mark.parametrize("raw_value", ["", "reference", "SHARED", " shared"])
-def test_flush_index_materialization_selector_rejects_invalid_values(
-    monkeypatch: pytest.MonkeyPatch, raw_value: str
-) -> None:
-    monkeypatch.setenv("KVARN_FLUSH_INDEX_MATERIALIZATION", raw_value)
-    with pytest.raises(
-        ValueError,
-        match=(
-            "KVARN_FLUSH_INDEX_MATERIALIZATION must be exactly 'per_layer' or 'shared'"
-        ),
-    ):
-        _kvarn_flush_index_materialization_requested()
-
-
-def test_flush_index_materialization_selection_is_frozen_and_logged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_FLUSH_INDEX_MATERIALIZATION", raising=False)
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker:
-            assert KVarNAttentionImpl._select_flush_index_materialization() == (
-                "per_layer"
-            )
-            monkeypatch.setenv("KVARN_FLUSH_INDEX_MATERIALIZATION", "shared")
-            assert KVarNAttentionImpl._select_flush_index_materialization() == (
-                "per_layer"
-            )
-
-        marker.assert_called_once_with(
-            "[KVARN_FACTORY] selected_flush_index_materialization=%s; "
-            "selector_source=%s; immutable for engine lifetime",
-            "per_layer",
-            "reference-default",
-        )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-@pytest.mark.parametrize(
-    ("raw_value", "expected", "source"),
-    [
-        (None, "reference", "reference-default"),
-        ("reference", "reference", "KVARN_FLUSH_WRITER"),
-        ("native_xe2", "native_xe2", "KVARN_FLUSH_WRITER"),
-    ],
-)
-def test_flush_writer_selector(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_value: str | None,
-    expected: str,
-    source: str,
-) -> None:
-    if raw_value is None:
-        monkeypatch.delenv("KVARN_FLUSH_WRITER", raising=False)
-    else:
-        monkeypatch.setenv("KVARN_FLUSH_WRITER", raw_value)
-
-    assert _kvarn_flush_writer_requested() == (expected, source)
-
-
-@pytest.mark.parametrize("raw_value", ["", "native", "NATIVE_XE2", " native_xe2"])
-def test_flush_writer_selector_rejects_invalid_values(
-    monkeypatch: pytest.MonkeyPatch, raw_value: str
-) -> None:
-    monkeypatch.setenv("KVARN_FLUSH_WRITER", raw_value)
-    with pytest.raises(
-        ValueError,
-        match="KVARN_FLUSH_WRITER must be exactly 'reference' or 'native_xe2'",
-    ):
-        _kvarn_flush_writer_requested()
-
-
-def test_flush_writer_selection_is_frozen_and_logged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_FLUSH_WRITER", raising=False)
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker:
-            assert KVarNAttentionImpl._select_flush_writer() == "reference"
-            monkeypatch.setenv("KVARN_FLUSH_WRITER", "native_xe2")
-            assert KVarNAttentionImpl._select_flush_writer() == "reference"
-
-        marker.assert_called_once_with(
-            "[KVARN_FACTORY] selected_flush_writer=%s; selector_source=%s; "
-            "immutable for engine lifetime",
-            "reference",
-            "reference-default",
-        )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-@pytest.mark.parametrize(
-    ("raw_value", "expected", "source"),
-    [
-        (None, "materialized", "reference-default"),
-        ("materialized", "materialized", "KVARN_SINKHORN_SOURCE"),
-        ("fused_materialized", "fused_materialized", "KVARN_SINKHORN_SOURCE"),
-    ],
-)
-def test_sinkhorn_source_selector(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_value: str | None,
-    expected: str,
-    source: str,
-) -> None:
-    if raw_value is None:
-        monkeypatch.delenv("KVARN_SINKHORN_SOURCE", raising=False)
-    else:
-        monkeypatch.setenv("KVARN_SINKHORN_SOURCE", raw_value)
-
-    assert _kvarn_sinkhorn_source_requested() == (expected, source)
-
-
-@pytest.mark.parametrize("raw_value", ["", "pool", "FUSED", " direct"])
-def test_sinkhorn_source_selector_rejects_invalid_values(
-    monkeypatch: pytest.MonkeyPatch, raw_value: str
-) -> None:
-    monkeypatch.setenv("KVARN_SINKHORN_SOURCE", raw_value)
-    with pytest.raises(
-        ValueError,
-        match=(
-            "KVARN_SINKHORN_SOURCE must be exactly 'materialized' or "
-            "'fused_materialized'"
-        ),
-    ):
-        _kvarn_sinkhorn_source_requested()
-
-
-def test_sinkhorn_source_selection_is_frozen_and_logged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_SINKHORN_SOURCE", raising=False)
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker:
-            assert KVarNAttentionImpl._select_sinkhorn_source() == "materialized"
-            monkeypatch.setenv("KVARN_SINKHORN_SOURCE", "fused_materialized")
-            assert KVarNAttentionImpl._select_sinkhorn_source() == "materialized"
-
-        marker.assert_called_once_with(
-            "[KVARN_SINKHORN] selected_source=%s; selector_source=%s; "
-            "immutable for engine lifetime",
-            "materialized",
-            "reference-default",
-        )
     finally:
         KVarNAttentionImpl.reset_process_state()
 
@@ -3578,11 +2605,8 @@ def test_batched_flush_native_writer_bypasses_reference_record_assembly(
 ) -> None:
     import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
 
-    monkeypatch.setenv("KVARN_FLUSH_WRITER", "native_xe2")
-    # The legacy debug switch must not silently override an explicitly selected
-    # native writer.
-    monkeypatch.setenv("KVARN_FAST_FLUSH", "0")
     KVarNAttentionImpl.reset_process_state()
+    KVarNAttentionImpl._select_flush_writer("native_xe2")
     group_key = ("native-writer-test",)
     cfg = SimpleNamespace(
         head_dim=256,
@@ -3698,127 +2722,6 @@ def test_batched_flush_fused_sinkhorn_bypasses_unfused_materialization(
         KVarNAttentionImpl.reset_process_state()
 
 
-@pytest.mark.parametrize(
-    ("selection", "second_group", "expected_materializations", "expected_reuses"),
-    [
-        pytest.param("per_layer", False, 4, 0, id="reference-per-layer"),
-        pytest.param("shared", False, 2, 1, id="shared-one-group"),
-        pytest.param("shared", True, 4, 0, id="shared-group-isolation"),
-    ],
-)
-def test_batched_flush_index_materialization_is_scoped_and_counted(
-    monkeypatch: pytest.MonkeyPatch,
-    selection: str,
-    second_group: bool,
-    expected_materializations: int,
-    expected_reuses: int,
-) -> None:
-    monkeypatch.setenv("KVARN_FLUSH_INDEX_MATERIALIZATION", selection)
-    monkeypatch.setenv("KVARN_FAST_FLUSH", "1")
-    KVarNAttentionImpl.reset_process_state()
-    cfg = SimpleNamespace(
-        head_dim=2,
-        group=2,
-        record_bytes=26,
-        k_packed_bytes=1,
-        v_packed_bytes=1,
-    )
-    first_group = ("cache-group-a",)
-    groups = (first_group, ("cache-group-b",) if second_group else first_group)
-
-    def make_impl(group_key: tuple):
-        return SimpleNamespace(
-            kvarn_config=cfg,
-            num_kv_heads=1,
-            _group_key=group_key,
-            _tail_K_pool=torch.zeros(3, 2, 1, 2),
-            _tail_V_pool=torch.zeros(3, 2, 1, 2),
-            _tails={1: object(), 3: object()},
-            _kvarn_cache_layout="natural",
-        )
-
-    impls = tuple(make_impl(group_key) for group_key in groups)
-    caches = tuple(torch.full((4, 1, 26), 255, dtype=torch.uint8) for _ in impls)
-    for group_key in set(groups):
-        KVarNAttentionImpl._block_to_slot_dict[group_key] = {1: 0, 3: 2}
-
-    flush_pairs = [
-        (impl, block_id, cache)
-        for impl, cache in zip(impls, caches, strict=True)
-        for block_id in (1, 3)
-    ]
-    real_as_tensor = torch.as_tensor
-    materialized_host_indices: list[tuple[int, ...]] = []
-
-    def counted_as_tensor(values, *args, **kwargs):
-        materialized_host_indices.append(tuple(values))
-        return real_as_tensor(values, *args, **kwargs)
-
-    def fake_sinkhorn_pack(K_tiles, V_tiles, config, *, cache_layout):
-        del V_tiles, cache_layout
-        rows = K_tiles.shape[0]
-
-        def half(width: int) -> torch.Tensor:
-            return torch.zeros((rows, width), dtype=torch.float16)
-
-        return (
-            {
-                "q_packed_uint8": torch.zeros(
-                    (rows, config.k_packed_bytes), dtype=torch.uint8
-                ),
-                "s_col_K": half(config.head_dim),
-                "zp_K": half(config.head_dim),
-                "s_row_K": half(config.group),
-            },
-            {
-                "q_packed_uint8": torch.zeros(
-                    (rows, config.v_packed_bytes), dtype=torch.uint8
-                ),
-                "s_col_V": half(config.head_dim),
-                "s_row_V": half(config.group),
-                "zp_V": half(config.group),
-            },
-        )
-
-    try:
-        with (
-            patch.object(torch, "as_tensor", side_effect=counted_as_tensor),
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn._sinkhorn_pack_kv",
-                side_effect=fake_sinkhorn_pack,
-            ),
-            patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker,
-        ):
-            KVarNAttentionImpl._batched_flush(flush_pairs)
-
-        assert len(materialized_host_indices) == expected_materializations
-        assert KVarNAttentionImpl.flush_index_materialization_counters() == {
-            "flush_calls": 1,
-            "layer_batches": 2,
-            "schedule_groups": expected_materializations // 2,
-            "device_index_tensor_materializations": expected_materializations,
-            "shared_layer_reuses": expected_reuses,
-        }
-        marker.assert_any_call(
-            "[KVARN_FLUSH_INDEX] selected=%s; first_flush_layer_batches=%d; "
-            "first_flush_schedule_groups=%d; "
-            "first_flush_device_index_tensor_materializations=%d; "
-            "first_flush_shared_layer_reuses=%d",
-            selection,
-            2,
-            expected_materializations // 2,
-            expected_materializations,
-            expected_reuses,
-        )
-        for impl, cache in zip(impls, caches, strict=True):
-            assert not impl._tails
-            assert torch.count_nonzero(cache[1]) == 0
-            assert torch.count_nonzero(cache[3]) == 0
-            assert torch.all(cache[[0, 2]] == 255)
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
 def test_fused_qkv_frontend_layer_filter_freezes_topology(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3830,65 +2733,6 @@ def test_fused_qkv_frontend_layer_filter_freezes_topology(
     assert not impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
     monkeypatch.setenv("KVARN_NATIVE_XPU_LAYER", "model.layers.0.self_attn")
     assert not impl.configure_fused_qkv_cache_update("model.layers.0.self_attn")
-
-
-@pytest.mark.parametrize(
-    ("policy", "kernel_name", "kernel_id"),
-    [
-        ("b70_q6", "q6_scalar", 2),
-        ("b70_q6", "q6_page_metadata_cursor", 20),
-        ("b70_q6", "q6_paired_nibble_half2", 21),
-        ("b70_q6_v2", "q6_next_page_prefetch", 12),
-        (
-            "b70_q6_v2",
-            "q6_next_page_prefetch_split_reducer",
-            13,
-        ),
-        ("b70_q6_id18_v1", "q6_prefetch_record_cursor", 18),
-    ],
-)
-def test_b70_q6_split_policies_are_frozen_and_reported(
-    monkeypatch: pytest.MonkeyPatch,
-    policy: str,
-    kernel_name: str,
-    kernel_id: int,
-) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", "xe2_dpas")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", policy)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", kernel_name)
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        with (
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn.get_flash_attn_version",
-                return_value=2,
-            ),
-            patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker,
-        ):
-            impl = KVarNAttentionImpl(
-                num_heads=24,
-                head_size=256,
-                scale=1.0 / 16.0,
-                num_kv_heads=4,
-                kv_cache_dtype="kvarn_k4v4_g128",
-            )
-
-        assert impl._kvarn_native_split_policy == policy
-        assert impl._kvarn_native_max_splits == 32
-        marker.assert_any_call(
-            "[KVARN_FACTORY] selected_cache_layout=%s; "
-            "selected_kernel_variant=%s(%d); max_decode_splits=%d; "
-            "selected_split_policy=%s; immutable for engine lifetime",
-            "xe2_dpas",
-            kernel_name,
-            kernel_id,
-            32,
-            policy,
-        )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
 
 
 def test_dpas_layout_bypasses_natural_fused_verify_reader(
@@ -4042,7 +2886,6 @@ def _epoch_ready_pool_impl():
     impl.num_kv_heads = 2
     impl.layer_name = group_key[0]
     impl._kvarn_forward_pool_ensure = "epoch_latch"
-    impl._kvarn_pool_runtime_policy = KVarNAttentionImpl._select_pool_runtime_policy()
     impl._pool_epoch_latch_active_logged = False
     impl._tail_K_pool = torch.empty(1)
     impl._tail_V_pool = torch.empty(1)
@@ -4051,7 +2894,6 @@ def _epoch_ready_pool_impl():
     impl._v_rot_scratch = torch.empty(1)
     impl._pool_ready_key = mirror_key
     impl._pool_ready_native_key = None
-    impl._pool_ready_env = impl._kvarn_pool_runtime_policy
     impl._native_decode_scratch = None
 
     block_to_slot = torch.empty(2048)
@@ -4120,237 +2962,6 @@ def _native_scratch_for_test(
     )
 
 
-@pytest.mark.parametrize("malformation", ["missing", "undersized"])
-def test_beta_pool_readiness_rejects_incomplete_native_scratch(malformation: str):
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        impl, device, *_, shared_key, _ = _epoch_ready_pool_impl()
-        native_key, batch_capacity, split_capacity = (
-            _enable_beta_native_scratch_contract(impl, device)
-        )
-        if malformation == "undersized":
-            scratch = _native_scratch_for_test(batch_capacity - 1, split_capacity)
-            KVarNAttentionImpl._shared_native_decode_scratch[native_key] = scratch
-            impl._pool_ready_native_key = native_key
-            impl._native_decode_scratch = scratch
-        KVarNAttentionImpl._mark_pool_shared_changed(shared_key)
-        impl._record_pool_epoch_latch(device)
-
-        assert not impl._pool_is_initialized_for(device, 1)
-        assert not impl._pool_epoch_latch_is_current(device, 1)
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_beta_native_scratch_rebinds_malformed_shared_state():
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        impl, device, *_, shared_key, _ = _epoch_ready_pool_impl()
-        native_key, batch_capacity, split_capacity = (
-            _enable_beta_native_scratch_contract(impl, device)
-        )
-        malformed = _native_scratch_for_test(batch_capacity - 1, split_capacity)
-        KVarNAttentionImpl._shared_native_decode_scratch[native_key] = malformed
-        previous_epoch = KVarNAttentionImpl._pool_shared_epochs.get(shared_key, -1)
-
-        rebound = impl._ensure_native_decode_scratch(
-            native_key,
-            device=device,
-            batch_capacity=batch_capacity,
-            split_capacity=split_capacity,
-            shared_key=shared_key,
-        )
-
-        assert rebound is not malformed
-        assert KVarNAttentionImpl._shared_native_decode_scratch[native_key] is rebound
-        assert impl._native_decode_scratch_is_valid(
-            rebound,
-            device=device,
-            batch_capacity=batch_capacity,
-            split_capacity=split_capacity,
-        )
-        assert KVarNAttentionImpl._pool_shared_epochs[shared_key] > previous_epoch
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_experimental_native_scratch_keeps_no_scratch_fallback():
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        impl, device, *_, shared_key, _ = _epoch_ready_pool_impl()
-        impl._kvarn_xpu_beta_profile = False
-        malformed = (torch.empty(1), torch.empty(1), torch.empty(1))
-        native_key = (device, 8, 2, 4, 4)
-        KVarNAttentionImpl._shared_native_decode_scratch[native_key] = malformed
-
-        retained = impl._ensure_native_decode_scratch(
-            native_key,
-            device=device,
-            batch_capacity=4,
-            split_capacity=4,
-            shared_key=shared_key,
-        )
-
-        assert retained is malformed
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_pool_epoch_latch_elides_repeated_full_validation():
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        impl, device, *_ = _epoch_ready_pool_impl()
-
-        with (
-            patch.object(
-                impl,
-                "_pool_is_initialized_for",
-                side_effect=AssertionError("full validation reached"),
-            ),
-            patch("vllm.v1.attention.backends.kvarn_attn.logger.info") as marker,
-        ):
-            impl._ensure_pool(device, num_blocks_hint=2048)
-            impl._ensure_pool(device, num_blocks_hint=2048)
-
-        marker.assert_called_once_with(
-            "[KVARN_FORWARD_POOL_ENSURE] active=epoch_latch; "
-            "action=elide_full_validation; layer=%s",
-            "model.layers.0.self_attn",
-        )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_pool_epoch_latch_leaves_reference_validation_unchanged():
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        impl, device, *_ = _epoch_ready_pool_impl()
-        impl._kvarn_forward_pool_ensure = "always"
-
-        with patch.object(
-            impl,
-            "_pool_is_initialized_for",
-            wraps=impl._pool_is_initialized_for,
-        ) as full_validation:
-            impl._ensure_pool(device, num_blocks_hint=2048)
-
-        full_validation.assert_called_once_with(device, 2048)
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_pool_epoch_latch_revalidates_mirror_resize_and_group_retag():
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        impl, device, group_key, mirror_key, *_ = _epoch_ready_pool_impl()
-        assert impl._pool_epoch_latch_is_current(device, 2048)
-        assert not impl._pool_epoch_latch_is_current(device, 2049)
-        assert not impl._pool_epoch_latch_is_current(torch.device("cpu:1"), 1)
-
-        block_to_slot = torch.empty(4096)
-        is_sink = torch.empty(4096)
-        KVarNAttentionImpl._block_to_slot_t_per_device[mirror_key] = block_to_slot
-        KVarNAttentionImpl._is_sink_t_per_device[mirror_key] = is_sink
-        KVarNAttentionImpl._mark_pool_mirror_changed(mirror_key)
-        assert not impl._pool_epoch_latch_is_current(device, 2048)
-
-        impl._block_to_slot_t = block_to_slot
-        impl._is_sink_t = is_sink
-        impl._block_lookup_size = 4096
-        with patch.object(
-            impl,
-            "_pool_is_initialized_for",
-            wraps=impl._pool_is_initialized_for,
-        ) as full_validation:
-            impl._ensure_pool(device, num_blocks_hint=2049)
-        full_validation.assert_called_once_with(device, 2049)
-        assert impl._pool_epoch_latch_is_current(device, 4096)
-
-        impl._group_key = ("model.layers.1.self_attn",)
-        assert not impl._pool_epoch_latch_is_current(device, 1)
-        impl._group_key = group_key
-        assert impl._pool_epoch_latch_is_current(device, 1)
-
-        KVarNAttentionImpl.reset_process_state()
-        assert not impl._pool_epoch_latch_is_current(device, 1)
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_pool_epoch_latch_rebinds_after_shared_scratch_growth():
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        impl, device, *_, shared_key, attr_maps = _epoch_ready_pool_impl()
-        KVarNAttentionImpl._ensure_shared_q_output_scratch(shared_key, 2, 8, device)
-        assert not impl._pool_epoch_latch_is_current(device, 1)
-
-        for attr, mapping in attr_maps:
-            setattr(impl, attr, mapping[shared_key])
-        with patch.object(
-            impl,
-            "_pool_is_initialized_for",
-            wraps=impl._pool_is_initialized_for,
-        ) as full_validation:
-            impl._ensure_pool(device, num_blocks_hint=1)
-        full_validation.assert_called_once_with(device, 1)
-        assert impl._pool_epoch_latch_is_current(device, 1)
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-@pytest.mark.parametrize("replacement", ["mirror", "shared"])
-def test_trusted_inline_receipt_rejects_published_pool_replacement(replacement):
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        impl, device, *_, mirror_key, shared_key, _ = _epoch_ready_pool_impl()
-        receipt = impl._capture_trusted_inline_pool_receipt(device, 2048)
-        assert receipt is not None
-        assert impl._trusted_inline_pool_receipt_is_current(receipt)
-
-        if replacement == "mirror":
-            KVarNAttentionImpl._block_to_slot_t_per_device[mirror_key] = torch.empty(
-                4096
-            )
-            KVarNAttentionImpl._is_sink_t_per_device[mirror_key] = torch.empty(4096)
-            KVarNAttentionImpl._mark_pool_mirror_changed(mirror_key)
-        else:
-            KVarNAttentionImpl._shared_q_rot_fp16_buf[shared_key] = torch.empty(2)
-            KVarNAttentionImpl._mark_pool_shared_changed(shared_key)
-
-        assert not impl._trusted_inline_pool_receipt_is_current(receipt)
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_pool_epoch_latch_freezes_runtime_policy_until_explicit_test_override(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    KVarNAttentionImpl.reset_process_state()
-    try:
-        impl, device, *_ = _epoch_ready_pool_impl()
-        changed_value = "0" if impl._kvarn_pool_runtime_policy[1] != "0" else "1"
-        monkeypatch.setenv("KVARN_NATIVE_XPU_PERSISTENT_SCRATCH", changed_value)
-        assert impl._pool_epoch_latch_is_current(device, 1)
-
-        impl._override_pool_runtime_policy_for_test(
-            (impl._kvarn_pool_runtime_policy[0], changed_value)
-        )
-        assert not impl._pool_epoch_latch_is_current(device, 1)
-
-        with (
-            patch.object(impl, "_pool_is_initialized_for", return_value=False),
-            patch.object(XPUPlatform, "is_xpu", return_value=False),
-            patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
-            pytest.raises(
-                RuntimeError,
-                match="epoch_latch became stale during stream capture",
-            ),
-        ):
-            impl._ensure_pool(device, num_blocks_hint=1)
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
 def test_pool_initialized_fast_path_is_group_capacity_and_binding_safe():
     KVarNAttentionImpl.reset_process_state()
     try:
@@ -4362,9 +2973,6 @@ def test_pool_initialized_fast_path_is_group_capacity_and_binding_safe():
         impl._group_key = group_key
         impl.kvarn_config = SimpleNamespace(head_dim=8)
         impl.num_kv_heads = 2
-        impl._kvarn_pool_runtime_policy = (
-            KVarNAttentionImpl._select_pool_runtime_policy()
-        )
         impl._tail_K_pool = torch.empty(1)
         impl._tail_V_pool = torch.empty(1)
         impl._H_fp16 = torch.empty(1)
@@ -4372,7 +2980,6 @@ def test_pool_initialized_fast_path_is_group_capacity_and_binding_safe():
         impl._v_rot_scratch = torch.empty(1)
         impl._pool_ready_key = mirror_key
         impl._pool_ready_native_key = None
-        impl._pool_ready_env = impl._kvarn_pool_runtime_policy
         impl._native_decode_scratch = None
 
         block_to_slot = torch.empty(2048)
@@ -4525,42 +3132,6 @@ def test_pool_default_keeps_natural_decode_policy(monkeypatch):
     assert kvarn_decode_fp16_window_blocks() == 0
     assert kvarn_decode_fp16_low_water_blocks() == 0
     assert config.pool_slots(1, 2048) == 42
-
-
-def test_pool_accounts_for_explicit_decode_high_watermark(monkeypatch):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "20")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "0")
-    config = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128_compact", head_dim=256)
-
-    # B1/MNBT=2048: sink + tail + max(16 prefill, 20 decode) recent
-    # blocks + 16 current blocks + eight slots of allocator headroom.
-    assert kvarn_prefill_fp16_window_blocks() == 16
-    assert kvarn_decode_fp16_window_blocks() == 20
-    assert kvarn_decode_fp16_low_water_blocks() == 0
-    assert config.pool_slots(1, 2048) == 46
-
-
-def test_pool_and_concurrency_use_the_larger_history_window(monkeypatch):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "4")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "6")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "2")
-    config = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128_compact", head_dim=256)
-    slot_bytes = config._slot_bytes_per_layer(num_kv_heads=4)
-    num_layers = 16
-    max_slots = 100
-
-    assert config.pool_slots(4, 2048) == 56
-    assert (
-        config.max_supported_seqs(
-            total_gpu_bytes=max_slots * slot_bytes * num_layers,
-            num_kv_heads=4,
-            num_layers=num_layers,
-            max_num_batched_tokens=2048,
-            frac=1.0,
-        )
-        == 9
-    )
 
 
 class _ModelConfig:
@@ -4785,111 +3356,6 @@ def test_immediately_recycled_sink_is_delabeled_outside_new_row_zero():
     assert is_sink_t[new_sink]
 
 
-def test_deferred_prefill_flush_retains_committed_history(monkeypatch):
-    monkeypatch.setenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", "1")
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "1")
-    row = [10, 11, 12, 13]
-    resident = {10: 0, 11: 1, 12: 2, 99: 3}
-    blocks_needed = {13}
-    deferred_blocks: set[int] = set()
-
-    defer = _defer_kvarn_prefill_history_blocks(
-        row,
-        q_len=256,
-        committed_len=384,
-        group=128,
-        bt_cols=len(row),
-        resident_blocks=resident,
-        blocks_needed=blocks_needed,
-        deferred_blocks=deferred_blocks,
-    )
-    flush_seen: set[int] = set()
-    walk_back = _kvarn_walk_back_flush_blocks(
-        row,
-        committed_len=384,
-        group=128,
-        bt_cols=len(row),
-        resident_blocks=resident,
-        sinks={10},
-        flush_seen=flush_seen,
-        defer=defer,
-        deferred_blocks=deferred_blocks,
-    )
-    shared_owner_walk_back = _kvarn_walk_back_flush_blocks(
-        row,
-        committed_len=384,
-        group=128,
-        bt_cols=len(row),
-        resident_blocks=resident,
-        sinks={10},
-        flush_seen=flush_seen,
-        defer=False,
-        deferred_blocks=deferred_blocks,
-    )
-    reclaim = _kvarn_reclaimable_block_ids(resident, blocks_needed, flush_seen)
-
-    assert defer
-    assert blocks_needed == {10, 11, 12, 13}
-    assert deferred_blocks == {10, 11, 12}
-    assert walk_back == []
-    assert shared_owner_walk_back == []
-    assert flush_seen == set()
-    assert reclaim == [99]
-
-
-@pytest.mark.parametrize(
-    ("flag", "q_len", "committed_len"),
-    [
-        (None, 256, 384),  # default continuation behavior
-        ("1", 1, 384),  # decode remains on the production policy
-        ("1", 256, 0),  # fresh prefill has no committed history
-    ],
-)
-def test_deferred_prefill_flush_does_not_change_other_steps(
-    monkeypatch, flag, q_len, committed_len
-):
-    if flag is None:
-        monkeypatch.delenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", flag)
-    row = [10, 11, 12, 13]
-    resident = {10: 0, 11: 1, 12: 2, 99: 3}
-    blocks_needed = {13}
-
-    defer = _defer_kvarn_prefill_history_blocks(
-        row,
-        q_len=q_len,
-        committed_len=committed_len,
-        group=128,
-        bt_cols=len(row),
-        resident_blocks=resident,
-        blocks_needed=blocks_needed,
-    )
-    flush_seen: set[int] = set()
-    walk_back = _kvarn_walk_back_flush_blocks(
-        row,
-        committed_len=committed_len,
-        group=128,
-        bt_cols=len(row),
-        resident_blocks=resident,
-        sinks={10},
-        flush_seen=flush_seen,
-        defer=defer,
-    )
-    reclaim = _kvarn_reclaimable_block_ids(resident, blocks_needed, flush_seen)
-
-    assert not defer
-    assert blocks_needed == {13}
-    if committed_len:
-        assert walk_back == [12, 11]
-        assert flush_seen == {11, 12}
-        assert reclaim == [10, 99]
-    else:
-        assert walk_back == []
-        assert flush_seen == set()
-        assert reclaim == [10, 11, 12, 99]
-
-
 def test_prefill_fp16_window_chunk2_retains_available_recent_history(monkeypatch):
     monkeypatch.delenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", raising=False)
     monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
@@ -4975,215 +3441,6 @@ def test_prefill_fp16_window_chunk3_flushes_older_than_bounded_suffix(monkeypatc
     remaining_after_flush = (set(resident) - flush_seen) | set(range(32, 48))
     assert remaining_after_flush == {0, *range(16, 48)}
     assert len(remaining_after_flush) == 33
-
-
-@pytest.mark.parametrize(
-    ("window", "q_len", "committed_len"),
-    [
-        (0, 256, 384),  # default continuation behavior
-        (16, 1, 384),  # decode remains on the production policy
-        (16, 256, 0),  # fresh prefill has no committed history
-    ],
-)
-def test_prefill_fp16_window_does_not_change_other_steps(
-    monkeypatch, window, q_len, committed_len
-):
-    monkeypatch.delenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", raising=False)
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", str(window))
-    row = [10, 11, 12, 13]
-    resident = {10: 0, 11: 1, 12: 2, 99: 3}
-    blocks_needed = {13}
-    protected: set[int] = set()
-
-    active = _protect_kvarn_prefill_window_blocks(
-        row,
-        q_len=q_len,
-        committed_len=committed_len,
-        group=128,
-        bt_cols=len(row),
-        window=_kvarn_prefill_fp16_window_blocks(),
-        resident_blocks=resident,
-        blocks_needed=blocks_needed,
-        protected_blocks=protected,
-    )
-    flush_seen: set[int] = set()
-    walk_back = _kvarn_walk_back_flush_blocks(
-        row,
-        committed_len=committed_len,
-        group=128,
-        bt_cols=len(row),
-        resident_blocks=resident,
-        sinks={10},
-        flush_seen=flush_seen,
-        defer=False,
-        deferred_blocks=protected,
-    )
-
-    assert not active
-    assert protected == set()
-    assert blocks_needed == {13}
-    assert walk_back == ([12, 11] if committed_len else [])
-
-
-def test_decode_fp16_window_batches_flush_at_high_watermark(monkeypatch):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "20")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "16")
-    row = list(range(38))
-    # Reachable after continuation prefill retained pages 16..31 and decode
-    # completed five more pages. Crossing high-water 20 flushes five together.
-    resident = {0: 0, **{bid: bid - 15 for bid in range(16, 37)}}
-    blocks_needed = {0, 37}
-    protected: set[int] = set()
-
-    active, flush_required = _protect_kvarn_decode_window_blocks(
-        row,
-        q_len=1,
-        committed_len=37 * 128,
-        group=128,
-        bt_cols=len(row),
-        high_water=_kvarn_decode_fp16_window_blocks(),
-        low_water=_kvarn_decode_fp16_low_water_blocks(20),
-        resident_blocks=resident,
-        blocks_needed=blocks_needed,
-        protected_blocks=protected,
-    )
-    flush_seen: set[int] = set()
-    walk_back = _kvarn_walk_back_flush_blocks(
-        row,
-        committed_len=37 * 128,
-        group=128,
-        bt_cols=len(row),
-        resident_blocks=resident,
-        sinks={0},
-        flush_seen=flush_seen,
-        defer=False,
-        deferred_blocks=protected,
-    )
-    reclaim = _kvarn_reclaimable_block_ids(resident, blocks_needed, flush_seen)
-
-    assert active
-    assert flush_required
-    assert protected == set(range(21, 37))
-    assert walk_back == [20, 19, 18, 17, 16]
-    assert flush_seen == set(range(16, 21))
-    assert reclaim == []
-
-
-@pytest.mark.parametrize("high_water", [4, 8])
-def test_decode_fp16_window_flushes_to_independent_zero_low_water(
-    monkeypatch, high_water
-):
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", str(high_water))
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "0")
-    row = list(range(high_water + 3))
-    resident = {bid: bid for bid in range(high_water + 2)}
-    blocks_needed = {0, high_water + 2}
-    protected: set[int] = set()
-
-    active, flush_required = _protect_kvarn_decode_window_blocks(
-        row,
-        q_len=1,
-        committed_len=(high_water + 2) * 128,
-        group=128,
-        bt_cols=len(row),
-        high_water=_kvarn_decode_fp16_window_blocks(),
-        low_water=_kvarn_decode_fp16_low_water_blocks(high_water),
-        resident_blocks=resident,
-        blocks_needed=blocks_needed,
-        protected_blocks=protected,
-    )
-    flush_seen: set[int] = set()
-    walk_back = _kvarn_walk_back_flush_blocks(
-        row,
-        committed_len=(high_water + 2) * 128,
-        group=128,
-        bt_cols=len(row),
-        resident_blocks=resident,
-        sinks={0},
-        flush_seen=flush_seen,
-        defer=False,
-        deferred_blocks=protected,
-    )
-
-    assert active
-    assert flush_required
-    assert protected == set()
-    assert walk_back == list(range(high_water + 1, 0, -1))
-
-
-def test_decode_fp16_window_defers_flush_below_high_watermark(monkeypatch):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "20")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "16")
-    row = list(range(34))
-    resident = {0: 0, **{bid: bid - 15 for bid in range(16, 33)}}
-    blocks_needed = {0, 33}
-    protected: set[int] = set()
-
-    active, flush_required = _protect_kvarn_decode_window_blocks(
-        row,
-        q_len=1,
-        committed_len=33 * 128,
-        group=128,
-        bt_cols=len(row),
-        high_water=_kvarn_decode_fp16_window_blocks(),
-        low_water=_kvarn_decode_fp16_low_water_blocks(20),
-        resident_blocks=resident,
-        blocks_needed=blocks_needed,
-        protected_blocks=protected,
-    )
-    flush_seen: set[int] = set()
-    walk_back = _kvarn_walk_back_flush_blocks(
-        row,
-        committed_len=33 * 128,
-        group=128,
-        bt_cols=len(row),
-        resident_blocks=resident,
-        sinks={0},
-        flush_seen=flush_seen,
-        defer=active and not flush_required,
-        deferred_blocks=protected,
-    )
-
-    assert active
-    assert not flush_required
-    assert protected == set(range(16, 33))
-    assert walk_back == []
-
-
-def test_decode_fp16_window_scan_is_context_independent(monkeypatch):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "20")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "16")
-
-    class CountingRow(list):
-        accesses = 0
-
-        def __getitem__(self, index):
-            self.accesses += 1
-            return super().__getitem__(index)
-
-    row = CountingRow(range(1000))
-    protected: set[int] = set()
-
-    active, flush_required = _protect_kvarn_decode_window_blocks(
-        row,
-        q_len=1,
-        committed_len=1000 * 128,
-        group=128,
-        bt_cols=len(row),
-        high_water=_kvarn_decode_fp16_window_blocks(),
-        low_water=_kvarn_decode_fp16_low_water_blocks(20),
-        resident_blocks={bid: bid for bid in row},
-        blocks_needed=set(),
-        protected_blocks=protected,
-    )
-
-    assert active
-    assert flush_required
-    assert row.accesses == 21
-    assert protected == set(range(984, 1000))
 
 
 @pytest.mark.parametrize(
@@ -5309,43 +3566,10 @@ def test_decode_fp16_window_does_not_change_other_steps(
     assert blocks_needed == {13}
 
 
-@pytest.mark.parametrize("value", ["-1", "not-an-integer"])
-def test_prefill_fp16_window_rejects_invalid_values(monkeypatch, value):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", value)
-
-    with pytest.raises(ValueError, match="must be a non-negative integer"):
-        _kvarn_prefill_fp16_window_blocks()
-
-
 def test_prefill_fp16_window_defaults_to_beta_guardrail(monkeypatch):
     monkeypatch.delenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", raising=False)
 
     assert _kvarn_prefill_fp16_window_blocks() == 16
-
-
-@pytest.mark.parametrize("value", ["-1", "not-an-integer"])
-def test_decode_fp16_window_rejects_invalid_values(monkeypatch, value):
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", value)
-
-    with pytest.raises(ValueError, match="must be a non-negative integer"):
-        _kvarn_decode_fp16_window_blocks()
-
-
-@pytest.mark.parametrize("value", ["-1", "not-an-integer"])
-def test_decode_fp16_low_water_rejects_invalid_values(monkeypatch, value):
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "4")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", value)
-
-    with pytest.raises(ValueError, match="must be a non-negative integer"):
-        _kvarn_decode_fp16_low_water_blocks(4)
-
-
-def test_decode_fp16_low_water_cannot_exceed_high_water(monkeypatch):
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "4")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "5")
-
-    with pytest.raises(ValueError, match="must not exceed"):
-        _kvarn_decode_fp16_low_water_blocks(4)
 
 
 def test_decode_fp16_window_defaults_to_natural_reference(monkeypatch):
@@ -5360,40 +3584,6 @@ def test_decode_flush_scope_defaults_to_per_row(monkeypatch):
     monkeypatch.delenv("KVARN_DECODE_FLUSH_SCOPE", raising=False)
 
     assert _kvarn_decode_flush_scope() == "per_row"
-
-
-def test_decode_flush_scope_accepts_batch_cohort(monkeypatch):
-    monkeypatch.setenv("KVARN_DECODE_FLUSH_SCOPE", "batch_cohort")
-
-    assert _kvarn_decode_flush_scope() == "batch_cohort"
-
-
-def test_xpu_beta_metadata_defaults_to_bounded_decode_cohort(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    for name in (
-        "KVARN_PREFILL_FP16_WINDOW_BLOCKS",
-        "KVARN_DECODE_FP16_WINDOW_BLOCKS",
-        "KVARN_DECODE_FP16_LOW_WATER_BLOCKS",
-        "KVARN_DECODE_FLUSH_SCOPE",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    builder = object.__new__(KVarNMetadataBuilder)
-    builder._kvarn_xpu_beta_profile = True
-
-    assert builder._read_incremental_lifecycle_policy() == (
-        16,
-        4,
-        0,
-        "batch_cohort",
-    )
-
-
-def test_decode_flush_scope_rejects_unknown_value(monkeypatch):
-    monkeypatch.setenv("KVARN_DECODE_FLUSH_SCOPE", "global")
-
-    with pytest.raises(ValueError, match="must be one of"):
-        _kvarn_decode_flush_scope()
 
 
 class _ImmediateKVarNMetadataStageRing:
@@ -5624,417 +3814,6 @@ def _run_stable_kvarn_decode_trace(metadata_lifecycle, rows, initial_seq_lens):
         KVarNAttentionImpl.reset_process_state()
 
 
-@pytest.mark.parametrize(
-    ("rows", "seq_lens"),
-    [
-        ([[0, 1]], [130]),
-        (
-            [[0, 1], [100, 101, 102], [200], [300, 301]],
-            [130, 260, 65, 200],
-        ),
-    ],
-)
-def test_incremental_qlen1_matches_reference_for_stable_ragged_traces(
-    monkeypatch, rows, seq_lens
-):
-    monkeypatch.setenv("KVARN_FUSED_DECODE", "1")
-
-    reference = _run_stable_kvarn_decode_trace("reference", rows, seq_lens)
-    incremental = _run_stable_kvarn_decode_trace("incremental_qlen1", rows, seq_lens)
-
-    assert incremental[0] == reference[0]
-    assert incremental[2] == reference[2] == []
-    assert reference[1] == {"incremental_hits": 0, "full_builds": 3}
-    assert incremental[1] == {"incremental_hits": 2, "full_builds": 1}
-
-
-def test_incremental_qlen1_skips_full_lifecycle_scans(monkeypatch):
-    monkeypatch.setenv("KVARN_FUSED_DECODE", "1")
-    builder, _ = _make_kvarn_lifecycle_builder(
-        {0, 1}, sinks={0}, pool_size=4, metadata_lifecycle="incremental_qlen1"
-    )
-    flush_calls = []
-    try:
-        _run_kvarn_lifecycle_build(
-            builder,
-            [[0, 1]],
-            [130],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-            request_ids=["stable"],
-            row_versions=[1],
-        )
-        with (
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn.logger.info_once"
-            ) as info_once,
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn."
-                "_coordinate_kvarn_decode_window_blocks",
-                side_effect=AssertionError("full decode-window scan"),
-            ),
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn._reconcile_kvarn_sink_ownership",
-                side_effect=AssertionError("full sink scan"),
-            ),
-            patch(
-                "vllm.v1.attention.backends.kvarn_attn._kvarn_reclaimable_block_ids",
-                side_effect=AssertionError("full reclaim scan"),
-            ),
-        ):
-            metadata = _run_kvarn_lifecycle_build(
-                builder,
-                [[0, 1]],
-                [131],
-                [1],
-                num_decodes=1,
-                flush_calls=flush_calls,
-                request_ids=["stable"],
-                row_versions=[1],
-            )
-
-        assert metadata.seq_lens_cpu == [131]
-        assert builder._block_fill[1] == 3
-        assert builder._metadata_lifecycle_counters == {
-            "incremental_hits": 1,
-            "full_builds": 1,
-        }
-        info_once.assert_called_once_with(
-            "[KVARN_METADATA_LIFECYCLE] active=incremental_qlen1; "
-            "action=elide_full_lifecycle_scan"
-        )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_incremental_qlen1_policy_is_frozen_at_builder_init(monkeypatch):
-    monkeypatch.setenv("KVARN_FUSED_DECODE", "1")
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "0")
-    builder, _ = _make_kvarn_lifecycle_builder(
-        {0, 1}, sinks={0}, pool_size=4, metadata_lifecycle="incremental_qlen1"
-    )
-    flush_calls = []
-    try:
-        _run_kvarn_lifecycle_build(
-            builder,
-            [[0, 1]],
-            [130],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-            request_ids=["stable"],
-            row_versions=[1],
-        )
-        monkeypatch.setenv("KVARN_FUSED_DECODE", "0")
-        monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "invalid")
-        monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "invalid")
-
-        metadata = _run_kvarn_lifecycle_build(
-            builder,
-            [[0, 1]],
-            [131],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-            request_ids=["stable"],
-            row_versions=[1],
-        )
-
-        assert metadata.seq_lens_cpu == [131]
-        assert builder._metadata_lifecycle_counters == {
-            "incremental_hits": 1,
-            "full_builds": 1,
-        }
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_incremental_qlen1_rejects_equal_cardinality_allocator_mutation(
-    monkeypatch,
-):
-    monkeypatch.setenv("KVARN_FUSED_DECODE", "1")
-    builder, _ = _make_kvarn_lifecycle_builder(
-        {0, 1}, sinks={0}, pool_size=6, metadata_lifecycle="incremental_qlen1"
-    )
-    flush_calls = []
-    try:
-        _run_kvarn_lifecycle_build(
-            builder,
-            [[0, 1]],
-            [130],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-            request_ids=["stable"],
-            row_versions=[1],
-        )
-        group_key = builder._group_key
-        free_slots = KVarNAttentionImpl._free_slots[group_key]
-        epoch = KVarNAttentionImpl._allocator_lifecycle_epochs[group_key]
-        free_slots.reverse()
-        KVarNAttentionImpl._bump_allocator_lifecycle_epoch(group_key)
-        assert len(free_slots) == 4
-        assert KVarNAttentionImpl._allocator_lifecycle_epochs[group_key] == epoch + 1
-
-        _run_kvarn_lifecycle_build(
-            builder,
-            [[0, 1]],
-            [131],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-            request_ids=["stable"],
-            row_versions=[1],
-        )
-
-        assert builder._metadata_lifecycle_counters == {
-            "incremental_hits": 0,
-            "full_builds": 2,
-        }
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_incremental_qlen1_late_row_failure_rolls_back_tail_fills(monkeypatch):
-    monkeypatch.setenv("KVARN_FUSED_DECODE", "1")
-    rows = [[0, 1], [100, 101], [200, 201], [300, 301]]
-    resident = {block for row in rows for block in row}
-    builder, _ = _make_kvarn_lifecycle_builder(
-        resident,
-        sinks={row[0] for row in rows},
-        pool_size=len(resident) + 4,
-        metadata_lifecycle="incremental_qlen1",
-    )
-    request_ids = [f"ragged-{index}" for index in range(4)]
-    flush_calls = []
-    try:
-        _run_kvarn_lifecycle_build(
-            builder,
-            rows,
-            [130, 130, 130, 130],
-            [1, 1, 1, 1],
-            num_decodes=4,
-            flush_calls=flush_calls,
-            request_ids=request_ids,
-            row_versions=[1, 1, 1, 1],
-        )
-        fills_before = builder._block_fill.copy()
-        changed_rows = [*rows[:3], [300, 999]]
-        cam = _kvarn_lifecycle_common(
-            changed_rows,
-            [131, 131, 131, 131],
-            [1, 1, 1, 1],
-            request_ids=request_ids,
-            row_versions=[1, 1, 1, 1],
-        )
-
-        assert not builder._try_incremental_decode_lifecycle(
-            cam=cam,
-            seq_lens_cpu=[131, 131, 131, 131],
-            block_table_np=cam.block_table_cpu,
-            pure_qlen1=True,
-            for_cudagraph_capture=False,
-        )
-        assert builder._block_fill == fills_before
-        assert builder._incremental_decode_state is None
-        assert builder._metadata_lifecycle_counters == {
-            "incremental_hits": 0,
-            "full_builds": 1,
-        }
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_incremental_qlen1_falls_back_at_page_boundary(monkeypatch):
-    monkeypatch.setenv("KVARN_FUSED_DECODE", "1")
-    builder, block_map = _make_kvarn_lifecycle_builder(
-        {0}, sinks={0}, pool_size=3, metadata_lifecycle="incremental_qlen1"
-    )
-    flush_calls = []
-    try:
-        _run_kvarn_lifecycle_build(
-            builder,
-            [[0, 1]],
-            [128],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-            request_ids=["boundary"],
-            row_versions=[1],
-        )
-        _run_kvarn_lifecycle_build(
-            builder,
-            [[0, 1]],
-            [129],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-            request_ids=["boundary"],
-            row_versions=[2],
-        )
-
-        assert 1 in block_map
-        assert builder._block_fill[1] == 1
-        assert builder._metadata_lifecycle_counters == {
-            "incremental_hits": 0,
-            "full_builds": 2,
-        }
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-@pytest.mark.parametrize(
-    ("request_ids", "row_versions", "rows"),
-    [
-        (["replacement"], [1], [[0, 1]]),
-        (["original"], [2], [[0, 1]]),
-        (["replacement"], [2], [[2, 3]]),
-    ],
-)
-def test_incremental_qlen1_falls_back_on_replacement_or_block_reuse(
-    monkeypatch, request_ids, row_versions, rows
-):
-    monkeypatch.setenv("KVARN_FUSED_DECODE", "1")
-    builder, _ = _make_kvarn_lifecycle_builder(
-        {0, 1}, sinks={0}, pool_size=4, metadata_lifecycle="incremental_qlen1"
-    )
-    flush_calls = []
-    try:
-        _run_kvarn_lifecycle_build(
-            builder,
-            [[0, 1]],
-            [130],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-            request_ids=["original"],
-            row_versions=[1],
-        )
-        _run_kvarn_lifecycle_build(
-            builder,
-            rows,
-            [131],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-            request_ids=request_ids,
-            row_versions=row_versions,
-        )
-
-        assert builder._metadata_lifecycle_counters["incremental_hits"] == 0
-        assert builder._metadata_lifecycle_counters["full_builds"] == 2
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_incremental_qlen1_falls_back_on_cancellation_and_multiquery(monkeypatch):
-    monkeypatch.setenv("KVARN_FUSED_DECODE", "1")
-    builder, block_map = _make_kvarn_lifecycle_builder(
-        {0, 1}, sinks={0}, pool_size=4, metadata_lifecycle="incremental_qlen1"
-    )
-    flush_calls = []
-    try:
-        _run_kvarn_lifecycle_build(
-            builder,
-            [[0, 1]],
-            [130],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-            request_ids=["cancelled"],
-            row_versions=[1],
-        )
-        metadata = _run_kvarn_lifecycle_build(
-            builder,
-            [[0, 1]],
-            [132],
-            [2],
-            num_decodes=1,
-            flush_calls=flush_calls,
-            request_ids=["cancelled"],
-            row_versions=[1],
-        )
-        assert metadata.has_cached_multiquery
-        assert builder._metadata_lifecycle_counters["full_builds"] == 2
-
-        _run_kvarn_lifecycle_build(
-            builder,
-            [],
-            [],
-            [],
-            num_decodes=0,
-            flush_calls=flush_calls,
-            request_ids=[],
-            row_versions=[],
-        )
-        assert set(block_map) == {0}
-        assert builder._retired_sinks == {0: None}
-        assert builder._metadata_lifecycle_counters == {
-            "incremental_hits": 0,
-            "full_builds": 3,
-        }
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_decode_cohort_builder_flushes_ragged_b4_shared_prefix_once(monkeypatch):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "4")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "0")
-    monkeypatch.setenv("KVARN_DECODE_FLUSH_SCOPE", "batch_cohort")
-    rows = [
-        [0, 1, 2, 100, 101, 102, 103],
-        [0, 1, 2, 200, 201, 202],
-        [0, 1, 2, 300, 301],
-        [0, 1, 2, 400],
-    ]
-    current = {103, 202, 301, 400}
-    resident = {0, 1, 2, 100, 101, 102, 200, 201, 300}
-    builder, block_to_slot = _make_kvarn_lifecycle_builder(
-        resident, sinks={0}, pool_size=len(resident) + 4
-    )
-    flush_calls = []
-    try:
-        seq_lens = [(len(row) - 1) * 128 + 1 for row in rows]
-        with patch(
-            "vllm.v1.attention.backends.kvarn_attn.logger.info_once"
-        ) as info_once:
-            _run_kvarn_lifecycle_build(
-                builder,
-                rows,
-                seq_lens,
-                [1] * 4,
-                num_decodes=4,
-                flush_calls=flush_calls,
-            )
-
-        assert flush_calls == [[102, 101, 100, 2, 1, 201, 200, 300]]
-        assert set(block_to_slot) == {0} | current
-        marker_calls = [
-            call
-            for call in info_once.call_args_list
-            if call.args[0].startswith("[KVARN_DECODE_FLUSH_BATCH]")
-        ]
-        assert len(marker_calls) == 1
-        assert marker_calls[0].args == (
-            (
-                "[KVARN_DECODE_FLUSH_BATCH] scope=%s; high_water=%d; "
-                "low_water=%d; triggering_rows=%d; flushed_rows=%d; "
-                "flushed_pages=%d"
-            ),
-            "batch_cohort",
-            4,
-            0,
-            1,
-            4,
-            8,
-        )
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
 def test_decode_cohort_builder_preserves_shared_multiquery_prefix(monkeypatch):
     monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
     monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "4")
@@ -6114,253 +3893,6 @@ def test_decode_cohort_builder_flushes_before_capacity_and_reclaims_completion(
         assert set(block_to_slot) == sinks
         assert builder._retired_sinks == dict.fromkeys(sinks)
         assert len(KVarNAttentionImpl._free_slots[builder._group_key]) == 20
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_decode_window_builder_preserves_shared_prefix_for_mixed_b4_crossing(
-    monkeypatch,
-):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "20")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "16")
-    shared = list(range(1, 17))
-    private = [
-        list(range(100, 121)),
-        list(range(200, 221)),
-        list(range(300, 302)),
-        list(range(400, 402)),
-    ]
-    current = [121, 221, 302, 402]
-    rows = [[0, *shared, *suffix, tail] for suffix, tail in zip(private, current)]
-    resident = {0, *shared, *(bid for suffix in private for bid in suffix)}
-    builder, block_to_slot = _make_kvarn_lifecycle_builder(
-        resident, sinks={0}, pool_size=len(resident) + 4
-    )
-    flush_calls = []
-    try:
-        seq_lens = [(len(row) - 1) * 128 + 1 for row in rows]
-        _run_kvarn_lifecycle_build(
-            builder,
-            rows,
-            seq_lens,
-            [1] * 4,
-            num_decodes=4,
-            flush_calls=flush_calls,
-        )
-
-        assert flush_calls == [[104, 103, 102, 101, 100, 204, 203, 202, 201, 200]]
-        assert set(shared) <= block_to_slot.keys()
-        assert set(current) <= block_to_slot.keys()
-        assert not ({*range(100, 105), *range(200, 205)} & block_to_slot.keys())
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_decode_window_builder_survives_two_cycles_then_reclaims_completion(
-    monkeypatch,
-):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "20")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "16")
-    builder, block_to_slot = _make_kvarn_lifecycle_builder(
-        set(range(22)), sinks={0}, pool_size=24
-    )
-    row = list(range(28))
-    flush_calls = []
-    try:
-        _run_kvarn_lifecycle_build(
-            builder,
-            [row],
-            [22 * 128 + 1],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-        )
-        for full_bid in range(22, 27):
-            _run_kvarn_lifecycle_build(
-                builder,
-                [row],
-                [(full_bid + 1) * 128],
-                [1],
-                num_decodes=1,
-                flush_calls=flush_calls,
-            )
-            _run_kvarn_lifecycle_build(
-                builder,
-                [row],
-                [(full_bid + 1) * 128 + 1],
-                [1],
-                num_decodes=1,
-                flush_calls=flush_calls,
-            )
-
-        assert flush_calls[:2] == [list(range(5, 0, -1)), list(range(10, 5, -1))]
-        assert set(block_to_slot) == {0, *range(11, 28)}
-
-        _run_kvarn_lifecycle_build(
-            builder,
-            [],
-            [],
-            [],
-            num_decodes=0,
-            flush_calls=flush_calls,
-        )
-
-        assert set(flush_calls[-1]) == set(range(11, 27))
-        assert block_to_slot == {0: block_to_slot[0]}
-        assert builder._retired_sinks == {0: None}
-        assert len(KVarNAttentionImpl._free_slots[builder._group_key]) == 23
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-@pytest.mark.parametrize("high_water", [4, 8])
-def test_decode_window_builder_low_zero_batches_two_cycles_then_reclaims(
-    monkeypatch, high_water
-):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", str(high_water))
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "0")
-    initial_tail = high_water + 2
-    final_tail = 2 * high_water + 3
-    builder, block_to_slot = _make_kvarn_lifecycle_builder(
-        set(range(initial_tail)), sinks={0}, pool_size=initial_tail
-    )
-    row = list(range(final_tail + 1))
-    flush_calls = []
-    try:
-        _run_kvarn_lifecycle_build(
-            builder,
-            [row],
-            [initial_tail * 128 + 1],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-        )
-        assert flush_calls == [list(range(high_water + 1, 0, -1))]
-        assert set(block_to_slot) == {0, initial_tail}
-
-        for full_bid in range(initial_tail, final_tail):
-            _run_kvarn_lifecycle_build(
-                builder,
-                [row],
-                [(full_bid + 1) * 128],
-                [1],
-                num_decodes=1,
-                flush_calls=flush_calls,
-            )
-            _run_kvarn_lifecycle_build(
-                builder,
-                [row],
-                [(full_bid + 1) * 128 + 1],
-                [1],
-                num_decodes=1,
-                flush_calls=flush_calls,
-            )
-
-        assert flush_calls[:2] == [
-            list(range(high_water + 1, 0, -1)),
-            list(range(final_tail - 1, initial_tail - 1, -1)),
-        ]
-        assert set(block_to_slot) == {0, final_tail}
-
-        _run_kvarn_lifecycle_build(
-            builder,
-            [],
-            [],
-            [],
-            num_decodes=0,
-            flush_calls=flush_calls,
-        )
-
-        assert block_to_slot == {0: block_to_slot[0]}
-        assert builder._retired_sinks == {0: None}
-        free_slots = KVarNAttentionImpl._free_slots[builder._group_key]
-        assert len(free_slots) == initial_tail - 1
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-@pytest.mark.parametrize(("query_len", "num_decodes"), [(4, 1), (256, 0)])
-def test_decode_retention_transitions_to_multiquery_flush_policy(
-    monkeypatch, query_len, num_decodes
-):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "20")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "16")
-    builder, block_to_slot = _make_kvarn_lifecycle_builder(
-        set(range(19)), sinks={0}, pool_size=24
-    )
-    row = list(range(22))
-    flush_calls = []
-    try:
-        _run_kvarn_lifecycle_build(
-            builder,
-            [row],
-            [19 * 128 + 1],
-            [1],
-            num_decodes=1,
-            flush_calls=flush_calls,
-        )
-        assert flush_calls == []
-
-        metadata = _run_kvarn_lifecycle_build(
-            builder,
-            [row],
-            [19 * 128 + 1 + query_len],
-            [query_len],
-            num_decodes=num_decodes,
-            flush_calls=flush_calls,
-        )
-
-        assert flush_calls == [[2, 1]]
-        assert not ({1, 2} & block_to_slot.keys())
-        assert set(range(3, 20)) <= block_to_slot.keys()
-        assert metadata.has_cached_multiquery
-        assert metadata.vq_qlen == (4 if num_decodes else 0)
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_decode_window_builder_flushes_before_exact_capacity_b4_allocation(
-    monkeypatch,
-):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "20")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "16")
-    rows = []
-    resident = set()
-    sinks = set()
-    current = set()
-    expected_flush = set()
-    for batch_index in range(4):
-        base = batch_index * 100
-        sinks.add(base)
-        resident.update(range(base, base + 22))
-        current.add(base + 22)
-        expected_flush.update(range(base + 1, base + 6))
-        rows.append(list(range(base, base + 23)))
-    builder, block_to_slot = _make_kvarn_lifecycle_builder(
-        resident, sinks=sinks, pool_size=len(resident)
-    )
-    flush_calls = []
-    try:
-        _run_kvarn_lifecycle_build(
-            builder,
-            rows,
-            [22 * 128 + 1] * 4,
-            [1] * 4,
-            num_decodes=4,
-            flush_calls=flush_calls,
-        )
-
-        assert len(flush_calls) == 1
-        assert set(flush_calls[0]) == expected_flush
-        assert not (expected_flush & block_to_slot.keys())
-        assert current <= block_to_slot.keys()
-        assert len(block_to_slot) == 72
-        assert len(KVarNAttentionImpl._free_slots[builder._group_key]) == 16
     finally:
         KVarNAttentionImpl.reset_process_state()
 

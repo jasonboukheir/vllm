@@ -18,7 +18,6 @@ layer forwards in a step.
 from __future__ import annotations
 
 import functools
-import os
 from dataclasses import dataclass
 
 import torch
@@ -31,51 +30,21 @@ from vllm.utils.platform_utils import num_compute_units
 logger = init_logger(__name__)
 
 _KVARN_NATIVE_RECORD_BYTES = 35_072
-_KVARN_NATIVE_SPLIT_COUNTS = frozenset({1, 2, 4, 8, 16, 17, 24, 32})
 _KVARN_NATIVE_MAX_BATCH = 12
 KVARN_NATIVE_SPLIT_POLICY_FIXED = "fixed"
-KVARN_NATIVE_SPLIT_POLICY_B70_Q6 = "b70_q6"
-KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2 = "b70_q6_v2"
 KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1 = "b70_q6_id18_v1"
 _KVARN_NATIVE_SPLIT_POLICIES = frozenset(
-    {
-        KVARN_NATIVE_SPLIT_POLICY_FIXED,
-        KVARN_NATIVE_SPLIT_POLICY_B70_Q6,
-        KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2,
-        KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1,
-    }
+    {KVARN_NATIVE_SPLIT_POLICY_FIXED, KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1}
 )
-_KVARN_NATIVE_B70_Q6_POLICIES = frozenset(
-    {
-        KVARN_NATIVE_SPLIT_POLICY_B70_Q6,
-        KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2,
-        KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1,
-    }
-)
-# The B70 primitive factory sweeps showed that ID12 and its independently
-# selectable ID13 reducer variant prefer S=8 at 4K and 16K, but S=32 at
-# 65,023 tokens. Keep the lower-overhead S=8 schedule through 48 Ki tokens and
-# switch only above that conservative, deliberately late boundary. The
-# unmeasured crossover should
-# be retuned from matched service ABBA measurements rather than inferred more
-# aggressively from three points.
-_KVARN_NATIVE_B70_Q6_V2_B4_SPLIT32_AFTER = 48 * 1024
 KVARN_CACHE_LAYOUT_NATURAL = "natural"
 KVARN_CACHE_LAYOUT_XE2_DPAS = "xe2_dpas"
 _KVARN_CACHE_LAYOUTS = frozenset(
     {KVARN_CACHE_LAYOUT_NATURAL, KVARN_CACHE_LAYOUT_XE2_DPAS}
 )
 KVARN_FRONTEND_REFERENCE = "reference"
-KVARN_FRONTEND_QKV_SCATTER = "qkv_scatter"
-KVARN_FRONTEND_QKV_SCATTER_INLINE = "qkv_scatter_inline"
 KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM = "qkv_scatter_inline_current_stream"
 _KVARN_FRONTEND_VARIANTS = frozenset(
-    {
-        KVARN_FRONTEND_REFERENCE,
-        KVARN_FRONTEND_QKV_SCATTER,
-        KVARN_FRONTEND_QKV_SCATTER_INLINE,
-        KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
-    }
+    {KVARN_FRONTEND_REFERENCE, KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM}
 )
 KVARN_PREFILL_STORE_REFERENCE = "reference"
 KVARN_PREFILL_STORE_HADAMARD_SCATTER = "hadamard_scatter"
@@ -83,99 +52,13 @@ _KVARN_PREFILL_STORE_VARIANTS = frozenset(
     {KVARN_PREFILL_STORE_REFERENCE, KVARN_PREFILL_STORE_HADAMARD_SCATTER}
 )
 KVARN_NATIVE_KERNEL_BASELINE = 0
-KVARN_NATIVE_KERNEL_QK_I8U4 = 1
-KVARN_NATIVE_KERNEL_Q6_SCALAR = 2
-KVARN_NATIVE_KERNEL_Q8_VECTOR = 3
-KVARN_NATIVE_KERNEL_Q6_VECTOR = 4
-_KVARN_NATIVE_KERNEL_PAGE128_RESERVED = 5
-KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS = 6
-KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS = 7
-KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS = 8
-KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR = 9
-KVARN_NATIVE_KERNEL_Q6_MAIN_GRF128 = 10
-KVARN_NATIVE_KERNEL_Q6_SPLIT_REDUCER_SPECIALIZED = 11
-KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH = 12
-KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER = 13
-_KVARN_NATIVE_B70_Q6_V2_KERNEL_VARIANTS = frozenset(
-    {
-        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
-        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-    }
-)
-KVARN_NATIVE_KERNEL_Q6_SIMD_UNPACK = 14
-KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE = 15
-KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH = 16
-KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR = 17
 KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR = 18
-KVARN_NATIVE_KERNEL_Q6_PAGE_METADATA_CURSOR = 20
-KVARN_NATIVE_KERNEL_Q6_PAIRED_NIBBLE_HALF2 = 21
 _KVARN_NATIVE_KERNEL_VARIANTS = {
     "baseline": KVARN_NATIVE_KERNEL_BASELINE,
-    "qk_i8u4": KVARN_NATIVE_KERNEL_QK_I8U4,
-    "q6_scalar": KVARN_NATIVE_KERNEL_Q6_SCALAR,
-    "q8_vector": KVARN_NATIVE_KERNEL_Q8_VECTOR,
-    "q6_vector": KVARN_NATIVE_KERNEL_Q6_VECTOR,
-    "q6_cached_weights": KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS,
-    "q6_exact_rows": KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS,
-    "q6_cached_weights_exact_rows": KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS,
-    "q6_page_pair": KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR,
-    "q6_main_grf128": KVARN_NATIVE_KERNEL_Q6_MAIN_GRF128,
-    "q6_split_reducer_specialized": KVARN_NATIVE_KERNEL_Q6_SPLIT_REDUCER_SPECIALIZED,
-    "q6_next_page_prefetch": KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
-    "q6_next_page_prefetch_split_reducer": (
-        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER
-    ),
-    "q6_simd_unpack": KVARN_NATIVE_KERNEL_Q6_SIMD_UNPACK,
-    "q6_block_output_store": KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE,
-    "q6_current_half_v_prefetch": KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
-    "q6_page_record_cursor": KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
     "q6_prefetch_record_cursor": KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
-    "q6_page_metadata_cursor": KVARN_NATIVE_KERNEL_Q6_PAGE_METADATA_CURSOR,
-    "q6_paired_nibble_half2": KVARN_NATIVE_KERNEL_Q6_PAIRED_NIBBLE_HALF2,
 }
 _KVARN_NATIVE_DPAS_ONLY_KERNEL_VARIANTS = frozenset(
-    {
-        KVARN_NATIVE_KERNEL_QK_I8U4,
-        KVARN_NATIVE_KERNEL_Q6_SCALAR,
-        KVARN_NATIVE_KERNEL_Q8_VECTOR,
-        KVARN_NATIVE_KERNEL_Q6_VECTOR,
-        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS,
-        KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS,
-        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS,
-        KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR,
-        KVARN_NATIVE_KERNEL_Q6_MAIN_GRF128,
-        KVARN_NATIVE_KERNEL_Q6_SPLIT_REDUCER_SPECIALIZED,
-        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
-        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-        KVARN_NATIVE_KERNEL_Q6_SIMD_UNPACK,
-        KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE,
-        KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
-        KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
-        KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
-        KVARN_NATIVE_KERNEL_Q6_PAGE_METADATA_CURSOR,
-        KVARN_NATIVE_KERNEL_Q6_PAIRED_NIBBLE_HALF2,
-    }
-)
-_KVARN_NATIVE_Q6_KERNEL_VARIANTS = frozenset(
-    {
-        KVARN_NATIVE_KERNEL_Q6_SCALAR,
-        KVARN_NATIVE_KERNEL_Q6_VECTOR,
-        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS,
-        KVARN_NATIVE_KERNEL_Q6_EXACT_ROWS,
-        KVARN_NATIVE_KERNEL_Q6_CACHED_WEIGHTS_EXACT_ROWS,
-        KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR,
-        KVARN_NATIVE_KERNEL_Q6_MAIN_GRF128,
-        KVARN_NATIVE_KERNEL_Q6_SPLIT_REDUCER_SPECIALIZED,
-        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
-        KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-        KVARN_NATIVE_KERNEL_Q6_SIMD_UNPACK,
-        KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE,
-        KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
-        KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
-        KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
-        KVARN_NATIVE_KERNEL_Q6_PAGE_METADATA_CURSOR,
-        KVARN_NATIVE_KERNEL_Q6_PAIRED_NIBBLE_HALF2,
-    }
+    {KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR}
 )
 _KVARN_NATIVE_IMPLEMENTED_KERNEL_VARIANTS = frozenset(
     _KVARN_NATIVE_KERNEL_VARIANTS.values()
@@ -184,65 +67,29 @@ _KVARN_NATIVE_IMPLEMENTED_KERNEL_VARIANTS = frozenset(
 
 def _kvarn_native_work_unit_tokens(kernel_variant: int) -> int:
     """Return the C++ decoder's scheduling granularity for one variant."""
-    if kernel_variant == _KVARN_NATIVE_KERNEL_PAGE128_RESERVED:
-        raise ValueError("KVarN kernel variant 5 is reserved and cannot be selected")
     if kernel_variant not in _KVARN_NATIVE_IMPLEMENTED_KERNEL_VARIANTS:
         raise ValueError(f"unknown KVarN native kernel variant: {kernel_variant}")
-    return 128 if kernel_variant == KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR else 64
+    return 64
 
 
 def _kvarn_native_master_enabled() -> bool:
-    """Return the platform-aware native KVarN master selection."""
-    native_default = "1" if current_platform.is_xpu() else "0"
-    return os.environ.get("KVARN_NATIVE_XPU", native_default) == "1"
+    """Return whether the qualified native KVarN platform is active."""
+    return current_platform.is_xpu()
 
 
 def kvarn_native_feature_enabled(feature: str) -> bool:
-    """Return whether a native KVarN XPU sub-feature is enabled.
-
-    Native dispatch is the XPU beta default. ``KVARN_NATIVE_XPU=0`` disables it
-    for rollback or comparison; individual sub-features can also be disabled.
-    Unsupported shapes and missing custom ops still fall back to Triton.
-    """
-    return (
-        _kvarn_native_master_enabled()
-        and os.environ.get(f"KVARN_NATIVE_XPU_{feature}", "1") == "1"
-    )
+    """Return whether native KVarN is enabled on the qualified platform."""
+    del feature
+    return _kvarn_native_master_enabled()
 
 
 def kvarn_cache_layout_requested(
     default: str = KVARN_CACHE_LAYOUT_NATURAL,
 ) -> str:
-    """Resolve the process configuration to a named cache-layout ABI.
-
-    This is intended to be called once by ``KVarNAttentionImpl``. Hot paths
-    must consume the immutable selection stored on that implementation rather
-    than reading environment state again. The named selector leaves room for
-    future layout variants without conflating them with decoder-kernel choices.
-    """
-    named = os.environ.get("KVARN_NATIVE_XPU_CACHE_LAYOUT")
-    legacy = os.environ.get("KVARN_NATIVE_XPU_DPAS_LAYOUT")
-    if named is None:
-        if legacy not in (None, "0", "1"):
-            raise ValueError("KVARN_NATIVE_XPU_DPAS_LAYOUT must be 0 or 1")
-        if legacy is None:
-            return default
-        return (
-            KVARN_CACHE_LAYOUT_XE2_DPAS if legacy == "1" else KVARN_CACHE_LAYOUT_NATURAL
-        )
-    if named not in _KVARN_CACHE_LAYOUTS:
-        choices = ", ".join(sorted(_KVARN_CACHE_LAYOUTS))
-        raise ValueError(f"KVARN_NATIVE_XPU_CACHE_LAYOUT must be one of: {choices}")
-    if legacy is not None:
-        legacy_layout = (
-            KVARN_CACHE_LAYOUT_XE2_DPAS if legacy == "1" else KVARN_CACHE_LAYOUT_NATURAL
-        )
-        if legacy not in ("0", "1") or legacy_layout != named:
-            raise ValueError(
-                "KVARN_NATIVE_XPU_CACHE_LAYOUT conflicts with "
-                "KVARN_NATIVE_XPU_DPAS_LAYOUT"
-            )
-    return named
+    """Return the layout selected by the supported-profile qualification."""
+    if default not in _KVARN_CACHE_LAYOUTS:
+        raise ValueError(f"unknown KVarN cache layout: {default}")
+    return default
 
 
 def kvarn_dpas_layout_requested() -> bool:
@@ -253,23 +100,19 @@ def kvarn_dpas_layout_requested() -> bool:
 def kvarn_frontend_variant_requested(
     default: str = KVARN_FRONTEND_REFERENCE,
 ) -> str:
-    """Resolve the immutable Q/K/V transform/store frontend selection."""
-    variant = os.environ.get("KVARN_NATIVE_XPU_FRONTEND", default)
-    if variant not in _KVARN_FRONTEND_VARIANTS:
-        choices = ", ".join(sorted(_KVARN_FRONTEND_VARIANTS))
-        raise ValueError(f"KVARN_NATIVE_XPU_FRONTEND must be one of: {choices}")
-    return variant
+    """Return the frontend selected by the supported-profile qualification."""
+    if default not in _KVARN_FRONTEND_VARIANTS:
+        raise ValueError(f"unknown KVarN frontend: {default}")
+    return default
 
 
 def kvarn_prefill_store_variant_requested(
     default: str = KVARN_PREFILL_STORE_REFERENCE,
 ) -> str:
-    """Resolve the immutable multi-token K/V prefill-store selection."""
-    variant = os.environ.get("KVARN_NATIVE_XPU_PREFILL_STORE", default)
-    if variant not in _KVARN_PREFILL_STORE_VARIANTS:
-        choices = ", ".join(sorted(_KVARN_PREFILL_STORE_VARIANTS))
-        raise ValueError("KVARN_NATIVE_XPU_PREFILL_STORE must be one of: " + choices)
-    return variant
+    """Return the prefill store selected by the supported-profile qualification."""
+    if default not in _KVARN_PREFILL_STORE_VARIANTS:
+        raise ValueError(f"unknown KVarN prefill store: {default}")
+    return default
 
 
 def _require_kvarn_dpas_reader(dpas_layout: bool, selected: bool, reader: str) -> None:
@@ -302,43 +145,18 @@ def _kvarn_dpas_layout_for_problem(
 def kvarn_native_split_policy_requested(
     default: str = KVARN_NATIVE_SPLIT_POLICY_FIXED,
 ) -> tuple[str, int]:
-    """Resolve the split policy and scratch capacity once per engine."""
-    policy = os.environ.get("KVARN_NATIVE_XPU_SPLIT_POLICY", default)
-    if policy not in _KVARN_NATIVE_SPLIT_POLICIES:
-        choices = ", ".join(sorted(_KVARN_NATIVE_SPLIT_POLICIES))
-        raise ValueError(f"KVARN_NATIVE_XPU_SPLIT_POLICY must be one of: {choices}")
-    if policy in _KVARN_NATIVE_B70_Q6_POLICIES:
-        if "KVARN_NATIVE_XPU_SPLITS" in os.environ:
-            raise ValueError(
-                "KVARN_NATIVE_XPU_SPLITS conflicts with "
-                f"KVARN_NATIVE_XPU_SPLIT_POLICY={policy}"
-            )
-        return policy, 32
-
-    text = os.environ.get("KVARN_NATIVE_XPU_SPLITS", "16")
-    try:
-        splits = int(text)
-    except ValueError as exc:
-        raise ValueError(
-            "KVARN_NATIVE_XPU_SPLITS must be one of 1, 2, 4, 8, 16, 17, 24, or 32"
-        ) from exc
-    if splits not in _KVARN_NATIVE_SPLIT_COUNTS:
-        raise ValueError(
-            "KVARN_NATIVE_XPU_SPLITS must be one of 1, 2, 4, 8, 16, 17, 24, or 32"
-        )
-    return policy, splits
+    """Return the qualified split policy and its scratch capacity."""
+    if default not in _KVARN_NATIVE_SPLIT_POLICIES:
+        raise ValueError(f"unknown KVarN native split policy: {default}")
+    return default, 32 if default == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1 else 16
 
 
 def kvarn_native_kernel_variant_requested(default: str = "baseline") -> tuple[str, int]:
-    """Resolve the native implementation independently from cache layout."""
-    name = os.environ.get("KVARN_NATIVE_XPU_KERNEL_VARIANT", default)
+    """Return the native implementation selected by qualification."""
     try:
-        return name, _KVARN_NATIVE_KERNEL_VARIANTS[name]
+        return default, _KVARN_NATIVE_KERNEL_VARIANTS[default]
     except KeyError as exc:
-        choices = ", ".join(sorted(_KVARN_NATIVE_KERNEL_VARIANTS))
-        raise ValueError(
-            f"KVARN_NATIVE_XPU_KERNEL_VARIANT must be one of: {choices}"
-        ) from exc
+        raise ValueError(f"unknown KVarN native kernel variant: {default}") from exc
 
 
 def validate_kvarn_native_factory_selection(
@@ -348,8 +166,6 @@ def validate_kvarn_native_factory_selection(
     split_policy: str = KVARN_NATIVE_SPLIT_POLICY_FIXED,
 ) -> None:
     """Fail before cache allocation when a kernel/layout ABI is incompatible."""
-    if kernel_variant == _KVARN_NATIVE_KERNEL_PAGE128_RESERVED:
-        raise ValueError("KVarN kernel variant 5 is reserved and cannot be selected")
     registered_variant = _KVARN_NATIVE_KERNEL_VARIANTS.get(kernel_variant_name)
     if registered_variant != kernel_variant:
         raise ValueError(
@@ -362,22 +178,7 @@ def validate_kvarn_native_factory_selection(
     ):
         raise ValueError(
             f"KVarN kernel variant {kernel_variant_name!r} requires "
-            f"KVARN_NATIVE_XPU_CACHE_LAYOUT={KVARN_CACHE_LAYOUT_XE2_DPAS}"
-        )
-    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES and (
-        kernel_variant not in _KVARN_NATIVE_Q6_KERNEL_VARIANTS
-    ):
-        raise ValueError(
-            f"KVarN split policy {split_policy!r} requires a Q6 kernel variant"
-        )
-    if (
-        split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2
-        and kernel_variant not in _KVARN_NATIVE_B70_Q6_V2_KERNEL_VARIANTS
-    ):
-        raise ValueError(
-            "KVarN split policy 'b70_q6_v2' requires kernel variant "
-            "'q6_next_page_prefetch'(12) or "
-            "'q6_next_page_prefetch_split_reducer'(13)"
+            f"cache layout {KVARN_CACHE_LAYOUT_XE2_DPAS!r}"
         )
     if (
         split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1
@@ -398,7 +199,7 @@ def _kvarn_native_split_count_cached(
     kernel_variant: int,
 ) -> int:
     splits = max_splits
-    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES:
+    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1:
         if not 1 <= batch_size <= _KVARN_NATIVE_MAX_BATCH:
             raise ValueError(
                 f"{split_policy} split policy supports batch sizes 1 through 12"
@@ -410,15 +211,7 @@ def _kvarn_native_split_count_cached(
         elif batch_size == 3:
             splits = 8
         elif batch_size == 4:
-            if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1:
-                splits = 24
-            elif (
-                split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_V2
-                and max_seq_len > _KVARN_NATIVE_B70_Q6_V2_B4_SPLIT32_AFTER
-            ):
-                splits = 32
-            else:
-                splits = 8
+            splits = 24
         elif batch_size <= 8:
             splits = 4
         else:
@@ -456,7 +249,7 @@ def kvarn_native_split_count(
         split_policy = KVARN_NATIVE_SPLIT_POLICY_FIXED
     if split_policy not in _KVARN_NATIVE_SPLIT_POLICIES:
         raise ValueError(f"unknown KVarN native split policy: {split_policy}")
-    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES and max_splits != 32:
+    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1 and max_splits != 32:
         raise ValueError(f"{split_policy} split policy requires max_splits=32")
     return _kvarn_native_split_count_cached(
         max_seq_len, max_splits, batch_size, split_policy, kernel_variant
@@ -471,7 +264,7 @@ def kvarn_native_split_scratch_count(
 ) -> int:
     """Return persistent scratch capacity for the engine-lifetime policy."""
     _kvarn_native_work_unit_tokens(kernel_variant)
-    if split_policy in _KVARN_NATIVE_B70_Q6_POLICIES:
+    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1:
         if max_splits != 32:
             raise ValueError(f"{split_policy} split policy requires max_splits=32")
         return max_splits
@@ -696,19 +489,6 @@ def kvarn_native_prefill_store_supported(
     )
 
 
-@functools.lru_cache(maxsize=256)
-def kvarn_native_layer_selected(layer_name: str, layer_filter: str) -> bool:
-    """Match comma-separated layer paths on dot-component boundaries."""
-    if not layer_filter:
-        return True
-    dotted_name = f".{layer_name.strip('.')}."
-    return any(
-        f".{candidate.strip().strip('.')}." in dotted_name
-        for candidate in layer_filter.split(",")
-        if candidate.strip()
-    )
-
-
 @dataclass(frozen=True)
 class KVarNTrustedNativeDecodePlan:
     """Engine-lifetime native decode facts proven by the inline frontend."""
@@ -756,7 +536,7 @@ def build_kvarn_trusted_native_decode_plan(
     num_kv_heads = kv_cache.shape[1]
     group = cfg.group
     try:
-        _kvarn_dpas_layout_for_problem(
+        dpas_layout = _kvarn_dpas_layout_for_problem(
             impl._kvarn_dpas_layout,
             head_dim,
             group,
@@ -789,7 +569,10 @@ def build_kvarn_trusted_native_decode_plan(
         query.device.type == "xpu" and torch.xpu.is_current_stream_capturing()
     )
     native_supported = (
-        kvarn_native_feature_enabled("DECODE")
+        dpas_layout
+        and getattr(impl, "_kvarn_native_kernel_variant", None)
+        == KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR
+        and kvarn_native_feature_enabled("DECODE")
         and kvarn_native_problem_supported(
             device_type=query.device.type,
             batch_size=batch_size,
@@ -804,10 +587,6 @@ def build_kvarn_trusted_native_decode_plan(
             has_lookup=True,
             has_tail_pool=True,
             is_capturing=is_capturing,
-        )
-        and kvarn_native_layer_selected(
-            getattr(impl, "layer_name", ""),
-            os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
         )
         and kv_cache.shape[-1] == cfg.record_bytes
         and kv_cache.is_contiguous()
@@ -870,7 +649,6 @@ def build_kvarn_trusted_native_decode_plan(
 # Number of KV-sequence splits for the split-K flash-decoding kernel. More
 # splits = better load-balancing of ragged burst seqlens across SMs, at the cost
 # of a larger fp32 partial-output scratch + more stage-2 combine work.
-KVARN_NUM_KV_SPLITS = int(os.environ.get("KVARN_NUM_KV_SPLITS", "16"))
 KVARN_MAX_KV_SPLITS = 64  # cap of the context-adaptive schedule below
 
 # Shared autotune space for the decode kernels (single-token, split-K stage1,
@@ -908,10 +686,7 @@ def adaptive_num_kv_splits(max_blocks_per_req: int) -> int:
     decode microbench (Qwen3-4B, ctx 4.6K) measured 37us at 16 vs ~27us at 32,
     a ~28% stage-1 win, growing at longer ctx (16K: 82->49us). Split-K is
     log-sum-exp-combined, so the count never changes the OUTPUT, only occupancy;
-    32 is the floor up to 256 blocks. KVARN_NUM_KV_SPLITS overrides."""
-    env = os.environ.get("KVARN_NUM_KV_SPLITS")
-    if env is not None:
-        return int(env)
+    32 is the floor up to 256 blocks."""
     if max_blocks_per_req <= 256:
         return 32
     return KVARN_MAX_KV_SPLITS
@@ -1708,6 +1483,11 @@ def _kvarn_bound_native_decode_attention_v2(
     plan: KVarNBoundNativeDecodePlanV2,
 ) -> torch.Tensor:
     """Launch Variant H using only its immutable native bindings."""
+    if (
+        not plan.dpas_layout
+        or plan.kernel_variant != KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR
+    ):
+        raise RuntimeError("bound KVarN native decode requires Xe2 DPAS kernel ID18")
     B, Hq, D = query.shape
     if not 1 <= B <= plan.max_batch:
         raise RuntimeError("bound KVarN inline decode batch exceeds its proof")
@@ -1852,12 +1632,11 @@ def kvarn_decode_attention(
         is_capturing = (
             query.device.type == "xpu" and torch.xpu.is_current_stream_capturing()
         )
-        native_layer_selected = kvarn_native_layer_selected(
-            getattr(impl, "layer_name", ""),
-            os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
-        )
         use_native_xpu = (
-            kvarn_native_feature_enabled("DECODE")
+            dpas_layout
+            and impl._kvarn_native_kernel_variant
+            == KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR
+            and kvarn_native_feature_enabled("DECODE")
             and kvarn_native_problem_supported(
                 device_type=query.device.type,
                 batch_size=B,
@@ -1875,7 +1654,6 @@ def kvarn_decode_attention(
                 ),
                 is_capturing=is_capturing,
             )
-            and native_layer_selected
             and kv_cache.shape[-1] == cfg.record_bytes
             and kv_cache.is_contiguous()
             and md.block_table[:B].is_contiguous()
@@ -2033,7 +1811,8 @@ def kvarn_decode_attention(
                 out_unrot = torch.mm(output_rot.reshape(N, D), H16)
             return out_unrot.view(B, Hq, D)
 
-    # 2+3. Attention. Two paths (KVARN_FUSED_DECODE, default fused):
+    # 2+3. Attention. The generic fallback reads int4/pool directly and
+    # dequantizes in registers without materializing fp16 K/V to HBM.
     #   FUSED      — one kernel reads int4/pool directly, dequants in registers,
     #                online-softmax; never materializes fp16 K/V to HBM. Moves
     #                ~0.25x FP16 KV traffic for the bulk history → the only path
@@ -2041,7 +1820,7 @@ def kvarn_decode_attention(
     #   MATERIALIZE — build packed fp16 K/V then stock FlashAttention (≥2.25x
     #                FP16 KV traffic; kept for A/B and as a fallback).
     max_blocks_per_req = md.fa_max_blocks_per_req
-    use_fused = os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
+    use_fused = True
     # Both the single-stage kernel and stage1 are @triton.autotune'd over
     # BLOCK_N/num_warps (keyed on D/GROUP/Q_PER_KV/K_BITS/V_BITS) — no
     # BLOCK_N/num_warps/num_stages passed at the launch sites.
@@ -2069,12 +1848,6 @@ def kvarn_decode_attention(
         V_ZP_OFFSET=cfg.v_zp_offset,
         VQ_INDIRECT=False,
     )
-    # SPLIT-K (KVARN_SPLIT_K=1): two-stage flash-decoding — only a win in the
-    # LOW-batch / long-context regime (few programs ⇒ the KV-split dim adds the
-    # missing parallelism). At BURST (high batch) the single-stage (B,Hk) grid
-    # already saturates the GPU, so split-K's mid-buffer round-trip + stage-2 +
-    # empty-split waste roughly HALVE throughput. Default: single-stage.
-    use_fused = use_fused and True
     # Split-K decision. Single-stage grid is (B, Hk) programs, each serially
     # walking the WHOLE context; at long context that serial loop dominates and
     # leaves the GPU under-occupied -> split-K parallelizes the KV dim for a big
@@ -2082,29 +1855,22 @@ def kvarn_decode_attention(
     # out-throughput FP16's max feasible batch). But at short context / high
     # occupancy the mid-buffer round-trip + stage-2 + empty-split waste roughly
     # HALVE throughput. So auto-enable only in the long-context, under-occupied
-    # regime; KVARN_SPLIT_K env (0/1) is an explicit override.
+    # regime.
     # The split-K mid buffers are sized for the pure-decode regime
     # (max_num_seqs * Hq rows); never split if this batch would overflow them
     # (defensive — real decode batches always fit, but a padded dummy run can
     # be wider). The single-stage kernel handles any batch size.
     _mid_fits = impl._mid_o_buf is not None and impl._mid_o_buf.shape[0] >= N
-    _sk_env = os.environ.get("KVARN_SPLIT_K")
-    if _sk_env is not None:
-        split_k = use_fused and _sk_env == "1" and _mid_fits
-    else:
-        compute_units = num_compute_units(device.index or 0)
-        # long context (>= ~16 blocks of group tokens) AND single-stage grid does
-        # not already fill the SMs.
-        # Sliding-window layers read only ~window/GROUP blocks (single-stage is
-        # plenty + the windowed loop is in the single-stage kernel), so never split.
-        _sw = int(getattr(impl, "sliding_window", 0) or 0)
-        split_k = (
-            use_fused
-            and (_sw <= 0)
-            and (max_blocks_per_req >= 16)
-            and (B * Hk <= compute_units)
-            and _mid_fits
-        )
+    compute_units = num_compute_units(device.index or 0)
+    # Sliding-window layers read only ~window/GROUP blocks, so never split.
+    _sw = int(getattr(impl, "sliding_window", 0) or 0)
+    split_k = (
+        use_fused
+        and (_sw <= 0)
+        and (max_blocks_per_req >= 16)
+        and (B * Hk <= compute_units)
+        and _mid_fits
+    )
     _require_kvarn_dpas_reader(dpas_layout, not use_fused, "Triton fused decode")
     if use_fused and not split_k:
         fused_out = impl._fused_out_buf[:N]  # [N, D] fp16
@@ -2201,7 +1967,6 @@ def kvarn_decode_attention(
                 kvarn_native_feature_enabled("MATERIALIZE")
                 and query.device.type == "xpu"
                 and not is_capturing
-                and native_layer_selected
                 and Hk == 4
                 and D == 256
                 and group == 128
@@ -2364,75 +2129,6 @@ def kvarn_verify_attention(
 
     out_rot = torch.empty(NQ, Hq, D, dtype=torch.float16, device=device)
 
-    _m = qlen * (1 << ((Hq // Hk) - 1).bit_length() if Hq // Hk > 1 else 1)
-    if (
-        qlen >= 2
-        and seq_lens is not None
-        and NQ % qlen == 0
-        and (_m & (_m - 1)) == 0  # Q-tile rows must be a power of 2
-        # DEFAULT OFF: numerically validated in isolation (matches the
-        # per-token kernel within fp32 reduction noise on live inputs,
-        # incl. on the failing trajectory), but serving with it corrupts
-        # the MTP drafter's proposals (invalid [-1,...] spec tokens,
-        # embedding index asserts at temperature>0, degenerate greedy
-        # output) through a mechanism not yet isolated — suspicion is an
-        # interaction with async scheduling / drafter metadata rather
-        # than kernel math. Re-enable for debugging only.
-        and os.environ.get("KVARN_SHARED_VERIFY", "0") == "1"
-    ):
-        # SHARED-DEQUANT uniform path: split-K shaped (SPLITS=1 degenerates
-        # cleanly); stage2 combines into the flat [NQ*Hq, D] output.
-        B = NQ // qlen
-        SPLITS = (
-            adaptive_num_kv_splits(max_ctx_blocks)
-            if max_ctx_blocks >= 16 and B * Hk <= num_compute_units(device.index or 0)
-            else 1
-        )
-        mid_o = torch.empty(Nrows, SPLITS, D, dtype=torch.float32, device=device)
-        mid_lse = torch.empty(Nrows, SPLITS, dtype=torch.float32, device=device)
-        _kvarn_fused_verify_stage1[(B, Hk, SPLITS)](
-            q_rot,
-            block_table,
-            vq_seqlen,
-            impl._block_to_slot_t,
-            kv_cache,
-            impl._tail_K_pool,
-            impl._tail_V_pool,
-            mid_o,
-            mid_lse,
-            scale,
-            Hq * D,
-            D,
-            block_table.stride(0),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            impl._tail_K_pool.stride(0),
-            impl._tail_K_pool.stride(1),
-            impl._tail_K_pool.stride(2),
-            mid_o.stride(0),
-            mid_o.stride(1),
-            mid_lse.stride(0),
-            QLEN=qlen,
-            HQ=Hq,
-            NUM_KV_SPLITS=SPLITS,
-            **common,
-        )
-        out_flat = out_rot.view(Nrows, D)
-        _kvarn_fused_decode_stage2[(Nrows,)](
-            mid_o,
-            mid_lse,
-            out_flat,
-            mid_o.stride(0),
-            mid_o.stride(1),
-            mid_lse.stride(0),
-            out_flat.stride(0),
-            D=D,
-            NUM_KV_SPLITS=SPLITS,
-            num_warps=2,
-        )
-        out_unrot = torch.mm(out_rot.reshape(Nrows, D), H16)
-        return out_unrot.view(NQ, Hq, D).to(out_dtype)
-
     common["VQ_INDIRECT"] = True
 
     # Split-K mirrors the decode driver's heuristic: long context with too few
@@ -2440,11 +2136,7 @@ def kvarn_verify_attention(
     # long-context verify nearly always wants the split.
     compute_units = num_compute_units(device.index or 0)
     _sw = int(getattr(impl, "sliding_window", 0) or 0)
-    _sk_env = os.environ.get("KVARN_SPLIT_K")
-    if _sk_env is not None:
-        split_k = _sk_env == "1"
-    else:
-        split_k = (_sw <= 0) and (max_ctx_blocks >= 16) and (NQ * Hk <= compute_units)
+    split_k = (_sw <= 0) and (max_ctx_blocks >= 16) and (NQ * Hk <= compute_units)
 
     if not split_k:
         _kvarn_fused_decode_kernel[(NQ, Hk)](
@@ -2517,221 +2209,3 @@ def kvarn_verify_attention(
 
     out_unrot = torch.mm(out_rot.reshape(Nrows, D), H16)
     return out_unrot.view(NQ, Hq, D).to(out_dtype)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SHARED-DEQUANT verify kernel: one program per (REQUEST, kv-head, split) — all
-# QLEN verify tokens of a request share each block's dequant (the per-token
-# VQ_INDIRECT path above re-walks the context once per token, i.e. QLEN
-# redundant dequants). Q tile is [QLEN * Q_PER_KV_PAD, D] with a per-row
-# bottom-right causal limit: row (token j, lane h) attends kv positions
-# < seq_len - QLEN + j + 1. Uniform QLEN is a constexpr (uniform-batch graph
-# capture guarantees it); non-uniform eager batches fall back to the per-token
-# kernel. Scale vectors are loaded via fp16 pointer casts (the tile offsets are
-# 2-byte aligned) instead of the byte-pair loads of the older kernels.
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-@triton.autotune(
-    configs=_DECODE_AUTOTUNE_CONFIGS,
-    key=["D", "GROUP", "Q_PER_KV", "QLEN", "K_BITS", "V_BITS"],
-)
-@triton.jit
-def _kvarn_fused_verify_stage1(
-    Q_ptr,  # [NQ = B*QLEN, Hq, D] fp16 (rotated, token-major)
-    Block_table_ptr,  # [B, max_blocks] int32
-    Seq_lens_ptr,  # [NQ] int32 — the vq plan (per-token causal lengths);
-    # the request's FULL length is its LAST token's entry.
-    # Built CPU-side in the builder: under async spec
-    # decode the device seq_lens tensor can disagree with
-    # the builder's CPU view, and the CPU view is the one
-    # the (validated) per-token path uses.
-    Block_to_slot_ptr,
-    KV_cache_ptr,
-    Tail_K_pool_ptr,
-    Tail_V_pool_ptr,
-    MidO_ptr,  # [NQ*Hq, NUM_KV_SPLITS, D] fp32
-    MidLse_ptr,  # [NQ*Hq, NUM_KV_SPLITS]    fp32
-    scale,
-    stride_q_t,
-    stride_q_h,
-    stride_bt_b,
-    stride_kv_b,
-    stride_kv_h,
-    stride_pool_b,
-    stride_pool_t,
-    stride_pool_h,
-    stride_mo_n,
-    stride_mo_s,
-    stride_ml_n,
-    MAX_BLOCKS_PER_REQ: tl.constexpr,  # unused; kept for launch-dict parity
-    D: tl.constexpr,
-    GROUP: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    QLEN: tl.constexpr,
-    Q_PER_KV: tl.constexpr,
-    Q_PER_KV_PAD: tl.constexpr,
-    HQ: tl.constexpr,
-    NUM_KV_SPLITS: tl.constexpr,
-    SLIDING_WINDOW: tl.constexpr,
-    K_BITS: tl.constexpr,
-    V_BITS: tl.constexpr,
-    NUM_BLOCKS_LOOKUP: tl.constexpr,
-    K_PACKED_OFFSET: tl.constexpr,
-    K_S_COL_OFFSET: tl.constexpr,
-    K_ZP_OFFSET: tl.constexpr,
-    K_S_ROW_OFFSET: tl.constexpr,
-    V_PACKED_OFFSET: tl.constexpr,
-    V_S_COL_OFFSET: tl.constexpr,
-    V_S_ROW_OFFSET: tl.constexpr,
-    V_ZP_OFFSET: tl.constexpr,
-):
-    b = tl.program_id(0)
-    hk = tl.program_id(1)
-    split = tl.program_id(2)
-
-    seq_len = tl.load(Seq_lens_ptr + b * QLEN + (QLEN - 1))
-    # Padded rows (uniform-batch capture/replay) carry seq_len <= 0.
-    if seq_len <= 0:
-        return
-
-    M: tl.constexpr = QLEN * Q_PER_KV_PAD
-    r = tl.arange(0, M)
-    j = r // Q_PER_KV_PAD  # token idx in request
-    lane = r % Q_PER_KV_PAD  # query-head lane
-    rmask = lane < Q_PER_KV
-    limit = seq_len - QLEN + j + 1  # [M] causal kv limit
-    hq0 = hk * Q_PER_KV
-    d_offs = tl.arange(0, D)
-
-    PACK_K: tl.constexpr = 8 // K_BITS
-    PACK_V: tl.constexpr = 8 // V_BITS
-    MASK_K: tl.constexpr = (1 << K_BITS) - 1
-    MASK_V: tl.constexpr = (1 << V_BITS) - 1
-    d_byte_v = d_offs // PACK_V
-    d_shift_v = (d_offs % PACK_V) * V_BITS
-
-    tok_row = b * QLEN + j  # [M] token-major Q row
-    q = tl.load(
-        Q_ptr
-        + tok_row[:, None] * stride_q_t
-        + (hq0 + lane)[:, None] * stride_q_h
-        + d_offs[None, :],
-        mask=rmask[:, None],
-        other=0.0,
-    ).to(tl.float32)  # [M, D]
-
-    m_i = tl.full([M], -float("inf"), dtype=tl.float32)
-    l_i = tl.zeros([M], dtype=tl.float32)
-    acc = tl.zeros([M, D], dtype=tl.float32)
-
-    n_blocks = (seq_len + GROUP - 1) // GROUP
-    blocks_per_split = (n_blocks + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS
-    blk_lo = split * blocks_per_split
-    blk_hi = tl.minimum(blk_lo + blocks_per_split, n_blocks)
-
-    for k in range(blk_lo, blk_hi):
-        rem = seq_len - k * GROUP
-        n_tok = tl.minimum(tl.maximum(rem, 0), GROUP)
-        block_id = tl.load(Block_table_ptr + b * stride_bt_b + k)
-        in_range = (block_id >= 0) & (block_id < NUM_BLOCKS_LOOKUP)
-        safe_bid = tl.where(in_range, block_id, 0)
-        pool_slot = tl.load(Block_to_slot_ptr + safe_bid, mask=in_range, other=-1)
-        tile_base = block_id.to(tl.int64) * stride_kv_b + hk * stride_kv_h
-        safe_slot = tl.where(pool_slot >= 0, pool_slot, 0)
-        pool_base = safe_slot.to(tl.int64) * stride_pool_b + hk * stride_pool_h
-
-        # Per-channel scales — direct fp16 loads (2-byte-aligned offsets).
-        s_col_K = tl.load(
-            (KV_cache_ptr + tile_base + K_S_COL_OFFSET).to(tl.pointer_type(tl.float16))
-            + d_offs
-        ).to(tl.float32)
-        zp_K = tl.load(
-            (KV_cache_ptr + tile_base + K_ZP_OFFSET).to(tl.pointer_type(tl.float16))
-            + d_offs
-        ).to(tl.float32)
-        s_col_V = tl.load(
-            (KV_cache_ptr + tile_base + V_S_COL_OFFSET).to(tl.pointer_type(tl.float16))
-            + d_offs
-        ).to(tl.float32)
-
-        for c0 in range(0, GROUP, BLOCK_N):
-            cols = c0 + tl.arange(0, BLOCK_N)
-            cmask = cols < n_tok
-            kvpos = k * GROUP + cols  # [BN]
-
-            if pool_slot >= 0:
-                src = pool_base + cols[:, None] * stride_pool_t + d_offs[None, :]
-                Kc = tl.load(Tail_K_pool_ptr + src, mask=cmask[:, None], other=0.0).to(
-                    tl.float32
-                )  # [BN, D]
-                Vc = tl.load(Tail_V_pool_ptr + src, mask=cmask[:, None], other=0.0).to(
-                    tl.float32
-                )  # [BN, D]
-                K_dg = tl.trans(Kc)  # [D, BN]
-            else:
-                cb_k = cols // PACK_K
-                cs_k = (cols % PACK_K) * K_BITS
-                s_row_K = tl.load(
-                    (KV_cache_ptr + tile_base + K_S_ROW_OFFSET).to(
-                        tl.pointer_type(tl.float16)
-                    )
-                    + cols
-                ).to(tl.float32)
-                k_addrs = (
-                    tile_base
-                    + K_PACKED_OFFSET
-                    + d_offs[:, None] * (GROUP // PACK_K)
-                    + cb_k[None, :]
-                )
-                k_bytes = tl.load(KV_cache_ptr + k_addrs).to(tl.int32)
-                q_K = ((k_bytes >> cs_k[None, :]) & MASK_K).to(tl.float32)
-                K_dg = (q_K * s_col_K[:, None] + zp_K[:, None]) * s_row_K[None, :]
-                s_row_V = tl.load(
-                    (KV_cache_ptr + tile_base + V_S_ROW_OFFSET).to(
-                        tl.pointer_type(tl.float16)
-                    )
-                    + cols
-                ).to(tl.float32)
-                zp_V = tl.load(
-                    (KV_cache_ptr + tile_base + V_ZP_OFFSET).to(
-                        tl.pointer_type(tl.float16)
-                    )
-                    + cols
-                ).to(tl.float32)
-                v_addrs = (
-                    tile_base
-                    + V_PACKED_OFFSET
-                    + cols[:, None] * (D // PACK_V)
-                    + d_byte_v[None, :]
-                )
-                v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
-                q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
-                Vc = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[None, :]
-
-            scores = tl.dot(q, K_dg)  # [M, BN]
-            smask = cmask[None, :] & (kvpos[None, :] < limit[:, None])
-            if SLIDING_WINDOW > 0:
-                smask = smask & (
-                    kvpos[None, :] >= tl.maximum(limit[:, None] - SLIDING_WINDOW, 0)
-                )
-            scores = tl.where(smask, scores * scale, -float("inf"))
-            m_new = tl.maximum(m_i, tl.max(scores, axis=1))
-            p = tl.exp(scores - m_new[:, None])
-            alpha = tl.exp(m_i - m_new)
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            acc = acc * alpha[:, None] + tl.dot(p, Vc)
-            m_i = m_new
-
-    nonempty = l_i > 0
-    O_s = acc / tl.where(nonempty, l_i, 1.0)[:, None]
-    lse_s = tl.where(
-        nonempty, m_i + tl.log(tl.where(nonempty, l_i, 1.0)), -float("inf")
-    )
-    rows = tok_row * HQ + hq0 + lane  # [M] N-row index
-    tl.store(
-        MidO_ptr + rows[:, None] * stride_mo_n + split * stride_mo_s + d_offs[None, :],
-        O_s,
-        mask=rmask[:, None],
-    )
-    tl.store(MidLse_ptr + rows * stride_ml_n + split, lse_s, mask=rmask)

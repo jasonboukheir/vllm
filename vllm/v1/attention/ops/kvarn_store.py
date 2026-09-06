@@ -17,8 +17,6 @@ The output is a packed record matching the cache layout from
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 from vllm.model_executor.layers.quantization.kvarn.sinkhorn import (
@@ -27,18 +25,7 @@ from vllm.model_executor.layers.quantization.kvarn.sinkhorn import (
 
 
 def _rtn_range(t: torch.Tensor, dim: int):
-    """Per-row range. With KVARN_RTN_QUANTILE=q > 0 (e.g. 0.005), uses
-    percentiles [q, 1-q] instead of min/max — values outside get clamped at
-    quantize time, sacrificing outliers for finer bulk resolution. Critical
-    for k2v2 on models like Qwen3-30B-A3B-Thinking where K outliers
-    (max/std ≈ 6) waste 2-bit resolution.
-    """
-    q_str = os.environ.get("KVARN_RTN_QUANTILE", "")
-    if q_str and float(q_str) > 0:
-        q = float(q_str)
-        lo = torch.quantile(t, q, dim=dim, keepdim=True)
-        hi = torch.quantile(t, 1.0 - q, dim=dim, keepdim=True)
-        return lo, hi
+    """Per-row min/max range used by the qualified writer."""
     return t.amin(dim=dim, keepdim=True), t.amax(dim=dim, keepdim=True)
 
 

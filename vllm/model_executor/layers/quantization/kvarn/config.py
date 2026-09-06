@@ -38,10 +38,9 @@ KVARN_PRESETS: dict[str, dict] = {
 # context-independent memory bound and is included in tail-pool accounting.
 KVARN_PREFILL_FP16_WINDOW_BLOCKS_DEFAULT = 16
 
-# Decode flush batching is experimental. A nonzero window is its high-water
-# mark; the independent low-water mark defaults to zero so batching does not
-# retain the prefill correctness window during decode. Pool sizing depends on
-# the high-water mark because it bounds peak residency.
+# The generic profile flushes immediately; the XPU profile uses a four-block
+# high-water mark and flushes the batch cohort to zero. The high-water mark
+# bounds peak residency and is included in pool sizing.
 KVARN_DECODE_FP16_WINDOW_BLOCKS_DEFAULT = 0
 KVARN_DECODE_FP16_LOW_WATER_BLOCKS_DEFAULT = 0
 KVARN_DECODE_FLUSH_SCOPE_DEFAULT = "per_row"
@@ -49,81 +48,28 @@ KVARN_DECODE_FLUSH_SCOPES = frozenset({"per_row", "batch_cohort"})
 
 
 def kvarn_prefill_fp16_window_blocks() -> int:
-    """Return the bounded continuation-prefill fp16 history window."""
-    raw = os.environ.get(
-        "KVARN_PREFILL_FP16_WINDOW_BLOCKS",
-        str(KVARN_PREFILL_FP16_WINDOW_BLOCKS_DEFAULT),
-    )
-    try:
-        window = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "KVARN_PREFILL_FP16_WINDOW_BLOCKS must be a non-negative integer"
-        ) from exc
-    if window < 0:
-        raise ValueError(
-            "KVARN_PREFILL_FP16_WINDOW_BLOCKS must be a non-negative integer"
-        )
-    return window
+    """Return the qualified continuation-prefill fp16 history window."""
+    return KVARN_PREFILL_FP16_WINDOW_BLOCKS_DEFAULT
 
 
 def kvarn_decode_fp16_window_blocks(
     default: int = KVARN_DECODE_FP16_WINDOW_BLOCKS_DEFAULT,
 ) -> int:
-    """Return the bounded decode fp16 history high-water mark."""
-    raw = os.environ.get(
-        "KVARN_DECODE_FP16_WINDOW_BLOCKS",
-        str(default),
-    )
-    try:
-        window = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "KVARN_DECODE_FP16_WINDOW_BLOCKS must be a non-negative integer"
-        ) from exc
-    if window < 0:
-        raise ValueError(
-            "KVARN_DECODE_FP16_WINDOW_BLOCKS must be a non-negative integer"
-        )
-    return window
+    """Return the platform profile's fixed decode high-water mark."""
+    return default
 
 
 def kvarn_decode_fp16_low_water_blocks(
     high_water: int | None = None,
     default: int = KVARN_DECODE_FP16_LOW_WATER_BLOCKS_DEFAULT,
 ) -> int:
-    """Return the bounded decode fp16 history low-water mark."""
-    raw = os.environ.get(
-        "KVARN_DECODE_FP16_LOW_WATER_BLOCKS",
-        str(default),
-    )
-    try:
-        low_water = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "KVARN_DECODE_FP16_LOW_WATER_BLOCKS must be a non-negative integer"
-        ) from exc
-    if low_water < 0:
-        raise ValueError(
-            "KVARN_DECODE_FP16_LOW_WATER_BLOCKS must be a non-negative integer"
-        )
-    if high_water is None:
-        high_water = kvarn_decode_fp16_window_blocks()
-    if low_water > high_water:
-        raise ValueError(
-            "KVARN_DECODE_FP16_LOW_WATER_BLOCKS must not exceed "
-            "KVARN_DECODE_FP16_WINDOW_BLOCKS"
-        )
-    return low_water
+    """Return the platform profile's fixed decode low-water mark."""
+    return default
 
 
 def kvarn_decode_flush_scope(default: str = KVARN_DECODE_FLUSH_SCOPE_DEFAULT) -> str:
-    """Return the qlen=1 decode flush coordination scope."""
-    scope = os.environ.get("KVARN_DECODE_FLUSH_SCOPE", default).strip()
-    if scope not in KVARN_DECODE_FLUSH_SCOPES:
-        choices = ", ".join(sorted(KVARN_DECODE_FLUSH_SCOPES))
-        raise ValueError(f"KVARN_DECODE_FLUSH_SCOPE must be one of: {choices}")
-    return scope
+    """Return the platform profile's fixed flush coordination scope."""
+    return default
 
 
 @dataclass(frozen=True)
@@ -508,11 +454,8 @@ class KVarNConfig:
                 f"Unknown KVarN cache dtype: {cache_dtype!r}. Valid: {valid}"
             )
         preset = KVARN_PRESETS[cache_dtype]
-        # Optional env override for Sinkhorn iteration count (KVARN_SINKHORN_ITERS).
-        # Default 16 mirrors the paper; useful for testing convergence at large
-        # model scale (e.g. 48-layer 30B-A3B-Thinking-2507 may benefit from more).
-        iters = int(os.environ.get("KVARN_SINKHORN_ITERS", "8"))
-        sink_tokens = int(os.environ.get("KVARN_SINK_TOKENS", "128"))
+        iters = 8
+        sink_tokens = 128
         return KVarNConfig(
             head_dim=head_dim,
             key_bits=preset["key_bits"],
