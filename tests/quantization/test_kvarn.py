@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only contracts for KVarN configuration and cache accounting."""
 
-import os
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -2773,7 +2772,6 @@ def test_reset_process_state_releases_previous_model_generation():
         KVarNAttentionImpl._block_to_slot_t_per_device[mirror_key] = torch.ones(1)
         KVarNAttentionImpl._is_sink_t_per_device[mirror_key] = torch.ones(1)
         KVarNAttentionImpl._kernel_warmed.add(("decode", device))
-        KVarNAttentionImpl._tiles_dumped = True
         KVarNAttentionImpl._flush_index_materialization = "shared"
         KVarNAttentionImpl._flush_index_counters["flush_calls"] = 3
         for mapping in _shared_q_output_maps():
@@ -2817,7 +2815,6 @@ def test_reset_process_state_releases_previous_model_generation():
             "device_index_tensor_materializations": 0,
             "shared_layer_reuses": 0,
         }
-        assert KVarNAttentionImpl._tiles_dumped is False
     finally:
         KVarNAttentionImpl.reset_process_state()
 
@@ -3356,9 +3353,7 @@ def test_immediately_recycled_sink_is_delabeled_outside_new_row_zero():
     assert is_sink_t[new_sink]
 
 
-def test_prefill_fp16_window_chunk2_retains_available_recent_history(monkeypatch):
-    monkeypatch.delenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", raising=False)
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
+def test_prefill_fp16_window_chunk2_retains_available_recent_history():
     row = list(range(32))
     resident = {bid: bid for bid in range(16)}
     blocks_needed = {0, *range(16, 32)}
@@ -3398,9 +3393,7 @@ def test_prefill_fp16_window_chunk2_retains_available_recent_history(monkeypatch
     assert len(blocks_needed) == 32
 
 
-def test_prefill_fp16_window_chunk3_flushes_older_than_bounded_suffix(monkeypatch):
-    monkeypatch.delenv("VLLM_KVARN_DEFER_PREFILL_FLUSH", raising=False)
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
+def test_prefill_fp16_window_chunk3_flushes_older_than_bounded_suffix():
     row = list(range(48))
     resident = {bid: bid for bid in range(32)}
     blocks_needed = {0, *range(32, 48)}
@@ -3599,9 +3592,7 @@ class _ImmediateKVarNMetadataStageRing:
         assert stage == 0
 
 
-def _make_kvarn_lifecycle_builder(
-    resident, sinks, pool_size, *, metadata_lifecycle="reference"
-):
+def _make_kvarn_lifecycle_builder(resident, sinks, pool_size):
     KVarNAttentionImpl.reset_process_state()
     builder = object.__new__(KVarNMetadataBuilder)
     builder.reorder_batch_threshold = 4
@@ -3623,23 +3614,6 @@ def _make_kvarn_lifecycle_builder(
     builder._vq_seqlen_buf = torch.empty(4096, dtype=torch.int32)
     builder._vq_req_host = torch.empty((1, 4096), dtype=torch.int32)
     builder._vq_seqlen_host = torch.empty((1, 4096), dtype=torch.int32)
-    builder._metadata_lifecycle_variant = metadata_lifecycle
-    builder._metadata_lifecycle_policy = (
-        builder._read_incremental_lifecycle_policy()
-        if metadata_lifecycle == "incremental_qlen1"
-        else None
-    )
-    builder._metadata_lifecycle_fused_decode = (
-        os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
-        if metadata_lifecycle == "incremental_qlen1"
-        else None
-    )
-    builder._incremental_decode_state = None
-    builder._metadata_lifecycle_counters = {
-        "incremental_hits": 0,
-        "full_builds": 0,
-    }
-
     group_key = builder._group_key
     device = torch.device("cpu")
     resident = sorted(resident)
@@ -3672,9 +3646,7 @@ def _make_kvarn_lifecycle_builder(
     return builder, block_to_slot
 
 
-def _kvarn_lifecycle_common(
-    rows, seq_lens, query_lens, *, request_ids=None, row_versions=None
-):
+def _kvarn_lifecycle_common(rows, seq_lens, query_lens):
     width = max((len(row) for row in rows), default=0)
     block_table_cpu = np.full((len(rows), width), -1, dtype=np.int32)
     for i, row in enumerate(rows):
@@ -3694,13 +3666,6 @@ def _kvarn_lifecycle_common(
         max_query_len=max(query_lens, default=1),
         max_seq_len=max(seq_lens, default=0),
         causal=True,
-        request_ids=tuple(request_ids)
-        if request_ids is not None
-        else tuple(f"request-{index}" for index in range(len(rows))),
-        block_table_row_versions=np.asarray(
-            row_versions if row_versions is not None else [0] * len(rows),
-            dtype=np.uint64,
-        ),
     )
 
 
@@ -3712,16 +3677,8 @@ def _run_kvarn_lifecycle_build(
     *,
     num_decodes,
     flush_calls,
-    request_ids=None,
-    row_versions=None,
 ):
-    cam = _kvarn_lifecycle_common(
-        rows,
-        seq_lens,
-        query_lens,
-        request_ids=request_ids,
-        row_versions=row_versions,
-    )
+    cam = _kvarn_lifecycle_common(rows, seq_lens, query_lens)
     num_decode_tokens = sum(query_lens[:num_decodes])
 
     def record_flush(flush_pairs):
@@ -3742,83 +3699,7 @@ def _run_kvarn_lifecycle_build(
         return builder.build(0, cam)
 
 
-def _kvarn_lifecycle_snapshot(builder, metadata):
-    group_key = builder._group_key
-    block_map = KVarNAttentionImpl._block_to_slot_dict[group_key]
-
-    def tensor_values(value):
-        return None if value is None else tuple(value.tolist())
-
-    return (
-        tuple(metadata.seq_lens_cpu),
-        tensor_values(metadata.seq_lens),
-        tensor_values(metadata.slot_mapping),
-        tuple(tuple(row) for row in metadata.block_table.tolist()),
-        tensor_values(metadata.query_start_loc),
-        metadata.num_actual_tokens,
-        metadata.max_query_len,
-        metadata.num_decodes,
-        metadata.num_decode_tokens,
-        metadata.max_seq_len,
-        metadata.is_prefill,
-        metadata.has_cached_multiquery,
-        metadata.prefill_has_cached_multiquery,
-        metadata.block_table_cpu,
-        metadata.slot_mapping_cpu,
-        tensor_values(metadata.fa_cu_seqlens_q),
-        tensor_values(metadata.fa_cu_seqlens_k),
-        tensor_values(metadata.prefill_fa_cu_seqlens_k),
-        metadata.fa_max_blocks_per_req,
-        metadata.fa_max_seqlen_k_fixed,
-        tensor_values(metadata.vq_req),
-        tensor_values(metadata.vq_seqlen),
-        metadata.vq_qlen,
-        metadata.causal,
-        tuple(sorted(block_map.items())),
-        tuple(sorted(builder._block_fill.items())),
-        tuple(sorted(KVarNAttentionImpl._global_sink_blocks[group_key])),
-        tuple(builder._retired_sinks),
-        tuple(KVarNAttentionImpl._free_slots[group_key]),
-        KVarNAttentionImpl._allocator_lifecycle_epochs[group_key],
-    )
-
-
-def _run_stable_kvarn_decode_trace(metadata_lifecycle, rows, initial_seq_lens):
-    sinks = {row[0] for row in rows}
-    tails = {row[(seq_len - 1) // 128] for row, seq_len in zip(rows, initial_seq_lens)}
-    builder, _ = _make_kvarn_lifecycle_builder(
-        sinks | tails,
-        sinks=sinks,
-        pool_size=len(sinks | tails) + len(rows),
-        metadata_lifecycle=metadata_lifecycle,
-    )
-    request_ids = [f"stable-{index}" for index in range(len(rows))]
-    flush_calls = []
-    snapshots = []
-    try:
-        for step in range(3):
-            seq_lens = [seq_len + step for seq_len in initial_seq_lens]
-            metadata = _run_kvarn_lifecycle_build(
-                builder,
-                rows,
-                seq_lens,
-                [1] * len(rows),
-                num_decodes=len(rows),
-                flush_calls=flush_calls,
-                request_ids=request_ids,
-                row_versions=[1] * len(rows),
-            )
-            snapshots.append(_kvarn_lifecycle_snapshot(builder, metadata))
-        return snapshots, builder._metadata_lifecycle_counters.copy(), flush_calls
-    finally:
-        KVarNAttentionImpl.reset_process_state()
-
-
-def test_decode_cohort_builder_preserves_shared_multiquery_prefix(monkeypatch):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "4")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "0")
-    monkeypatch.setenv("KVARN_DECODE_FLUSH_SCOPE", "batch_cohort")
+def test_lifecycle_builder_preserves_shared_multiquery_prefix():
     rows = [
         [0, 1, 2, 100, 101, 102, 103],
         [0, 1, 2, 200, 201, 202],
@@ -3844,13 +3725,7 @@ def test_decode_cohort_builder_preserves_shared_multiquery_prefix(monkeypatch):
         KVarNAttentionImpl.reset_process_state()
 
 
-def test_decode_cohort_builder_flushes_before_capacity_and_reclaims_completion(
-    monkeypatch,
-):
-    monkeypatch.setenv("KVARN_PREFILL_FP16_WINDOW_BLOCKS", "16")
-    monkeypatch.setenv("KVARN_DECODE_FP16_WINDOW_BLOCKS", "4")
-    monkeypatch.setenv("KVARN_DECODE_FP16_LOW_WATER_BLOCKS", "0")
-    monkeypatch.setenv("KVARN_DECODE_FLUSH_SCOPE", "batch_cohort")
+def test_lifecycle_builder_flushes_before_capacity_and_reclaims_completion():
     rows = []
     resident = set()
     sinks = set()

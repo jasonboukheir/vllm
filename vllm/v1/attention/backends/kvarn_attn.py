@@ -1888,7 +1888,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     # Registry of impls so the builder can enumerate per-layer pools when
     # it needs to update sink markers / trigger flushes.
     _all_impls: ClassVar[list[KVarNAttentionImpl]] = []
-    _tiles_dumped: ClassVar[bool] = False
 
     @classmethod
     def _bump_allocator_lifecycle_epoch(cls, group_key: tuple) -> None:
@@ -1949,7 +1948,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls._cached_prefill_materializer = None
         cls._cached_prefill_materializer_counters.clear()
         cls._all_impls.clear()
-        cls._tiles_dumped = False
 
     @classmethod
     def _select_flush_index_materialization(
@@ -3503,15 +3501,10 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     def _batched_flush(cls, flush_pairs: list) -> None:
         """Flush many (impl, block_id, kv_cache) tiles to int4.
 
-        Dispatches to the vectorized path (default) or the legacy per-tile path
-        (KVARN_FAST_FLUSH=0, kept for A/B + the tile-dump debug hook). The
-        vectorized path replaces the per-(layer,block,head) Python gather/write
-        loops — which exploded into ~10^5 tiny GPU ops on a synchronized burst
-        (prefill completion, lockstep decode boundary) and dominated build() at
-        high concurrency (~44 ms/step at B=256) — with one
-        index_select gather + one index_copy write per (layer, block-chunk).
-        Numerically identical: same Sinkhorn, same RTN/pack math, same byte
-        layout; only the data movement is batched."""
+        Reuse shared page indices across layers and batch each layer's full
+        pages through the qualified Sinkhorn and native packed writer.
+        Generic layouts retain their compatible vectorized writer.
+        """
         if not flush_pairs:
             return
         cfg = flush_pairs[0][0].kvarn_config
