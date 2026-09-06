@@ -4,7 +4,6 @@
 import functools
 import gc
 import itertools
-import os
 import threading
 import time
 from collections import defaultdict
@@ -260,27 +259,6 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
-
-
-def _kvarn_incremental_lifecycle_metadata_enabled(
-    cache_dtype: str, metadata_lifecycle: str
-) -> bool:
-    """Resolve the runner-side B receipt switch once during engine init."""
-    return (
-        cache_dtype.startswith("kvarn_") and metadata_lifecycle == "incremental_qlen1"
-    )
-
-
-def _maybe_materialize_kvarn_lifecycle_metadata(
-    enabled: bool,
-    request_ids: Sequence[str],
-    block_table: Any,
-    num_reqs: int,
-) -> tuple[tuple[str, ...] | None, np.ndarray | None]:
-    """Materialize lifecycle receipts only for the selected B variant."""
-    if not enabled:
-        return None, None
-    return tuple(request_ids[:num_reqs]), block_table.get_row_versions(num_reqs)
 
 
 def _block_table_cpu_view(block_table: Any, num_reqs: int) -> np.ndarray:
@@ -564,13 +542,6 @@ class GPUModelRunner(
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
         )
-        self._enable_kvarn_incremental_lifecycle_metadata = (
-            _kvarn_incremental_lifecycle_metadata_enabled(
-                cache_config.cache_dtype,
-                os.environ.get("KVARN_METADATA_LIFECYCLE", "reference"),
-            )
-        )
-
         self.is_pooling_model = model_config.runner_type == "pooling"
         self.enable_prompt_embeds = model_config.enable_prompt_embeds
         self.is_multimodal_raw_input_only_model = (
@@ -819,9 +790,7 @@ class GPUModelRunner(
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 reasoning_config=self.vllm_config.reasoning_config,
                 use_replayssm=self.cache_config.use_replayssm,
-                track_block_table_row_versions=(
-                    self._enable_kvarn_incremental_lifecycle_metadata
-                ),
+                track_block_table_row_versions=False,
             )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -2461,17 +2430,6 @@ class GPUModelRunner(
         slot_mapping_gid_0 = slot_mappings[0]
         kvarn_request_ids = None
         block_table_row_versions_gid_0 = None
-        if self._enable_kvarn_incremental_lifecycle_metadata and not isinstance(
-            kv_cache_groups[0].kv_cache_spec, EncoderOnlyAttentionSpec
-        ):
-            kvarn_request_ids, block_table_row_versions_gid_0 = (
-                _maybe_materialize_kvarn_lifecycle_metadata(
-                    True,
-                    self.input_batch.req_ids,
-                    self.input_batch.block_table[0],
-                    num_reqs,
-                )
-            )
 
         if self.routed_experts_initialized:
             # Copy this step's attention slot_mapping into our private
@@ -2727,17 +2685,6 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
                 cm.block_table_cpu = _get_block_table_cpu(kv_cache_gid)
-                if self._enable_kvarn_incremental_lifecycle_metadata and not isinstance(
-                    kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec
-                ):
-                    _, cm.block_table_row_versions = (
-                        _maybe_materialize_kvarn_lifecycle_metadata(
-                            True,
-                            self.input_batch.req_ids,
-                            self.input_batch.block_table[kv_cache_gid],
-                            num_reqs,
-                        )
-                    )
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
@@ -7501,9 +7448,7 @@ class GPUModelRunner(
                     reasoning_config=self.vllm_config.reasoning_config,
                     use_replayssm=self.cache_config.use_replayssm,
                     slot_mapping_modes=slot_mapping_modes,
-                    track_block_table_row_versions=(
-                        self._enable_kvarn_incremental_lifecycle_metadata
-                    ),
+                    track_block_table_row_versions=False,
                 )
 
         assert self._init_block_sizes == block_sizes, (

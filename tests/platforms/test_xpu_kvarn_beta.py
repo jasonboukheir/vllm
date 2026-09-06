@@ -6,7 +6,10 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.config import CUDAGraphMode
-from vllm.platforms.xpu import _check_kvarn_beta_unsupported_config
+from vllm.platforms.xpu import (
+    _RETIRED_KVARN_ENV_VARS,
+    _check_kvarn_beta_unsupported_config,
+)
 
 
 def _config(
@@ -48,6 +51,22 @@ def _config(
 
 def test_kvarn_beta_accepts_supported_eager_text_configuration() -> None:
     _check_kvarn_beta_unsupported_config(_config(), CUDAGraphMode.NONE)
+
+
+@pytest.mark.parametrize(
+    "name", (*_RETIRED_KVARN_ENV_VARS, "KVARN_NATIVE_XPU_KERNEL_VARIANT")
+)
+def test_kvarn_release_rejects_retired_server_overrides(monkeypatch, name):
+    monkeypatch.setenv(name, "1")
+    with pytest.raises(ValueError, match="retired KVarN experiment"):
+        _check_kvarn_beta_unsupported_config(_config(), CUDAGraphMode.NONE)
+
+
+def test_auto_is_not_affected_by_retired_kvarn_overrides(monkeypatch):
+    monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", "baseline")
+    _check_kvarn_beta_unsupported_config(
+        _config(cache_dtype="auto"), CUDAGraphMode.NONE
+    )
 
 
 def test_kvarn_beta_accepts_multimodal_checkpoint_in_language_only_mode() -> None:

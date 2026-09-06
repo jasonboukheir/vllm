@@ -27,6 +27,39 @@ else:
 
 logger = init_logger(__name__)
 
+# These switches were useful while qualifying the beta implementation, but are
+# deliberately not part of the release contract.  Fail closed rather than
+# silently running a different cache implementation when an old launch
+# environment is reused.
+_RETIRED_KVARN_ENV_VARS = (
+    "KVARN_QUANT_SLIDING",
+    "KVARN_FLUSH_INDEX_MATERIALIZATION",
+    "KVARN_FLUSH_WRITER",
+    "KVARN_SINKHORN_SOURCE",
+    "KVARN_FORWARD_POOL_ENSURE",
+    "KVARN_QLEN1_INLINE_PLAN",
+    "KVARN_METADATA_LIFECYCLE",
+    "KVARN_NATIVE_XPU_LAYER",
+    "KVARN_FAST_FLUSH",
+    "KVARN_FUSED_VERIFY",
+    "KVARN_FUSED_VERIFY_MAXQ",
+    "KVARN_FUSED_VERIFY_MIN_BLOCKS",
+    "KVARN_FUSED_DECODE",
+    "KVARN_RTN_QUANTILE",
+    "KVARN_SINKHORN_ITERS",
+    "KVARN_SINK_TOKENS",
+    "KVARN_PREFILL_FP16_WINDOW_BLOCKS",
+    "KVARN_DECODE_FP16_WINDOW_BLOCKS",
+    "KVARN_DECODE_FP16_LOW_WATER_BLOCKS",
+    "KVARN_DECODE_FLUSH_SCOPE",
+    "KVARN_NATIVE_XPU",
+    "KVARN_SPLIT_K",
+    "KVARN_NUM_KV_SPLITS",
+    "KVARN_SHARED_VERIFY",
+    "KVARN_ONEDNN_DETERMINISTIC",
+    "VLLM_KVARN_DEFER_PREFILL_FLUSH",
+)
+
 
 def _check_kvarn_beta_unsupported_config(
     vllm_config: "VllmConfig", cudagraph_none: object
@@ -35,6 +68,17 @@ def _check_kvarn_beta_unsupported_config(
     cache_dtype = vllm_config.cache_config.cache_dtype
     if not isinstance(cache_dtype, str) or not cache_dtype.startswith("kvarn_"):
         return
+
+    retired = [name for name in _RETIRED_KVARN_ENV_VARS if name in os.environ]
+    retired.extend(
+        name for name in os.environ if name.startswith("KVARN_NATIVE_XPU_")
+    )
+    if retired:
+        raise ValueError(
+            "retired KVarN experiment environment override(s): "
+            + ", ".join(retired)
+            + "; remove them and use the qualified release defaults"
+        )
 
     if vllm_config.speculative_config is not None:
         raise ValueError(
@@ -640,10 +684,7 @@ class XPUPlatform(Platform):
                 )
 
             skip_layers = cache_config.kv_cache_dtype_skip_layers
-            if os.environ.get("KVARN_QUANT_SLIDING") == "1":
-                while "sliding_window" in skip_layers:
-                    skip_layers.remove("sliding_window")
-            elif "sliding_window" not in skip_layers:
+            if "sliding_window" not in skip_layers:
                 skip_layers.append("sliding_window")
 
             kvarn_config = KVarNConfig.from_cache_dtype(cache_dtype, head_size)

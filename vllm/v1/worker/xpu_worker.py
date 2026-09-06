@@ -24,9 +24,6 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
-_KVARN_ONEDNN_DETERMINISTIC_ENV = "KVARN_ONEDNN_DETERMINISTIC"
-
-
 def _check_kvarn_worker_model_runner(
     cache_dtype: str | None, use_v2_model_runner: bool
 ) -> None:
@@ -44,34 +41,12 @@ def _check_kvarn_worker_model_runner(
 
 
 def _configure_kvarn_onednn_determinism(cache_dtype: str | None) -> bool | None:
-    """Select the process-wide oneDNN determinism policy for KVarN.
-
-    Deterministic oneDNN remains the safe default because KVarN qualification
-    requires identical replay results.  The explicit opt-out is an attributable
-    performance diagnostic; parsing is deliberately strict so a misspelling
-    cannot silently weaken that contract.
-
-    Returns the selected value for a KVarN cache, or ``None`` when KVarN is not
-    active and this selector therefore owns no process-wide state.
-    """
+    """Enable the qualified deterministic oneDNN policy for KVarN."""
     if not isinstance(cache_dtype, str) or not cache_dtype.startswith("kvarn_"):
         return None
 
-    raw_value = os.environ.get(_KVARN_ONEDNN_DETERMINISTIC_ENV)
-    if raw_value is None:
-        deterministic = True
-        source = "safe-default"
-    elif raw_value == "1":
-        deterministic = True
-        source = _KVARN_ONEDNN_DETERMINISTIC_ENV
-    elif raw_value == "0":
-        deterministic = False
-        source = _KVARN_ONEDNN_DETERMINISTIC_ENV
-    else:
-        raise ValueError(
-            f"{_KVARN_ONEDNN_DETERMINISTIC_ENV} must be exactly '0' or '1', "
-            f"got {raw_value!r}"
-        )
+    deterministic = True
+    source = "release-default"
 
     # KVarN requires repeatable model projections as well as repeatable cache
     # operations. oneDNN may otherwise select global split-K XPU matmuls whose

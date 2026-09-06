@@ -81,8 +81,6 @@ from vllm.v1.attention.ops.kvarn_store import (
 from vllm.v1.attention.ops.triton_kvarn_decode import (
     KVARN_CACHE_LAYOUT_NATURAL,
     KVARN_CACHE_LAYOUT_XE2_DPAS,
-    KVARN_FRONTEND_QKV_SCATTER,
-    KVARN_FRONTEND_QKV_SCATTER_INLINE,
     KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
     KVARN_FRONTEND_REFERENCE,
     KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1,
@@ -100,7 +98,6 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_decode_abi_supported,
     kvarn_native_feature_enabled,
     kvarn_native_kernel_variant_requested,
-    kvarn_native_layer_selected,
     kvarn_native_layout_abi_supported,
     kvarn_native_prefill_store_supported,
     kvarn_native_split_count,
@@ -122,28 +119,18 @@ if _HAS_FLASH_ATTN:
 
 logger = init_logger(__name__)
 
-_KVARN_FLUSH_INDEX_MATERIALIZATION_ENV = "KVARN_FLUSH_INDEX_MATERIALIZATION"
 _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE = "per_layer"
 _KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED = "shared"
-_KVARN_FLUSH_WRITER_ENV = "KVARN_FLUSH_WRITER"
 _KVARN_FLUSH_WRITER_REFERENCE = "reference"
 _KVARN_FLUSH_WRITER_NATIVE_XE2 = "native_xe2"
-_KVARN_SINKHORN_SOURCE_ENV = "KVARN_SINKHORN_SOURCE"
 _KVARN_SINKHORN_SOURCE_MATERIALIZED = "materialized"
 _KVARN_SINKHORN_SOURCE_FUSED_MATERIALIZED = "fused_materialized"
-_KVARN_FORWARD_POOL_ENSURE_ENV = "KVARN_FORWARD_POOL_ENSURE"
 _KVARN_FORWARD_POOL_ENSURE_ALWAYS = "always"
-_KVARN_FORWARD_POOL_ENSURE_EPOCH_LATCH = "epoch_latch"
-_KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF = "fused_qkv_proof"
-_KVARN_QLEN1_INLINE_PLAN_ENV = "KVARN_QLEN1_INLINE_PLAN"
 _KVARN_QLEN1_INLINE_PLAN_REFERENCE = "reference"
-_KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE = "trusted_native"
 _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2 = "bound_native_v2"
 _KVARN_CACHED_PREFILL_MATERIALIZER_REFERENCE = "reference"
 _KVARN_CACHED_PREFILL_MATERIALIZER_NATIVE_XE2 = "native_xe2"
-_KVARN_METADATA_LIFECYCLE_ENV = "KVARN_METADATA_LIFECYCLE"
 _KVARN_METADATA_LIFECYCLE_REFERENCE = "reference"
-_KVARN_METADATA_LIFECYCLE_INCREMENTAL_QLEN1 = "incremental_qlen1"
 _KVARN_XPU_BETA_CACHE_DTYPE = "kvarn_k4v4_g128_compact"
 _KVARN_XPU_BETA_DECODE_WINDOW = 4
 _KVARN_FLUSH_INDEX_COUNTER_KEYS = (
@@ -166,140 +153,18 @@ class _KVarNQlen1MetadataKind(Enum):
     EAGER_PURE_DECODE = "eager_pure_decode"
 
 
-def _kvarn_flush_index_materialization_requested(
-    default: str = _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE,
-) -> tuple[str, str]:
-    """Resolve the process-lifetime flush-index materialization policy."""
-    raw_value = os.environ.get(_KVARN_FLUSH_INDEX_MATERIALIZATION_ENV)
-    if raw_value is None:
-        source = (
-            "xpu-beta-default"
-            if default != _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE
-            else "reference-default"
-        )
-        return default, source
-    if raw_value not in {
-        _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE,
-        _KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED,
-    }:
-        raise ValueError(
-            f"{_KVARN_FLUSH_INDEX_MATERIALIZATION_ENV} must be exactly "
-            f"'{_KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE}' or "
-            f"'{_KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED}', got {raw_value!r}"
-        )
-    return raw_value, _KVARN_FLUSH_INDEX_MATERIALIZATION_ENV
-
-
-def _kvarn_flush_writer_requested(
-    default: str = _KVARN_FLUSH_WRITER_REFERENCE,
-) -> tuple[str, str]:
-    """Resolve the engine-lifetime full-page writer implementation."""
-    raw_value = os.environ.get(_KVARN_FLUSH_WRITER_ENV)
-    if raw_value is None:
-        source = (
-            "xpu-beta-default"
-            if default != _KVARN_FLUSH_WRITER_REFERENCE
-            else "reference-default"
-        )
-        return default, source
-    if raw_value not in {
-        _KVARN_FLUSH_WRITER_REFERENCE,
-        _KVARN_FLUSH_WRITER_NATIVE_XE2,
-    }:
-        raise ValueError(
-            f"{_KVARN_FLUSH_WRITER_ENV} must be exactly "
-            f"'{_KVARN_FLUSH_WRITER_REFERENCE}' or "
-            f"'{_KVARN_FLUSH_WRITER_NATIVE_XE2}', got {raw_value!r}"
-        )
-    return raw_value, _KVARN_FLUSH_WRITER_ENV
-
-
-def _kvarn_sinkhorn_source_requested(
-    default: str = _KVARN_SINKHORN_SOURCE_MATERIALIZED,
-) -> tuple[str, str]:
-    """Resolve the engine-lifetime source layout for Sinkhorn balancing."""
-    raw_value = os.environ.get(_KVARN_SINKHORN_SOURCE_ENV)
-    if raw_value is None:
-        source = (
-            "xpu-beta-default"
-            if default != _KVARN_SINKHORN_SOURCE_MATERIALIZED
-            else "reference-default"
-        )
-        return default, source
-    if raw_value not in {
-        _KVARN_SINKHORN_SOURCE_MATERIALIZED,
-        _KVARN_SINKHORN_SOURCE_FUSED_MATERIALIZED,
-    }:
-        raise ValueError(
-            f"{_KVARN_SINKHORN_SOURCE_ENV} must be exactly "
-            f"'{_KVARN_SINKHORN_SOURCE_MATERIALIZED}' or "
-            f"'{_KVARN_SINKHORN_SOURCE_FUSED_MATERIALIZED}', got {raw_value!r}"
-        )
-    return raw_value, _KVARN_SINKHORN_SOURCE_ENV
-
-
 def _kvarn_forward_pool_ensure_requested() -> tuple[str, str]:
-    """Resolve whether forward may consume a fused-update pool proof."""
-    raw_value = os.environ.get(_KVARN_FORWARD_POOL_ENSURE_ENV)
-    if raw_value is None:
-        return _KVARN_FORWARD_POOL_ENSURE_ALWAYS, "reference-default"
-    if raw_value not in {
-        _KVARN_FORWARD_POOL_ENSURE_ALWAYS,
-        _KVARN_FORWARD_POOL_ENSURE_EPOCH_LATCH,
-        _KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF,
-    }:
-        raise ValueError(
-            f"{_KVARN_FORWARD_POOL_ENSURE_ENV} must be exactly "
-            f"'{_KVARN_FORWARD_POOL_ENSURE_ALWAYS}' or "
-            f"'{_KVARN_FORWARD_POOL_ENSURE_EPOCH_LATCH}' or "
-            f"'{_KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF}', got "
-            f"{raw_value!r}"
-        )
-    return raw_value, _KVARN_FORWARD_POOL_ENSURE_ENV
+    """Return the release pool policy.
 
-
-def _kvarn_qlen1_inline_plan_requested(
-    default: str = _KVARN_QLEN1_INLINE_PLAN_REFERENCE,
-) -> tuple[str, str]:
-    """Resolve the engine-lifetime eager qlen=1 inline execution plan."""
-    raw_value = os.environ.get(_KVARN_QLEN1_INLINE_PLAN_ENV)
-    if raw_value is None:
-        source = (
-            "xpu-beta-default"
-            if default != _KVARN_QLEN1_INLINE_PLAN_REFERENCE
-            else "reference-default"
-        )
-        return default, source
-    if raw_value not in {
-        _KVARN_QLEN1_INLINE_PLAN_REFERENCE,
-        _KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE,
-        _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2,
-    }:
-        raise ValueError(
-            f"{_KVARN_QLEN1_INLINE_PLAN_ENV} must be exactly "
-            f"'{_KVARN_QLEN1_INLINE_PLAN_REFERENCE}' or "
-            f"'{_KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE}' or "
-            f"'{_KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2}', got {raw_value!r}"
-        )
-    return raw_value, _KVARN_QLEN1_INLINE_PLAN_ENV
+    The epoch-latch and fused-QKV-proof variants were qualification tools and
+    are retired.  XPU startup rejects their old environment overrides.
+    """
+    return _KVARN_FORWARD_POOL_ENSURE_ALWAYS, "release-default"
 
 
 def _kvarn_metadata_lifecycle_requested() -> tuple[str, str]:
-    """Resolve the engine-lifetime metadata lifecycle implementation."""
-    raw_value = os.environ.get(_KVARN_METADATA_LIFECYCLE_ENV)
-    if raw_value is None:
-        return _KVARN_METADATA_LIFECYCLE_REFERENCE, "reference-default"
-    if raw_value not in {
-        _KVARN_METADATA_LIFECYCLE_REFERENCE,
-        _KVARN_METADATA_LIFECYCLE_INCREMENTAL_QLEN1,
-    }:
-        raise ValueError(
-            f"{_KVARN_METADATA_LIFECYCLE_ENV} must be exactly "
-            f"'{_KVARN_METADATA_LIFECYCLE_REFERENCE}' or "
-            f"'{_KVARN_METADATA_LIFECYCLE_INCREMENTAL_QLEN1}', got "
-            f"{raw_value!r}"
-        )
-    return raw_value, _KVARN_METADATA_LIFECYCLE_ENV
+    """Return the release metadata lifecycle (full reference rebuild)."""
+    return _KVARN_METADATA_LIFECYCLE_REFERENCE, "release-default"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -404,12 +269,7 @@ def _can_elide_fa_cu_seqlens(
     has_built_cudagraph_metadata: bool,
 ) -> bool:
     """Elide metadata only when every possible consumer is cu-seqlens-free."""
-    return (
-        pure_qlen1
-        and not for_cudagraph_capture
-        and not has_built_cudagraph_metadata
-        and os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
-    )
+    return pure_qlen1 and not for_cudagraph_capture and not has_built_cudagraph_metadata
 
 
 def _active_kvarn_metadata(layer: torch.nn.Module):
@@ -478,11 +338,9 @@ def _use_kvarn_fused_verify(
 ) -> bool:
     """Route only natural-layout cached queries to the fused verify reader."""
     return (
-        os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"
-        and not dpas_layout
-        and max_query_len <= int(os.environ.get("KVARN_FUSED_VERIFY_MAXQ", "8"))
-        and (max_seq_len + group - 1) // group
-        >= int(os.environ.get("KVARN_FUSED_VERIFY_MIN_BLOCKS", "64"))
+        not dpas_layout
+        and max_query_len <= 8
+        and (max_seq_len + group - 1) // group >= 64
         and batch_size > 0
     )
 
@@ -624,44 +482,6 @@ def _reconcile_kvarn_sink_ownership(
         if bid < is_sink_t.shape[0]:
             is_sink_t[bid] = False
     return mutated
-
-
-def _defer_kvarn_prefill_history_blocks(
-    row: Sequence[int],
-    *,
-    q_len: int,
-    committed_len: int,
-    group: int,
-    bt_cols: int,
-    resident_blocks: dict[int, int],
-    blocks_needed: set[int],
-    deferred_blocks: set[int] | None = None,
-) -> bool:
-    """Retain resident full history for a diagnostic continuation ablation.
-
-    Returning ``True`` tells the caller to skip this row's normal walk-back
-    flush. Adding each resident, fully committed history block to
-    ``blocks_needed`` also keeps it out of reclaim. Blocks already materialized
-    in int4 are deliberately ignored: allocating an empty fp16 slot for one
-    would corrupt a prefix-cache hit.
-
-    This is intentionally not a memory-scalable policy. It exists only to
-    isolate continuation-boundary flushing as a correctness/performance cause.
-    """
-    if (
-        os.environ.get("VLLM_KVARN_DEFER_PREFILL_FLUSH", "0") != "1"
-        or q_len <= 1
-        or committed_len <= 0
-    ):
-        return False
-
-    for k in range(min(committed_len // group, bt_cols)):
-        bid = int(row[k])
-        if bid >= 0 and bid in resident_blocks:
-            blocks_needed.add(bid)
-            if deferred_blocks is not None:
-                deferred_blocks.add(bid)
-    return True
 
 
 def _kvarn_prefill_fp16_window_blocks() -> int:
@@ -969,36 +789,6 @@ class _KVarNMetadataStageRing:
 
 
 @dataclass(frozen=True)
-class _KVarNIncrementalDecodeState:
-    """Facts which must stay unchanged between incremental decode steps."""
-
-    request_ids: tuple[str, ...]
-    block_table_row_versions: tuple[int, ...]
-    seq_lens: tuple[int, ...]
-    tail_columns: tuple[int, ...]
-    sink_blocks: tuple[int, ...]
-    sink_membership: tuple[bool, ...]
-    tail_blocks: tuple[int, ...]
-    sink_slots: tuple[int | None, ...]
-    tail_slots: tuple[int, ...]
-    tail_fills: tuple[int, ...]
-    block_table_shape: tuple[int, int]
-    device: torch.device
-    group_impls: tuple[object, ...]
-    block_map_id: int
-    block_map_size: int
-    free_slots_id: int
-    free_slots_size: int
-    sinks_id: int
-    sinks_size: int
-    retired_sinks_size: int
-    block_fill_size: int
-    block_to_slot_tensor_id: int
-    sink_tensor_id: int
-    allocator_lifecycle_epoch: int
-    lifecycle_policy: tuple[int, int, int, str]
-
-
 class KVarNAttentionBackend(AttentionBackend):
     """Attention backend using KVarN KV-cache compression."""
 
@@ -1195,11 +985,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
     # the vq verify plan) happens in KVarNMetadataBuilder.build() between
     # captured graph replays; the forward is pure tensor ops.
     # KVARN_FUSED_VERIFY=0 reverts to single-token-only support.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_BATCH
-        if os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"
-        else AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    )
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -1209,7 +995,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         # base helper.
         self._init_reorder_batch_threshold(
             1,
-            supports_spec_as_decode=(os.environ.get("KVARN_FUSED_VERIFY", "1") == "1"),
+            supports_spec_as_decode=True,
         )
         # KV-cache-group key, must match KVarNAttentionImpl._group_key for this
         # group's layers so the builder mutates the right group's slot allocator.
@@ -1293,21 +1079,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             self._metadata_lifecycle_variant,
             metadata_lifecycle_source,
         ) = _kvarn_metadata_lifecycle_requested()
-        self._metadata_lifecycle_policy = (
-            self._read_incremental_lifecycle_policy()
-            if self._incremental_metadata_enabled()
-            else None
-        )
-        self._metadata_lifecycle_fused_decode = (
-            os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
-            if self._incremental_metadata_enabled()
-            else None
-        )
-        self._incremental_decode_state: _KVarNIncrementalDecodeState | None = None
-        self._metadata_lifecycle_counters = {
-            "incremental_hits": 0,
-            "full_builds": 0,
-        }
         logger.info_once(
             "[KVARN_FACTORY] selected_metadata_lifecycle=%s; "
             "selector_source=%s; fallback=reference; immutable for engine lifetime",
@@ -1315,34 +1086,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             metadata_lifecycle_source,
         )
 
-    def _incremental_metadata_enabled(self) -> bool:
-        return (
-            getattr(
-                self,
-                "_metadata_lifecycle_variant",
-                _KVARN_METADATA_LIFECYCLE_REFERENCE,
-            )
-            == _KVARN_METADATA_LIFECYCLE_INCREMENTAL_QLEN1
-        )
-
-    @staticmethod
-    def _incremental_row_identity(cam, batch_size: int):
-        request_ids = getattr(cam, "request_ids", None)
-        versions = getattr(cam, "block_table_row_versions", None)
-        if request_ids is None or versions is None or len(request_ids) != batch_size:
-            return None
-        if isinstance(versions, torch.Tensor):
-            if versions.device.type != "cpu":
-                return None
-            versions = versions.numpy()
-        if len(versions) != batch_size:
-            return None
-        request_ids = tuple(request_ids)
-        if any(not isinstance(request_id, str) for request_id in request_ids):
-            return None
-        return request_ids, tuple(int(version) for version in versions)
-
-    def _read_incremental_lifecycle_policy(self) -> tuple[int, int, int, str]:
+    def _lifecycle_policy(self) -> tuple[int, int, int, str]:
         prefill_window = _kvarn_prefill_fp16_window_blocks()
         beta_profile = getattr(self, "_kvarn_xpu_beta_profile", False)
         decode_window = _kvarn_decode_fp16_window_blocks(
@@ -1363,296 +1107,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             decode_window,
             decode_low_water,
             decode_flush_scope,
-        )
-
-    def _incremental_lifecycle_policy(self) -> tuple[int, int, int, str]:
-        policy = getattr(self, "_metadata_lifecycle_policy", None)
-        if policy is not None:
-            return policy
-        return self._read_incremental_lifecycle_policy()
-
-    def _incremental_fused_decode_enabled(self) -> bool:
-        frozen = getattr(self, "_metadata_lifecycle_fused_decode", None)
-        if frozen is not None:
-            return frozen
-        return os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
-
-    def _try_incremental_decode_lifecycle(
-        self,
-        *,
-        cam,
-        seq_lens_cpu: list[int],
-        block_table_np: np.ndarray,
-        pure_qlen1: bool,
-        for_cudagraph_capture: bool,
-    ) -> bool:
-        if not self._incremental_metadata_enabled():
-            return False
-
-        state = self._incremental_decode_state
-        batch_size = len(seq_lens_cpu)
-        row_identity = self._incremental_row_identity(cam, batch_size)
-        if (
-            state is None
-            or not pure_qlen1
-            or for_cudagraph_capture
-            or getattr(self, "_has_built_cudagraph_metadata", False)
-            or not self._incremental_fused_decode_enabled()
-            or row_identity is None
-            or block_table_np.ndim != 2
-            or tuple(block_table_np.shape) != state.block_table_shape
-            or cam.seq_lens.device != state.device
-        ):
-            self._incremental_decode_state = None
-            return False
-
-        request_ids, row_versions = row_identity
-        if (
-            request_ids != state.request_ids
-            or row_versions != state.block_table_row_versions
-            or tuple(seq_lens_cpu) != tuple(previous + 1 for previous in state.seq_lens)
-            or self._incremental_lifecycle_policy() != state.lifecycle_policy
-        ):
-            self._incremental_decode_state = None
-            return False
-
-        from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
-
-        group_key = self._group_key
-        map_key = (state.device, group_key)
-        block_map = KVarNAttentionImpl._block_to_slot_dict.get(group_key)
-        free_slots = KVarNAttentionImpl._free_slots.get(group_key)
-        sinks = KVarNAttentionImpl._global_sink_blocks.get(group_key)
-        block_to_slot_t = KVarNAttentionImpl._block_to_slot_t_per_device.get(map_key)
-        is_sink_t = KVarNAttentionImpl._is_sink_t_per_device.get(map_key)
-        allocator_lifecycle_epoch = KVarNAttentionImpl._allocator_lifecycle_epochs.get(
-            group_key
-        )
-        if (
-            block_map is None
-            or free_slots is None
-            or sinks is None
-            or block_to_slot_t is None
-            or is_sink_t is None
-            or allocator_lifecycle_epoch != state.allocator_lifecycle_epoch
-            or id(block_map) != state.block_map_id
-            or len(block_map) != state.block_map_size
-            or id(free_slots) != state.free_slots_id
-            or len(free_slots) != state.free_slots_size
-            or id(sinks) != state.sinks_id
-            or len(sinks) != state.sinks_size
-            or len(self._retired_sinks) != state.retired_sinks_size
-            or len(self._block_fill) != state.block_fill_size
-            or id(block_to_slot_t) != state.block_to_slot_tensor_id
-            or id(is_sink_t) != state.sink_tensor_id
-            or any(
-                impl not in KVarNAttentionImpl._all_impls
-                or getattr(impl, "_group_key", None) != group_key
-                for impl in state.group_impls
-            )
-        ):
-            self._incremental_decode_state = None
-            return False
-
-        tail_updates: list[tuple[int, int]] = []
-        for row_index, seq_len in enumerate(seq_lens_cpu):
-            if seq_len <= 0:
-                self._incremental_decode_state = None
-                return False
-            tail_column = (seq_len - 1) // self._group
-            if tail_column != state.tail_columns[row_index]:
-                self._incremental_decode_state = None
-                return False
-            sink_block = int(block_table_np[row_index, 0])
-            tail_block = int(block_table_np[row_index, tail_column])
-            if (
-                sink_block != state.sink_blocks[row_index]
-                or tail_block != state.tail_blocks[row_index]
-                or block_map.get(sink_block) != state.sink_slots[row_index]
-                or block_map.get(tail_block) != state.tail_slots[row_index]
-                or self._block_fill.get(tail_block) != state.tail_fills[row_index]
-                or (sink_block in sinks) != state.sink_membership[row_index]
-            ):
-                self._incremental_decode_state = None
-                return False
-            tail_fill = seq_len - tail_column * self._group
-            tail_updates.append((tail_block, tail_fill))
-
-        # Validation is deliberately transactional. A later ragged row can
-        # invalidate the receipt, so no lifecycle state changes until every
-        # row has passed all checks.
-        for tail_block, tail_fill in tail_updates:
-            self._block_fill[tail_block] = tail_fill
-
-        self._incremental_decode_state = replace(
-            state,
-            seq_lens=tuple(seq_lens_cpu),
-            tail_fills=tuple(tail_fill for _, tail_fill in tail_updates),
-        )
-        counters = getattr(self, "_metadata_lifecycle_counters", None)
-        if counters is not None:
-            counters["incremental_hits"] += 1
-        logger.info_once(
-            "[KVARN_METADATA_LIFECYCLE] active=incremental_qlen1; "
-            "action=elide_full_lifecycle_scan"
-        )
-        return True
-
-    def _capture_incremental_decode_state(
-        self,
-        *,
-        cam,
-        seq_lens_cpu: list[int],
-        block_table_np: np.ndarray,
-        pure_qlen1: bool,
-        for_cudagraph_capture: bool,
-        group_impls: Sequence[object],
-    ) -> None:
-        self._incremental_decode_state = None
-        if (
-            not self._incremental_metadata_enabled()
-            or not pure_qlen1
-            or for_cudagraph_capture
-            or getattr(self, "_has_built_cudagraph_metadata", False)
-            or not self._incremental_fused_decode_enabled()
-            or not group_impls
-            or block_table_np.ndim != 2
-        ):
-            return
-
-        batch_size = len(seq_lens_cpu)
-        row_identity = self._incremental_row_identity(cam, batch_size)
-        if row_identity is None or block_table_np.shape[0] < batch_size:
-            return
-
-        from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
-
-        group_key = self._group_key
-        device = cam.seq_lens.device
-        map_key = (device, group_key)
-        block_map = KVarNAttentionImpl._block_to_slot_dict.get(group_key)
-        free_slots = KVarNAttentionImpl._free_slots.get(group_key)
-        sinks = KVarNAttentionImpl._global_sink_blocks.get(group_key)
-        block_to_slot_t = KVarNAttentionImpl._block_to_slot_t_per_device.get(map_key)
-        is_sink_t = KVarNAttentionImpl._is_sink_t_per_device.get(map_key)
-        allocator_lifecycle_epoch = KVarNAttentionImpl._allocator_lifecycle_epochs.get(
-            group_key
-        )
-        if any(
-            value is None
-            for value in (
-                block_map,
-                free_slots,
-                sinks,
-                block_to_slot_t,
-                is_sink_t,
-                allocator_lifecycle_epoch,
-            )
-        ):
-            return
-        assert block_map is not None
-        assert free_slots is not None
-        assert sinks is not None
-        assert block_to_slot_t is not None
-        assert is_sink_t is not None
-        assert allocator_lifecycle_epoch is not None
-
-        tail_columns: list[int] = []
-        sink_blocks: list[int] = []
-        sink_membership: list[bool] = []
-        tail_blocks: list[int] = []
-        sink_slots: list[int | None] = []
-        tail_slots: list[int] = []
-        tail_fills: list[int] = []
-        for row_index, seq_len in enumerate(seq_lens_cpu):
-            if seq_len <= 0:
-                return
-            tail_column = (seq_len - 1) // self._group
-            if tail_column >= block_table_np.shape[1]:
-                return
-            sink_block = int(block_table_np[row_index, 0])
-            tail_block = int(block_table_np[row_index, tail_column])
-            tail_slot = block_map.get(tail_block)
-            tail_fill = self._block_fill.get(tail_block)
-            if (
-                sink_block < 0
-                or tail_block < 0
-                or tail_slot is None
-                or tail_fill is None
-            ):
-                return
-            tail_columns.append(tail_column)
-            sink_blocks.append(sink_block)
-            sink_membership.append(sink_block in sinks)
-            tail_blocks.append(tail_block)
-            sink_slots.append(block_map.get(sink_block))
-            tail_slots.append(tail_slot)
-            tail_fills.append(tail_fill)
-
-        request_ids, row_versions = row_identity
-        self._incremental_decode_state = _KVarNIncrementalDecodeState(
-            request_ids=request_ids,
-            block_table_row_versions=row_versions,
-            seq_lens=tuple(seq_lens_cpu),
-            tail_columns=tuple(tail_columns),
-            sink_blocks=tuple(sink_blocks),
-            sink_membership=tuple(sink_membership),
-            tail_blocks=tuple(tail_blocks),
-            sink_slots=tuple(sink_slots),
-            tail_slots=tuple(tail_slots),
-            tail_fills=tuple(tail_fills),
-            block_table_shape=tuple(block_table_np.shape),
-            device=device,
-            group_impls=tuple(group_impls),
-            block_map_id=id(block_map),
-            block_map_size=len(block_map),
-            free_slots_id=id(free_slots),
-            free_slots_size=len(free_slots),
-            sinks_id=id(sinks),
-            sinks_size=len(sinks),
-            retired_sinks_size=len(self._retired_sinks),
-            block_fill_size=len(self._block_fill),
-            block_to_slot_tensor_id=id(block_to_slot_t),
-            sink_tensor_id=id(is_sink_t),
-            allocator_lifecycle_epoch=allocator_lifecycle_epoch,
-            lifecycle_policy=self._incremental_lifecycle_policy(),
-        )
-
-    def _build_incremental_decode_metadata(
-        self,
-        cam,
-        *,
-        seq_lens_cpu: list[int],
-        num_decodes: int,
-        num_decode_tokens: int,
-    ) -> KVarNMetadata:
-        return KVarNMetadata(
-            seq_lens=cam.seq_lens,
-            slot_mapping=cam.slot_mapping,
-            block_table=cam.block_table_tensor,
-            query_start_loc=cam.query_start_loc,
-            num_actual_tokens=cam.num_actual_tokens,
-            max_query_len=cam.max_query_len,
-            max_seq_len=cam.max_seq_len,
-            is_prefill=False,
-            num_decodes=num_decodes,
-            num_decode_tokens=num_decode_tokens,
-            qlen1_dispatch_kind=_KVarNQlen1MetadataKind.EAGER_PURE_DECODE,
-            has_cached_multiquery=False,
-            prefill_has_cached_multiquery=False,
-            seq_lens_cpu=seq_lens_cpu,
-            block_table_cpu=None,
-            slot_mapping_cpu=None,
-            fa_cu_seqlens_q=None,
-            fa_cu_seqlens_k=None,
-            prefill_fa_cu_seqlens_k=None,
-            fa_max_blocks_per_req=(self._max_model_len + self._group - 1)
-            // self._group,
-            fa_max_seqlen_k_fixed=self._max_model_len,
-            vq_req=None,
-            vq_seqlen=None,
-            vq_qlen=0,
-            causal=getattr(cam, "causal", True),
         )
 
     def build_for_cudagraph_capture(
@@ -1717,23 +1171,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             num_actual_tokens=cam.num_actual_tokens,
             max_query_len=cam.max_query_len,
         )
-        if self._try_incremental_decode_lifecycle(
-            cam=cam,
-            seq_lens_cpu=seq_lens_cpu,
-            block_table_np=block_table_np,
-            pure_qlen1=pure_qlen1,
-            for_cudagraph_capture=_for_cudagraph_capture,
-        ):
-            return self._build_incremental_decode_metadata(
-                cam,
-                seq_lens_cpu=seq_lens_cpu,
-                num_decodes=num_decodes,
-                num_decode_tokens=num_decode_tokens,
-            )
-        counters = getattr(self, "_metadata_lifecycle_counters", None)
-        if counters is not None:
-            counters["full_builds"] += 1
-
         # ── Stage α-2: assign pool slots for every block_id touched this
         # step. The allocator state is class-level on KVarNAttentionImpl
         # and we mutate it here (in the builder, outside any captured
@@ -1815,9 +1252,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 decode_window,
                 decode_low_water,
                 decode_flush_scope,
-            ) = self._incremental_lifecycle_policy()
-            deferred_prefill_rows: set[int] = set()
-            deferred_prefill_blocks: set[int] = set()
+            ) = self._lifecycle_policy()
             window_prefill_rows: set[int] = set()
             window_prefill_blocks: set[int] = set()
             window_decode_rows: set[int] = set()
@@ -1831,18 +1266,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     continue
                 q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
                 committed_len = max(sl - q_len, 0)
-                if _defer_kvarn_prefill_history_blocks(
-                    block_table_np[b],
-                    q_len=q_len,
-                    committed_len=committed_len,
-                    group=GROUP,
-                    bt_cols=bt_cols,
-                    resident_blocks=dict_map,
-                    blocks_needed=blocks_needed,
-                    deferred_blocks=deferred_prefill_blocks,
-                ):
-                    deferred_prefill_rows.add(b)
-                elif _protect_kvarn_prefill_window_blocks(
+                if _protect_kvarn_prefill_window_blocks(
                     block_table_np[b],
                     q_len=q_len,
                     committed_len=committed_len,
@@ -1879,16 +1303,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 blocks_needed=blocks_needed,
                 protected_blocks=window_decode_blocks,
             )
-            deferred_block_count = len(deferred_prefill_blocks)
-            if deferred_block_count:
-                logger.warning_once(
-                    "VLLM_KVARN_DEFER_PREFILL_FLUSH=1 retained %d resident "
-                    "full history block(s) across %d continuation row(s); "
-                    "this diagnostic ablation is not memory-scalable.",
-                    deferred_block_count,
-                    len(deferred_prefill_rows),
-                )
-
             # ORDER MATTERS: mark sinks → FLUSH (frees just-completed blocks'
             # slots) → ALLOCATE (the new tails, reusing the freed slots). Doing
             # the flush before allocation caps the live-slot peak at 2·B
@@ -1976,9 +1390,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             flush_seen: set[int] = set()
             prefill_window_flush_ids: set[int] = set()
             decode_window_flush_ids: set[int] = set()
-            protected_history_blocks = (
-                deferred_prefill_blocks | window_prefill_blocks | window_decode_blocks
-            )
+            protected_history_blocks = window_prefill_blocks | window_decode_blocks
             for b in range(B):
                 if b >= bt_rows or bt_cols == 0:
                     break
@@ -1996,7 +1408,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     resident_blocks=dict_map,
                     sinks=sinks,
                     flush_seen=flush_seen,
-                    defer=b in deferred_prefill_rows or b in deferred_decode_rows,
+                    defer=b in deferred_decode_rows,
                     deferred_blocks=protected_history_blocks,
                 )
                 flush_block_ids.extend(row_flush_ids)
@@ -2149,15 +1561,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     KVarNAttentionImpl._max_known_block_id[gk] = max(
                         KVarNAttentionImpl._max_known_block_id.get(gk, 0), bid
                     )
-
-        self._capture_incremental_decode_state(
-            cam=cam,
-            seq_lens_cpu=seq_lens_cpu,
-            block_table_np=block_table_np,
-            pure_qlen1=pure_qlen1,
-            for_cudagraph_capture=_for_cudagraph_capture,
-            group_impls=group_impls,
-        )
 
         # ── Persistent cu_seqlens buffers (in-place updated) ─────────────
         # A captured graph bakes in tensor addresses, so cu_seqlens MUST live
@@ -2372,40 +1775,6 @@ class _KVarNFlushDeviceIndices:
 
 
 @dataclass(frozen=True)
-class _KVarNTrustedInlinePoolReceipt:
-    """Pool bindings proven when the trusted eager route is first bound."""
-
-    mirror_key: tuple
-    shared_key: tuple
-    mirror_epoch: int
-    shared_epoch: int
-    runtime_policy: tuple[str | None, str | None]
-    lookup_capacity: int
-    block_to_slot: torch.Tensor
-    is_sink: torch.Tensor
-    tail_key: torch.Tensor
-    tail_value: torch.Tensor
-    q_rot_fp16: torch.Tensor
-    fused_output: torch.Tensor
-    native_output_fp16: torch.Tensor
-    native_scratch_key: tuple | None
-    native_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
-
-
-@dataclass(frozen=True)
-class _KVarNTrustedQlen1InlinePlan:
-    """Cached invariants for one engine's opt-in eager qlen=1 route."""
-
-    process_generation: int
-    cache_owner: torch.Tensor
-    cache_view: torch.Tensor
-    device: torch.device
-    activation_dtype: torch.dtype
-    native_decode: KVarNTrustedNativeDecodePlan
-    pool_receipt: _KVarNTrustedInlinePoolReceipt | None = None
-
-
-@dataclass(frozen=True)
 class _KVarNBoundQlen1InlinePlanV2:
     """Once-qualified bindings for the lean eager qlen=1 route.
 
@@ -2445,7 +1814,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     supports_quant_query_input: bool = False
     use_fused_qkv_cache_update: bool = False
     use_inline_qkv_cache_update: bool = False
-    use_trusted_qlen1_inline_plan: bool = False
     use_bound_qlen1_inline_plan_v2: bool = False
     _kvarn_frontend_bound: bool = False
 
@@ -2506,7 +1874,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     _flush_writer: ClassVar[str | None] = None
     _sinkhorn_source: ClassVar[str | None] = None
     _forward_pool_ensure: ClassVar[str | None] = None
-    _pool_runtime_policy: ClassVar[tuple[str | None, str | None] | None] = None
     _qlen1_inline_plan: ClassVar[str | None] = None
     _process_generation: ClassVar[int] = 0
     _pool_epoch_counter: ClassVar[int] = 0
@@ -2575,7 +1942,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls._flush_writer = None
         cls._sinkhorn_source = None
         cls._forward_pool_ensure = None
-        cls._pool_runtime_policy = None
         cls._qlen1_inline_plan = None
         cls._process_generation += 1
         cls._pool_epoch_counter += 1
@@ -2590,13 +1956,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls, default: str = _KVARN_FLUSH_INDEX_MATERIALIZATION_REFERENCE
     ) -> str:
         if cls._flush_index_materialization is None:
-            selection, source = _kvarn_flush_index_materialization_requested(default)
-            cls._flush_index_materialization = selection
+            cls._flush_index_materialization = default
             logger.info_once(
                 "[KVARN_FACTORY] selected_flush_index_materialization=%s; "
-                "selector_source=%s; immutable for engine lifetime",
-                selection,
-                source,
+                "release default; immutable for engine lifetime",
+                default,
             )
         return cls._flush_index_materialization
 
@@ -2611,13 +1975,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     @classmethod
     def _select_flush_writer(cls, default: str = _KVARN_FLUSH_WRITER_REFERENCE) -> str:
         if cls._flush_writer is None:
-            selection, source = _kvarn_flush_writer_requested(default)
-            cls._flush_writer = selection
+            cls._flush_writer = default
             logger.info_once(
-                "[KVARN_FACTORY] selected_flush_writer=%s; selector_source=%s; "
+                "[KVARN_FACTORY] selected_flush_writer=%s; release default; "
                 "immutable for engine lifetime",
-                selection,
-                source,
+                default,
             )
         return cls._flush_writer
 
@@ -2626,13 +1988,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls, default: str = _KVARN_SINKHORN_SOURCE_MATERIALIZED
     ) -> str:
         if cls._sinkhorn_source is None:
-            selection, source = _kvarn_sinkhorn_source_requested(default)
-            cls._sinkhorn_source = selection
+            cls._sinkhorn_source = default
             logger.info_once(
-                "[KVARN_SINKHORN] selected_source=%s; selector_source=%s; "
+                "[KVARN_SINKHORN] selected_source=%s; release default; "
                 "immutable for engine lifetime",
-                selection,
-                source,
+                default,
             )
         return cls._sinkhorn_source
 
@@ -2650,16 +2010,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 source,
             )
         return cls._forward_pool_ensure
-
-    @classmethod
-    def _select_pool_runtime_policy(cls) -> tuple[str | None, str | None]:
-        """Freeze pool-affecting native switches for this model generation."""
-        if cls._pool_runtime_policy is None:
-            cls._pool_runtime_policy = (
-                os.environ.get("KVARN_NATIVE_XPU"),
-                os.environ.get("KVARN_NATIVE_XPU_PERSISTENT_SCRATCH"),
-            )
-        return cls._pool_runtime_policy
 
     @classmethod
     def _next_pool_epoch(cls) -> int:
@@ -2692,30 +2042,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls, default: str = _KVARN_QLEN1_INLINE_PLAN_REFERENCE
     ) -> str:
         if cls._qlen1_inline_plan is None:
-            selection, source = _kvarn_qlen1_inline_plan_requested(default)
-            cls._qlen1_inline_plan = selection
-            if selection == _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2:
-                logger.info_once(
-                    "[KVARN_FACTORY] selected_qlen1_inline_plan=%s; "
-                    "selector_source=%s; variant=H; cached_invariants="
-                    "layout+abi+device+dtype+split+output; "
-                    "dynamic_guards=process_generation+binding_epoch+"
-                    "cache_identity+metadata_kind+batch_limit; "
-                    "fallback=reference; immutable for engine lifetime",
-                    selection,
-                    source,
-                )
-            else:
-                logger.info_once(
-                    "[KVARN_FACTORY] selected_qlen1_inline_plan=%s; "
-                    "selector_source=%s; cached_invariants="
-                    "pool+cache_abi+qkv_eligibility+decode_eligibility; "
-                    "dynamic_guards=qlen1+tensor_schema+cache_identity+generation+"
-                    "pool_epochs+lookup_capacity; "
-                    "fallback=reference; immutable for engine lifetime",
-                    selection,
-                    source,
-                )
+            cls._qlen1_inline_plan = default
+            logger.info_once(
+                "[KVARN_FACTORY] selected_qlen1_inline_plan=%s; release default; "
+                "immutable for engine lifetime",
+                default,
+            )
         return cls._qlen1_inline_plan
 
     @classmethod
@@ -2869,8 +2201,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._native_qkv_scatter_active_logged = False
         self._pending_fused_qkv_signature: tuple | None = None
         self._forward_pool_elision_active_logged = False
-        self._trusted_qlen1_inline_execution_logged = False
-        self._trusted_qlen1_inline_bound: _KVarNTrustedQlen1InlinePlan | None = None
         self._bound_qlen1_inline_v2_execution_logged = False
         self._bound_qlen1_inline_v2_binding_epoch = 0
         self._bound_qlen1_inline_v2_plan: _KVarNBoundQlen1InlinePlanV2 | None = None
@@ -2928,50 +2258,14 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             else _KVARN_SINKHORN_SOURCE_MATERIALIZED
         )
         self._kvarn_forward_pool_ensure = type(self)._select_forward_pool_ensure()
-        self._kvarn_pool_runtime_policy = type(self)._select_pool_runtime_policy()
         self._kvarn_qlen1_inline_plan = type(self)._select_qlen1_inline_plan(
             _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2
             if self._kvarn_xpu_beta_profile
             else _KVARN_QLEN1_INLINE_PLAN_REFERENCE
         )
-        self.use_trusted_qlen1_inline_plan = (
-            self._kvarn_qlen1_inline_plan == _KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE
-        )
         self.use_bound_qlen1_inline_plan_v2 = (
             self._kvarn_qlen1_inline_plan == _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2
         )
-        if (
-            self._kvarn_forward_pool_ensure
-            == _KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF
-            and self._kvarn_frontend_variant
-            not in {
-                KVARN_FRONTEND_QKV_SCATTER,
-                KVARN_FRONTEND_QKV_SCATTER_INLINE,
-                KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
-            }
-        ):
-            raise RuntimeError(
-                f"{_KVARN_FORWARD_POOL_ENSURE_ENV}="
-                f"{_KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF} requires "
-                "KVARN_NATIVE_XPU_FRONTEND=qkv_scatter or "
-                "qkv_scatter_inline, or qkv_scatter_inline_current_stream"
-            )
-        if (
-            self._kvarn_qlen1_inline_plan
-            in {
-                _KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE,
-                _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2,
-            }
-            and self._kvarn_frontend_variant != KVARN_FRONTEND_QKV_SCATTER_INLINE
-            and self._kvarn_frontend_variant
-            != KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM
-        ):
-            raise RuntimeError(
-                f"{_KVARN_QLEN1_INLINE_PLAN_ENV}="
-                f"{self._kvarn_qlen1_inline_plan} requires "
-                "KVARN_NATIVE_XPU_FRONTEND=qkv_scatter_inline or "
-                "qkv_scatter_inline_current_stream"
-            )
         self._kvarn_cached_prefill_materializer = type(
             self
         )._select_cached_prefill_materializer()
@@ -2987,7 +2281,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 op_available=kvarn_native_layout_abi_supported(
                     "kvarn_pack_balanced_kv"
                 ),
-                rtn_quantile=float(os.environ.get("KVARN_RTN_QUANTILE", "0") or 0),
+                rtn_quantile=0.0,
             )
             if not supported:
                 raise RuntimeError(
@@ -3064,11 +2358,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         ) = None
         self._pool_ready_key: tuple[torch.device, tuple] | None = None
         self._pool_ready_native_key: tuple | None = None
-        self._pool_ready_env: tuple[str | None, ...] | None = None
         self._pool_ready_process_generation: int = -1
         self._pool_ready_mirror_epoch: int = -1
         self._pool_ready_shared_epoch: int = -1
-        self._pool_epoch_latch_active_logged = False
         self._mid_o_buf: torch.Tensor | None = None
         self._mid_lse_buf: torch.Tensor | None = None
         self._fa_K_buf: torch.Tensor = None  # type: ignore[assignment]
@@ -3115,14 +2407,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     def _publish_bound_qlen1_inline_v2_pool_binding(self) -> None:
         if getattr(self, "use_bound_qlen1_inline_plan_v2", False):
             self._bump_bound_qlen1_inline_v2_epoch()
-
-    def _override_pool_runtime_policy_for_test(
-        self, policy: tuple[str | None, str | None]
-    ) -> None:
-        """Explicitly replace the frozen receipt policy in unit tests only."""
-        if len(policy) != 2:
-            raise ValueError("KVarN pool runtime policy must contain two values")
-        self._kvarn_pool_runtime_policy = policy
 
     def _pool_required_blocks(self, num_blocks_hint: int) -> int:
         return max(
@@ -3269,56 +2553,17 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cls._mark_pool_shared_changed(shared_key)
         return scratch
 
-    def _pool_epoch_latch_is_current(
-        self, device: torch.device, num_blocks_hint: int
-    ) -> bool:
-        """Check the opt-in readiness receipt without scanning shared buffers."""
-        if (
-            getattr(
-                self,
-                "_kvarn_forward_pool_ensure",
-                _KVARN_FORWARD_POOL_ENSURE_ALWAYS,
-            )
-            != _KVARN_FORWARD_POOL_ENSURE_EPOCH_LATCH
-        ):
-            return False
-        cls = type(self)
-        mirror_key = (device, self._group_key)
-        shared_key = (device, self.kvarn_config.head_dim, self.num_kv_heads)
-        return (
-            getattr(self, "_pool_ready_process_generation", -1)
-            == cls._process_generation
-            and self._pool_ready_key == mirror_key
-            and self._pool_ready_env == self._kvarn_pool_runtime_policy
-            and self._block_lookup_size >= self._pool_required_blocks(num_blocks_hint)
-            and getattr(self, "_pool_ready_mirror_epoch", -1)
-            == cls._pool_mirror_epochs.get(mirror_key, -1)
-            and getattr(self, "_pool_ready_shared_epoch", -1)
-            == cls._pool_shared_epochs.get(shared_key, -1)
-            and self._beta_native_scratch_binding_is_valid(device)
-        )
-
-    def _record_pool_epoch_latch(self, device: torch.device) -> None:
-        cls = type(self)
-        mirror_key = (device, self._group_key)
-        shared_key = (device, self.kvarn_config.head_dim, self.num_kv_heads)
-        self._pool_ready_process_generation = cls._process_generation
-        self._pool_ready_mirror_epoch = cls._pool_mirror_epochs.get(mirror_key, -1)
-        self._pool_ready_shared_epoch = cls._pool_shared_epochs.get(shared_key, -1)
-
     def _pool_is_initialized_for(
         self, device: torch.device, num_blocks_hint: int
     ) -> bool:
         """Check the fully initialized hot-path state without touching XPU."""
         cls = type(self)
         mkey = (device, self._group_key)
-        runtime_policy = self._kvarn_pool_runtime_policy
         required_blocks = self._pool_required_blocks(num_blocks_hint)
         block_to_slot = cls._block_to_slot_t_per_device.get(mkey)
         is_sink = cls._is_sink_t_per_device.get(mkey)
         if (
             self._pool_ready_key != mkey
-            or self._pool_ready_env != runtime_policy
             or block_to_slot is None
             or is_sink is None
             or self._block_to_slot_t is not block_to_slot
@@ -3377,35 +2622,13 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         All allocation happens BEFORE the captured forward, so
         do_kv_cache_update can be pure tensor ops.
         """
-        if self._pool_epoch_latch_is_current(device, num_blocks_hint):
-            if not getattr(self, "_pool_epoch_latch_active_logged", False):
-                logger.info(
-                    "[KVARN_FORWARD_POOL_ENSURE] active=epoch_latch; "
-                    "action=elide_full_validation; layer=%s",
-                    getattr(self, "layer_name", ""),
-                )
-                self._pool_epoch_latch_active_logged = True
-            return
         if self._pool_is_initialized_for(device, num_blocks_hint):
-            self._record_pool_epoch_latch(device)
             return
         if current_platform.is_xpu():
             is_capturing = torch.xpu.is_current_stream_capturing()
         else:
             is_capturing = torch.cuda.is_current_stream_capturing()
         if is_capturing:
-            if (
-                getattr(
-                    self,
-                    "_kvarn_forward_pool_ensure",
-                    _KVARN_FORWARD_POOL_ENSURE_ALWAYS,
-                )
-                == _KVARN_FORWARD_POOL_ENSURE_EPOCH_LATCH
-            ):
-                raise RuntimeError(
-                    "KVarN epoch_latch became stale during stream capture; "
-                    "reinitialize the pool outside capture"
-                )
             return
         cfg = self.kvarn_config
         cls = type(self)
@@ -3769,14 +2992,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._fa_V_buf = cls._shared_fa_V_buf[bkey]
         self._pool_ready_key = mkey
         self._pool_ready_native_key = native_key
-        self._pool_ready_env = self._kvarn_pool_runtime_policy
         if not self._beta_native_scratch_binding_is_valid(device):
             raise RuntimeError(
                 "XPU KVarN beta requires a complete native scratch binding; "
                 "the installed with-scratch ABI or configured capacity is "
                 "unavailable"
             )
-        self._record_pool_epoch_latch(device)
         self._publish_bound_qlen1_inline_v2_pool_binding()
 
     def _warm_decode_kernels(self, device: torch.device) -> None:
@@ -4293,12 +3514,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         layout; only the data movement is batched."""
         if not flush_pairs:
             return
-        if (
-            cls._select_flush_writer() == _KVARN_FLUSH_WRITER_REFERENCE
-            and os.environ.get("KVARN_FAST_FLUSH", "1") != "1"
-        ):
-            return cls._batched_flush_legacy(flush_pairs)
-
         cfg = flush_pairs[0][0].kvarn_config
         Hk = flush_pairs[0][0].num_kv_heads
         D = cfg.head_dim
@@ -4470,121 +3685,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cumulative["shared_layer_reuses"],
         )
 
-    @classmethod
-    def _batched_flush_legacy(cls, flush_pairs: list) -> None:
-        """Flush many (impl, block_id, kv_cache) tiles via batched Sinkhorn + RTN.
-
-        Replaces the per-(layer, block) Python loop calling `_flush_tail`. At
-        burst with many layers × many lockstep boundary crossings, the per-call
-        kernel-launch + Python-iter overhead dominated; Sinkhorn and the RTN-
-        pack are per-tile-independent, so stacking is numerically identical
-        (no accuracy change).
-
-        Chunked at CHUNK_PAIRS to bound the transient gather memory — at peak
-        (48 layers × ~73 lockstep reqs = ~3.5k pairs), the unchunked stack hits
-        >2 GB of fp32 working memory and OOMs on a memory-tight burst.
-        """
-        if not flush_pairs:
-            return
-        CHUNK_PAIRS = 256
-        cfg = flush_pairs[0][0].kvarn_config
-        Hk = flush_pairs[0][0].num_kv_heads
-        # Pre-filter pairs that still have a pool slot (some may have been freed
-        # by a sibling impl's flush already during this builder call).
-        filt: list[tuple] = []
-        for impl, bid, kvc in flush_pairs:
-            slot = cls._block_to_slot_dict.get(impl._group_key, {}).get(bid)
-            if slot is None:
-                impl._tails.pop(bid, None)
-                continue
-            filt.append((impl, bid, kvc, slot))
-            impl._tails.pop(bid, None)
-        if not filt:
-            return
-        for c0 in range(0, len(filt), CHUNK_PAIRS):
-            chunk = filt[c0 : c0 + CHUNK_PAIRS]
-            N = len(chunk)
-            # Gather pool data for this chunk.
-            K_list = [
-                impl._tail_K_pool[slot].float() for impl, _, _, slot in chunk
-            ]  # [G, Hk, D]
-            V_list = [impl._tail_V_pool[slot].float() for impl, _, _, slot in chunk]
-            K_stack = torch.stack(K_list, dim=0)  # [N, G, Hk, D]
-            V_stack = torch.stack(V_list, dim=0)
-            # Optional: dump first chunk's raw (pre-Sinkhorn) tiles for outlier
-            # analysis (KVARN_DUMP_TILES=/path/to/file.pt).
-            dump_path = os.environ.get("KVARN_DUMP_TILES", "")
-            if dump_path and not getattr(cls, "_tiles_dumped", False):
-                cls._tiles_dumped = True
-                # Capture per-tile (layer_idx, block_id) for per-layer analysis.
-                # layer_idx pulled from impl.layer_name
-                # (e.g. "model.layers.7.self_attn")
-                # via a regex fallback to enumerate index if name parsing fails.
-                import regex as re
-
-                lyr_ids, blk_ids = [], []
-                for impl, bid, _, _ in chunk:
-                    name = getattr(impl, "layer_name", "") or ""
-                    m = re.search(r"layers\.(\d+)\b", name)
-                    lyr_ids.append(int(m.group(1)) if m else -1)
-                    blk_ids.append(int(bid))
-                torch.save(
-                    {
-                        "K_stack": K_stack.detach().cpu(),
-                        "V_stack": V_stack.detach().cpu(),
-                        "layer_ids": lyr_ids,
-                        "block_ids": blk_ids,
-                        "Hk": flush_pairs[0][0].num_kv_heads,
-                        "G": cfg.group,
-                        "D": cfg.head_dim,
-                        "key_bits": cfg.key_bits,
-                        "value_bits": cfg.value_bits,
-                        "sinkhorn_iters": cfg.sinkhorn_iters,
-                    },
-                    dump_path,
-                )
-                print(
-                    f"[KVARN] dumped {N} (layer,block) pre-Sinkhorn tiles "
-                    f"→ {dump_path}",
-                    flush=True,
-                )
-                print(f"[KVARN] layer_ids in dump: {sorted(set(lyr_ids))}", flush=True)
-            del K_list, V_list
-            # K tile per Sinkhorn batch row: [D, G] (absorb = channel).
-            K_tiles = K_stack.permute(0, 2, 3, 1).reshape(
-                N * Hk, K_stack.shape[3], K_stack.shape[1]
-            )
-            V_tiles = V_stack.permute(0, 2, 1, 3).reshape(
-                N * Hk, V_stack.shape[1], V_stack.shape[3]
-            )
-            del K_stack, V_stack
-            # Sinkhorn + pack (fused when square head_dim==group, else separate
-            # K/V launches for non-square head_dim=256 — see _sinkhorn_pack_kv).
-            cache_layout = chunk[0][0]._kvarn_cache_layout
-            if any(impl._kvarn_cache_layout != cache_layout for impl, *_ in chunk):
-                raise RuntimeError(
-                    "Cannot batch KVarN flushes across different cache layouts"
-                )
-            K_out, V_out = _sinkhorn_pack_kv(
-                K_tiles,
-                V_tiles,
-                cfg,
-                cache_layout=cache_layout,
-            )
-            del K_tiles, V_tiles
-            # Distribute packed results to each (layer, block, head) cache slot.
-            for i, (impl, bid, kvc, _) in enumerate(chunk):
-                for h in range(Hk):
-                    idx = i * Hk + h
-                    store_K = {k: v[idx] for k, v in K_out.items()}
-                    store_V = {k: v[idx] for k, v in V_out.items()}
-                    impl._write_packed(kvc, bid, h, store_K, store_V)
-            del K_out, V_out
-
-    # ── do_kv_cache_update ───────────────────────────────────────────────────
-
     def configure_fused_qkv_cache_update(self, layer_name: str) -> bool:
-        """Freeze the selected Q/K/V frontend for this attention layer."""
+        """Bind the qualified Q/K/V frontend to this attention layer."""
         if self._kvarn_frontend_bound:
             if layer_name != self.layer_name:
                 raise RuntimeError(
@@ -4594,21 +3696,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             return self.use_fused_qkv_cache_update
 
         self.layer_name = layer_name
-        self.use_fused_qkv_cache_update = self._kvarn_frontend_variant in {
-            KVARN_FRONTEND_QKV_SCATTER,
-            KVARN_FRONTEND_QKV_SCATTER_INLINE,
-            KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
-        } and kvarn_native_layer_selected(
-            layer_name, os.environ.get("KVARN_NATIVE_XPU_LAYER", "")
+        self.use_fused_qkv_cache_update = (
+            self._kvarn_frontend_variant
+            == KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM
         )
-        self.use_inline_qkv_cache_update = (
-            self.use_fused_qkv_cache_update
-            and self._kvarn_frontend_variant
-            in {
-                KVARN_FRONTEND_QKV_SCATTER_INLINE,
-                KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
-            }
-        )
+        self.use_inline_qkv_cache_update = self.use_fused_qkv_cache_update
         self._kvarn_frontend_bound = True
         logger.info(
             "[KVARN_FRONTEND] configured=%s; layer=%s; selected=%s; "
@@ -4616,17 +3708,14 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             self._kvarn_frontend_variant,
             layer_name,
             self.use_fused_qkv_cache_update,
-            (
-                self._kvarn_qkv_scatter_op_name
-                if self.use_fused_qkv_cache_update
-                else "none"
-            ),
+            self._kvarn_qkv_scatter_op_name
+            if self.use_fused_qkv_cache_update
+            else "none",
         )
         if self.use_inline_qkv_cache_update:
             logger.info(
                 "[KVARN_FRONTEND_INLINE] configured=%s; layer=%s; "
-                "route=single_attention_context; "
-                "native_op=%s; "
+                "route=single_attention_context; native_op=%s; "
                 "immutable for engine lifetime",
                 self._kvarn_frontend_variant,
                 layer_name,
@@ -4785,276 +3874,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 self._kvarn_cache_layout,
             )
             self._native_qkv_scatter_active_logged = True
-
-    def _capture_trusted_inline_pool_receipt(
-        self, device: torch.device, lookup_capacity: int
-    ) -> _KVarNTrustedInlinePoolReceipt | None:
-        """Snapshot the pool bindings consumed by the trusted inline route."""
-        cls = type(self)
-        mirror_key = (device, self._group_key)
-        shared_key = (device, self.kvarn_config.head_dim, self.num_kv_heads)
-        block_to_slot = cls._block_to_slot_t_per_device.get(mirror_key)
-        is_sink = cls._is_sink_t_per_device.get(mirror_key)
-        q_rot_fp16 = cls._shared_q_rot_fp16_buf.get(shared_key)
-        fused_output = cls._shared_fused_out_buf.get(shared_key)
-        native_output_fp16 = cls._shared_native_output_fp16_buf.get(shared_key)
-        native_scratch_key = self._pool_ready_native_key
-        native_scratch = self._native_decode_scratch
-        mirror_epoch = cls._pool_mirror_epochs.get(mirror_key, -1)
-        shared_epoch = cls._pool_shared_epochs.get(shared_key, -1)
-        if (
-            mirror_epoch < 0
-            or shared_epoch < 0
-            or self._pool_ready_process_generation != cls._process_generation
-            or self._pool_ready_mirror_epoch != mirror_epoch
-            or self._pool_ready_shared_epoch != shared_epoch
-            or self._pool_ready_key != mirror_key
-            or self._pool_ready_env != self._kvarn_pool_runtime_policy
-            or block_to_slot is None
-            or is_sink is None
-            or q_rot_fp16 is None
-            or fused_output is None
-            or native_output_fp16 is None
-            or self._block_to_slot_t is not block_to_slot
-            or self._is_sink_t is not is_sink
-            or self._q_rot_fp16_buf is not q_rot_fp16
-            or self._fused_out_buf is not fused_output
-            or self._native_output_fp16_buf is not native_output_fp16
-            or self._block_lookup_size < lookup_capacity
-            or block_to_slot.shape[0] < lookup_capacity
-            or (
-                native_scratch_key is not None
-                and native_scratch
-                is not cls._shared_native_decode_scratch.get(native_scratch_key)
-            )
-        ):
-            return None
-        return _KVarNTrustedInlinePoolReceipt(
-            mirror_key=mirror_key,
-            shared_key=shared_key,
-            mirror_epoch=mirror_epoch,
-            shared_epoch=shared_epoch,
-            runtime_policy=self._kvarn_pool_runtime_policy,
-            lookup_capacity=lookup_capacity,
-            block_to_slot=block_to_slot,
-            is_sink=is_sink,
-            tail_key=self._tail_K_pool,
-            tail_value=self._tail_V_pool,
-            q_rot_fp16=q_rot_fp16,
-            fused_output=fused_output,
-            native_output_fp16=native_output_fp16,
-            native_scratch_key=native_scratch_key,
-            native_scratch=native_scratch,
-        )
-
-    def _trusted_inline_pool_receipt_is_current(
-        self, receipt: _KVarNTrustedInlinePoolReceipt | None
-    ) -> bool:
-        """Validate epochs, capacity, and exact bindings without a full scan."""
-        if receipt is None:
-            return False
-        cls = type(self)
-        return (
-            receipt.runtime_policy == self._kvarn_pool_runtime_policy
-            and self._pool_ready_process_generation == cls._process_generation
-            and self._pool_ready_key == receipt.mirror_key
-            and self._pool_ready_env == receipt.runtime_policy
-            and self._pool_ready_mirror_epoch == receipt.mirror_epoch
-            and self._pool_ready_shared_epoch == receipt.shared_epoch
-            and cls._pool_mirror_epochs.get(receipt.mirror_key, -1)
-            == receipt.mirror_epoch
-            and cls._pool_shared_epochs.get(receipt.shared_key, -1)
-            == receipt.shared_epoch
-            and self._block_lookup_size >= receipt.lookup_capacity
-            and receipt.block_to_slot.shape[0] >= receipt.lookup_capacity
-            and self._block_to_slot_t is receipt.block_to_slot
-            and self._is_sink_t is receipt.is_sink
-            and cls._block_to_slot_t_per_device.get(receipt.mirror_key)
-            is receipt.block_to_slot
-            and cls._is_sink_t_per_device.get(receipt.mirror_key) is receipt.is_sink
-            and self._tail_K_pool is receipt.tail_key
-            and self._tail_V_pool is receipt.tail_value
-            and self._q_rot_fp16_buf is receipt.q_rot_fp16
-            and self._fused_out_buf is receipt.fused_output
-            and self._native_output_fp16_buf is receipt.native_output_fp16
-            and cls._shared_q_rot_fp16_buf.get(receipt.shared_key) is receipt.q_rot_fp16
-            and cls._shared_fused_out_buf.get(receipt.shared_key)
-            is receipt.fused_output
-            and cls._shared_native_output_fp16_buf.get(receipt.shared_key)
-            is receipt.native_output_fp16
-            and self._pool_ready_native_key == receipt.native_scratch_key
-            and self._native_decode_scratch is receipt.native_scratch
-            and (
-                receipt.native_scratch_key is None
-                or cls._shared_native_decode_scratch.get(receipt.native_scratch_key)
-                is receipt.native_scratch
-            )
-        )
-
-    def _trusted_qlen1_inline_inputs_valid(
-        self,
-        plan: _KVarNTrustedQlen1InlinePlan,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        attn_metadata,
-        output: torch.Tensor,
-    ) -> bool:
-        """Check only step-varying facts not covered by the cached plan."""
-        generation_is_current = (
-            plan.process_generation == type(self)._process_generation
-        )
-        pool_is_current = self._trusted_inline_pool_receipt_is_current(
-            plan.pool_receipt
-        )
-        if not generation_is_current or not pool_is_current:
-            return False
-        if kv_cache is not plan.cache_owner or query.device != plan.device:
-            return False
-        if slot_mapping.ndim != 1:
-            return False
-        num_tokens = slot_mapping.shape[0]
-        if (
-            not _is_pure_kvarn_decode_step(attn_metadata, num_tokens)
-            or not 1 <= num_tokens <= plan.native_decode.max_batch
-        ):
-            return False
-        if not all(
-            isinstance(tensor, torch.Tensor)
-            for tensor in (
-                query,
-                key,
-                value,
-                slot_mapping,
-                output,
-                attn_metadata.block_table,
-                attn_metadata.seq_lens,
-            )
-        ):
-            return False
-        return (
-            query.dtype == key.dtype == value.dtype == plan.activation_dtype
-            and query.device == key.device == value.device == slot_mapping.device
-            and output.device == query.device
-            and output.dtype in (torch.float16, torch.bfloat16)
-            and query.ndim == key.ndim == value.ndim == output.ndim == 3
-            and query.shape[0] >= num_tokens
-            and key.shape[0] >= num_tokens
-            and value.shape[0] >= num_tokens
-            and output.shape[0] >= num_tokens
-            and query.shape[1:] == (self.num_heads, self.head_size)
-            and key.shape[1:] == (self.num_kv_heads, self.head_size)
-            and value.shape[1:] == key.shape[1:]
-            and output.shape[1:] == query.shape[1:]
-            and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
-            and output.is_contiguous()
-            and slot_mapping.dtype == torch.int64
-            and slot_mapping.is_contiguous()
-            and attn_metadata.block_table[:num_tokens].is_contiguous()
-            and attn_metadata.seq_lens[:num_tokens].is_contiguous()
-            and int(attn_metadata.max_seq_len) >= 1
-        )
-
-    def forward_trusted_qlen1_inline(
-        self,
-        layer: AttentionLayer,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        attn_metadata: KVarNMetadata,
-        output: torch.Tensor,
-    ) -> bool:
-        """Run the opt-in native qlen=1 frontend and decode from one proof."""
-        if (
-            getattr(
-                self,
-                "_kvarn_qlen1_inline_plan",
-                _KVARN_QLEN1_INLINE_PLAN_REFERENCE,
-            )
-            != _KVARN_QLEN1_INLINE_PLAN_TRUSTED_NATIVE
-        ):
-            return False
-
-        plan = self._trusted_qlen1_inline_bound
-        if plan is None:
-            cache_view = self._record_cache_view(kv_cache)
-            if (
-                cache_view.numel() == 0
-                or cache_view.shape[-1] != self.kvarn_config.record_bytes
-            ):
-                return False
-            self._ensure_pool(query.device, num_blocks_hint=cache_view.shape[0])
-            if not self._native_qkv_scatter_eligible(
-                layer, query, key, value, slot_mapping, attn_metadata
-            ):
-                return False
-            native_decode = build_kvarn_trusted_native_decode_plan(
-                query,
-                cache_view,
-                self.kvarn_config,
-                self,
-                attn_metadata,
-            )
-            if native_decode is None:
-                return False
-            pool_receipt = self._capture_trusted_inline_pool_receipt(
-                query.device, cache_view.shape[0]
-            )
-            if pool_receipt is None:
-                return False
-            plan = _KVarNTrustedQlen1InlinePlan(
-                process_generation=type(self)._process_generation,
-                cache_owner=kv_cache,
-                cache_view=cache_view,
-                device=query.device,
-                activation_dtype=query.dtype,
-                native_decode=native_decode,
-                pool_receipt=pool_receipt,
-            )
-            self._trusted_qlen1_inline_bound = plan
-            self._kv_cache_ref = cache_view
-
-        if not self._trusted_qlen1_inline_inputs_valid(
-            plan,
-            query,
-            key,
-            value,
-            kv_cache,
-            slot_mapping,
-            attn_metadata,
-            output,
-        ):
-            self._trusted_qlen1_inline_bound = None
-            return False
-
-        self._pending_fused_qkv_signature = None
-        self._launch_native_qkv_scatter(query, key, value, slot_mapping)
-        num_tokens = slot_mapping.shape[0]
-        q = query[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
-        direct_output = output[:num_tokens]
-        attn_out = self._decode_path(
-            q,
-            plan.cache_view,
-            attn_metadata,
-            output=direct_output,
-            query_rotation_precomputed=True,
-            trusted_native_plan=plan.native_decode,
-        )
-        if attn_out is not direct_output:
-            direct_output.copy_(attn_out)
-        if not self._trusted_qlen1_inline_execution_logged:
-            logger.info(
-                "[KVARN_TRUSTED_QLEN1_INLINE] active=trusted_native; "
-                "layer=%s; cached=pool_ready+cache_abi+qkv_eligibility+"
-                "decode_eligibility; fallback=reference",
-                getattr(self, "layer_name", ""),
-            )
-            self._trusted_qlen1_inline_execution_logged = True
-        return True
 
     def _bind_bound_qlen1_inline_v2_plan(
         self,
@@ -5324,10 +4143,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                     "kvarn_hadamard_scatter"
                 ),
             )
-            and kvarn_native_layer_selected(
-                getattr(self, "layer_name", ""),
-                os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
-            )
             and key.ndim == 3
             and key.shape[0] >= num_tokens
             and key.shape[1:] == (self.num_kv_heads, self.head_size)
@@ -5482,11 +4297,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 ),
             )
             and (
-                kvarn_native_layer_selected(
-                    getattr(self, "layer_name", ""),
-                    os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
-                )
-                and key.stride(-1) == 1
+                key.stride(-1) == 1
                 and value.stride(-1) == 1
                 and slot_mapping.dtype == torch.int64
                 and self._block_to_slot_t.dtype == torch.int32
@@ -5607,26 +4418,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
         # Make sure pool + block-lookup tensors exist and cover num_blocks.
         if not profiling_without_cache:
-            elide_pool_ensure = (
-                getattr(
-                    self,
-                    "_kvarn_forward_pool_ensure",
-                    _KVARN_FORWARD_POOL_ENSURE_ALWAYS,
-                )
-                == _KVARN_FORWARD_POOL_ENSURE_FUSED_QKV_PROOF
-                and query_rotation_precomputed
-            )
-            if elide_pool_ensure:
-                if not self._forward_pool_elision_active_logged:
-                    logger.info(
-                        "[KVARN_FORWARD_POOL_ENSURE] "
-                        "active=fused_qkv_proof; action=elide_ensure_pool; "
-                        "layer=%s",
-                        getattr(self, "layer_name", ""),
-                    )
-                    self._forward_pool_elision_active_logged = True
-            else:
-                self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
+            self._ensure_pool(device, num_blocks_hint=kv_cache.shape[0])
             # Cache the kv_cache ref so the metadata builder can drive flushes
             # into this layer's int4 cache (outside the captured region).
             if getattr(self, "use_bound_qlen1_inline_plan_v2", False):
@@ -6121,11 +4913,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             or cfg.record_bytes % 4 != 0
         ):
             return False, "unsupported_cache_abi"
-        if not kvarn_native_layer_selected(
-            getattr(self, "layer_name", ""),
-            os.environ.get("KVARN_NATIVE_XPU_LAYER", ""),
-        ):
-            return False, "layer_not_selected"
         if not kvarn_native_layout_abi_supported("kvarn_materialize_packed_kv"):
             return False, "native_op_unavailable"
         if kv_cache.device.type != "xpu":
