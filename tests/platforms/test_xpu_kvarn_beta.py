@@ -18,6 +18,8 @@ def _config(
     prefix_caching=False,
     multimodal=False,
     language_model_only=False,
+    model_type=None,
+    video_limit=0,
 ):
     return SimpleNamespace(
         cache_config=SimpleNamespace(
@@ -31,8 +33,12 @@ def _config(
         ),
         model_config=SimpleNamespace(
             is_multimodal_model=multimodal,
+            hf_config=SimpleNamespace(model_type=model_type),
             multimodal_config=(
-                SimpleNamespace(language_model_only=language_model_only)
+                SimpleNamespace(
+                    language_model_only=language_model_only,
+                    get_limit_per_prompt=lambda modality: video_limit,
+                )
                 if multimodal
                 else None
             ),
@@ -48,6 +54,20 @@ def test_kvarn_beta_accepts_multimodal_checkpoint_in_language_only_mode() -> Non
     _check_kvarn_beta_unsupported_config(
         _config(multimodal=True, language_model_only=True), CUDAGraphMode.NONE
     )
+
+
+def test_kvarn_beta_accepts_qwen35_images_with_video_disabled() -> None:
+    _check_kvarn_beta_unsupported_config(
+        _config(multimodal=True, model_type="qwen3_5"), CUDAGraphMode.NONE
+    )
+
+
+def test_kvarn_beta_does_not_enable_unvalidated_video() -> None:
+    with pytest.raises(ValueError, match="video inputs disabled"):
+        _check_kvarn_beta_unsupported_config(
+            _config(multimodal=True, model_type="qwen3_5", video_limit=1),
+            CUDAGraphMode.NONE,
+        )
 
 
 @pytest.mark.parametrize(
