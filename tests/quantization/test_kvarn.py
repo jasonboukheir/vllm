@@ -82,6 +82,17 @@ from vllm.v1.kv_cache_interface import (
 )
 
 
+def test_xpu_beta_skips_unused_generic_decode_autotuning(monkeypatch):
+    impl = object.__new__(KVarNAttentionImpl)
+    impl._kvarn_xpu_beta_profile = True
+
+    def reject_allocation(*args, **kwargs):
+        pytest.fail("native-only XPU startup allocated generic autotune scratch")
+
+    monkeypatch.setattr(torch, "zeros", reject_allocation)
+    impl._warm_decode_kernels(torch.device("xpu"))
+
+
 def test_kvarn_xpu_decode_uses_only_qualified_native_configuration():
     assert kvarn_cache_layout_requested(KVARN_CACHE_LAYOUT_XE2_DPAS) == "xe2_dpas"
     assert (
@@ -378,7 +389,7 @@ def test_cached_prefill_materializer_selection_is_frozen_and_logged(
         enabled.assert_called_once_with("MATERIALIZE")
         marker.assert_called_once_with(
             "[KVARN_FACTORY] selected_cached_prefill_materializer=%s; "
-            "selectors=KVARN_NATIVE_XPU,KVARN_NATIVE_XPU_MATERIALIZE; "
+            "release default; "
             "eligibility_fallback=reference; immutable for engine lifetime",
             "native_xe2",
         )
