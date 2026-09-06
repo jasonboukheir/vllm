@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,14 +14,8 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     _kvarn_native_scratch_views,
     _kvarn_op_supports_argument,
     _require_kvarn_dpas_reader,
-    kvarn_cache_layout_requested,
-    kvarn_dpas_layout_requested,
-    kvarn_frontend_variant_requested,
     kvarn_native_bf16_output_supported,
     kvarn_native_decode_abi_supported,
-    kvarn_native_feature_enabled,
-    kvarn_native_kernel_variant_requested,
-    kvarn_native_layer_selected,
     kvarn_native_layout_abi_supported,
     kvarn_native_prefill_store_supported,
     kvarn_native_problem_supported,
@@ -30,43 +23,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_split_policy_requested,
     kvarn_native_split_scratch_count,
     kvarn_native_store_supported,
-    kvarn_prefill_store_variant_requested,
-    validate_kvarn_native_factory_selection,
 )
-
-
-def test_fused_qkv_frontend_requires_explicit_valid_selection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_FRONTEND", raising=False)
-    assert kvarn_frontend_variant_requested() == "reference"
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter")
-    assert kvarn_frontend_variant_requested() == "qkv_scatter"
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter_inline")
-    assert kvarn_frontend_variant_requested() == "qkv_scatter_inline"
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "qkv_scatter_inline_current_stream")
-    assert kvarn_frontend_variant_requested() == "qkv_scatter_inline_current_stream"
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_FRONTEND", "automatic")
-    with pytest.raises(ValueError, match="KVARN_NATIVE_XPU_FRONTEND"):
-        kvarn_frontend_variant_requested()
-
-
-def test_prefill_store_requires_explicit_valid_selection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_PREFILL_STORE", raising=False)
-    assert kvarn_prefill_store_variant_requested() == "reference"
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_PREFILL_STORE", "hadamard_scatter")
-    assert kvarn_prefill_store_variant_requested() == "hadamard_scatter"
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_PREFILL_STORE", "automatic")
-    with pytest.raises(ValueError, match="KVARN_NATIVE_XPU_PREFILL_STORE"):
-        kvarn_prefill_store_variant_requested()
 
 
 def _native_problem(**overrides) -> dict:
@@ -87,29 +44,6 @@ def _native_problem(**overrides) -> dict:
     )
     problem.update(overrides)
     return problem
-
-
-def test_native_feature_master_and_subfeature_toggles(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU", raising=False)
-    monkeypatch.setattr(kvarn_decode.current_platform, "is_xpu", lambda: False)
-    assert not kvarn_native_feature_enabled("DECODE")
-
-    monkeypatch.setattr(kvarn_decode.current_platform, "is_xpu", lambda: True)
-    assert kvarn_native_feature_enabled("DECODE")
-    assert kvarn_native_feature_enabled("MATERIALIZE")
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
-    assert kvarn_native_feature_enabled("DECODE")
-    assert kvarn_native_feature_enabled("MATERIALIZE")
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_DECODE", "0")
-    assert not kvarn_native_feature_enabled("DECODE")
-    assert kvarn_native_feature_enabled("MATERIALIZE")
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_MATERIALIZE", "0")
-    assert not kvarn_native_feature_enabled("MATERIALIZE")
 
 
 def _native_store(**overrides) -> dict:
@@ -141,31 +75,6 @@ def _native_prefill_store(**overrides) -> dict:
     return problem
 
 
-def test_native_store_follows_decode_switch(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU", raising=False)
-    monkeypatch.setattr(kvarn_decode.current_platform, "is_xpu", lambda: True)
-    assert kvarn_native_store_supported(**_native_store())
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU", "0")
-    assert not kvarn_native_store_supported(**_native_store())
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
-    assert kvarn_native_store_supported(**_native_store())
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_DECODE", "0")
-    assert not kvarn_native_store_supported(**_native_store())
-
-
-def test_native_prefill_store_follows_master_switch_and_has_no_decode_batch_cap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
-    assert kvarn_native_prefill_store_supported(**_native_prefill_store())
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU", "0")
-    assert not kvarn_native_prefill_store_supported(**_native_prefill_store())
-
-
 @pytest.mark.parametrize(
     "override",
     [
@@ -189,7 +98,7 @@ def test_native_prefill_store_follows_master_switch_and_has_no_decode_batch_cap(
 def test_native_prefill_store_rejects_unsupported_dispatch(
     monkeypatch: pytest.MonkeyPatch, override: dict
 ) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
+    monkeypatch.setattr(kvarn_decode.current_platform, "is_xpu", lambda: True)
     assert not kvarn_native_prefill_store_supported(**_native_prefill_store(**override))
 
 
@@ -216,7 +125,7 @@ def test_native_prefill_store_rejects_unsupported_dispatch(
 def test_native_store_rejects_unsupported_dispatch(
     monkeypatch: pytest.MonkeyPatch, override: dict
 ) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
+    monkeypatch.setattr(kvarn_decode.current_platform, "is_xpu", lambda: True)
     assert not kvarn_native_store_supported(**_native_store(**override))
 
 
@@ -243,24 +152,6 @@ def test_native_problem_rejects_unsupported_abi(override: dict) -> None:
     assert not kvarn_native_problem_supported(**_native_problem(**override))
 
 
-def test_native_problem_accepts_matching_dpas_layout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", raising=False)
-    assert kvarn_cache_layout_requested() == "natural"
-    assert kvarn_native_problem_supported(**_native_problem())
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
-    assert kvarn_cache_layout_requested() == "xe2_dpas"
-    assert kvarn_dpas_layout_requested()
-    assert kvarn_native_problem_supported(**_native_problem())
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "0")
-    assert not kvarn_dpas_layout_requested()
-    assert kvarn_native_problem_supported(**_native_problem())
-
-
 def test_dpas_layout_refuses_natural_reader_fallback() -> None:
     _require_kvarn_dpas_reader(True, True, "test reader")
     with pytest.raises(RuntimeError, match="refusing the natural-layout"):
@@ -273,473 +164,6 @@ def test_dpas_layout_problem_validation_is_fail_closed() -> None:
     assert _kvarn_dpas_layout_for_problem(True, 256, 128, 4, 4)
     with pytest.raises(RuntimeError, match="requires D256/G128/K4V4"):
         _kvarn_dpas_layout_for_problem(True, 256, 128, 4, 2)
-
-
-def test_named_layout_selector_rejects_conflicts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", "natural")
-    monkeypatch.setenv("KVARN_NATIVE_XPU_DPAS_LAYOUT", "1")
-    with pytest.raises(ValueError, match="conflicts"):
-        kvarn_cache_layout_requested()
-
-    monkeypatch.delenv("KVARN_NATIVE_XPU_DPAS_LAYOUT")
-    monkeypatch.setenv("KVARN_NATIVE_XPU_CACHE_LAYOUT", "future_layout")
-    with pytest.raises(ValueError, match="must be one of"):
-        kvarn_cache_layout_requested()
-
-
-def test_native_kernel_variant_selection_is_named_and_fail_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", raising=False)
-    assert kvarn_native_kernel_variant_requested() == ("baseline", 0)
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", "unknown")
-    with pytest.raises(ValueError, match="must be one of"):
-        kvarn_native_kernel_variant_requested()
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", "q6_b1_short_last_producer")
-    with pytest.raises(ValueError, match="must be one of"):
-        kvarn_native_kernel_variant_requested()
-
-
-@pytest.mark.parametrize(
-    ("name", "variant"),
-    [
-        ("baseline", 0),
-        ("qk_i8u4", 1),
-        ("q6_scalar", 2),
-        ("q8_vector", 3),
-        ("q6_vector", 4),
-        ("q6_cached_weights", 6),
-        ("q6_exact_rows", 7),
-        ("q6_cached_weights_exact_rows", 8),
-        ("q6_page_pair", 9),
-        ("q6_main_grf128", 10),
-        ("q6_split_reducer_specialized", 11),
-        ("q6_next_page_prefetch", 12),
-        ("q6_next_page_prefetch_split_reducer", 13),
-        ("q6_simd_unpack", 14),
-        ("q6_block_output_store", 15),
-        ("q6_current_half_v_prefetch", 16),
-        ("q6_page_record_cursor", 17),
-        ("q6_prefetch_record_cursor", 18),
-        ("q6_page_metadata_cursor", 20),
-        ("q6_paired_nibble_half2", 21),
-    ],
-)
-def test_native_kernel_variant_factory_ids_are_stable(
-    monkeypatch: pytest.MonkeyPatch, name: str, variant: int
-) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU_KERNEL_VARIANT", name)
-    assert kvarn_native_kernel_variant_requested() == (name, variant)
-
-
-@pytest.mark.parametrize(
-    ("name", "variant"),
-    [
-        ("qk_i8u4", 1),
-        ("q6_scalar", 2),
-        ("q8_vector", 3),
-        ("q6_vector", 4),
-        ("q6_cached_weights", 6),
-        ("q6_exact_rows", 7),
-        ("q6_cached_weights_exact_rows", 8),
-        ("q6_page_pair", 9),
-        ("q6_main_grf128", 10),
-        ("q6_split_reducer_specialized", 11),
-        ("q6_next_page_prefetch", 12),
-        ("q6_next_page_prefetch_split_reducer", 13),
-        ("q6_simd_unpack", 14),
-        ("q6_block_output_store", 15),
-        ("q6_current_half_v_prefetch", 16),
-        ("q6_page_record_cursor", 17),
-        ("q6_prefetch_record_cursor", 18),
-        ("q6_page_metadata_cursor", 20),
-        ("q6_paired_nibble_half2", 21),
-    ],
-)
-def test_native_experimental_variants_require_dpas_cache_layout(
-    name: str, variant: int
-) -> None:
-    validate_kvarn_native_factory_selection("xe2_dpas", name, variant)
-    with pytest.raises(ValueError, match="requires.*xe2_dpas"):
-        validate_kvarn_native_factory_selection("natural", name, variant)
-
-    validate_kvarn_native_factory_selection("natural", "baseline", 0)
-
-
-@pytest.mark.parametrize(
-    ("name", "variant"),
-    [
-        ("q6_scalar", 2),
-        ("q6_vector", 4),
-        ("q6_cached_weights", 6),
-        ("q6_exact_rows", 7),
-        ("q6_cached_weights_exact_rows", 8),
-        ("q6_page_pair", 9),
-        ("q6_main_grf128", 10),
-        ("q6_split_reducer_specialized", 11),
-        ("q6_next_page_prefetch", 12),
-        ("q6_next_page_prefetch_split_reducer", 13),
-        ("q6_simd_unpack", 14),
-        ("q6_block_output_store", 15),
-        ("q6_current_half_v_prefetch", 16),
-        ("q6_page_record_cursor", 17),
-        ("q6_prefetch_record_cursor", 18),
-        ("q6_page_metadata_cursor", 20),
-        ("q6_paired_nibble_half2", 21),
-    ],
-)
-def test_b70_q6_split_policy_requires_q6_kernel(name: str, variant: int) -> None:
-    validate_kvarn_native_factory_selection(
-        "xe2_dpas", name, variant, split_policy="b70_q6"
-    )
-    with pytest.raises(ValueError, match="requires a Q6 kernel variant"):
-        validate_kvarn_native_factory_selection(
-            "xe2_dpas", "baseline", 0, split_policy="b70_q6"
-        )
-
-
-@pytest.mark.parametrize(
-    ("name", "variant"),
-    [
-        ("q6_next_page_prefetch", 12),
-        ("q6_next_page_prefetch_split_reducer", 13),
-    ],
-)
-def test_b70_q6_v2_split_policy_requires_profiled_kernels(
-    name: str, variant: int
-) -> None:
-    validate_kvarn_native_factory_selection(
-        "xe2_dpas", name, variant, split_policy="b70_q6_v2"
-    )
-    with pytest.raises(
-        ValueError, match="requires kernel variant.*q6_next_page_prefetch"
-    ):
-        validate_kvarn_native_factory_selection(
-            "xe2_dpas", "q6_scalar", 2, split_policy="b70_q6_v2"
-        )
-
-
-@pytest.mark.parametrize(
-    ("name", "variant"),
-    [
-        ("q6_page_metadata_cursor", 20),
-        ("q6_paired_nibble_half2", 21),
-    ],
-)
-def test_round6_variants_do_not_expand_b70_q6_v2(name: str, variant: int) -> None:
-    with pytest.raises(
-        ValueError, match="requires kernel variant.*q6_next_page_prefetch"
-    ):
-        validate_kvarn_native_factory_selection(
-            "xe2_dpas", name, variant, split_policy="b70_q6_v2"
-        )
-
-
-def test_b70_q6_id18_v1_requires_profiled_kernel() -> None:
-    validate_kvarn_native_factory_selection(
-        "xe2_dpas",
-        "q6_prefetch_record_cursor",
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
-        split_policy="b70_q6_id18_v1",
-    )
-    with pytest.raises(
-        ValueError, match="requires kernel variant.*q6_prefetch_record_cursor"
-    ):
-        validate_kvarn_native_factory_selection(
-            "xe2_dpas",
-            "q6_next_page_prefetch",
-            kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
-            split_policy="b70_q6_id18_v1",
-        )
-
-
-def test_native_kernel_variant_five_remains_reserved() -> None:
-    with pytest.raises(ValueError, match="variant 5 is reserved"):
-        validate_kvarn_native_factory_selection("xe2_dpas", "page128", 5)
-
-
-@pytest.mark.parametrize(
-    ("name", "variant"),
-    [("q6_page_pair", 10), ("unknown", 9), ("baseline", 99)],
-)
-def test_native_kernel_variant_validation_rejects_unregistered_pairs(
-    name: str, variant: int
-) -> None:
-    with pytest.raises(ValueError, match="name/id pair is not registered"):
-        validate_kvarn_native_factory_selection("xe2_dpas", name, variant)
-
-
-def test_native_layer_filter_matches_components() -> None:
-    kvarn_native_layer_selected.cache_clear()
-    name = "model.layers.17.self_attn.attn"
-    assert kvarn_native_layer_selected(name, "")
-    assert kvarn_native_layer_selected(name, "layers.17")
-    assert kvarn_native_layer_selected(name, "layers.3,layers.17.self_attn")
-    assert not kvarn_native_layer_selected(name, "layers.1")
-    assert not kvarn_native_layer_selected(name, "layers.170")
-
-    before = kvarn_native_layer_selected.cache_info()
-    assert kvarn_native_layer_selected(name, "layers.17")
-    after = kvarn_native_layer_selected.cache_info()
-    assert after.hits == before.hits + 1
-
-
-def test_native_split_count_matches_cpp_short_context_rule(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    kvarn_decode._kvarn_native_split_count_cached.cache_clear()
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "32")
-    assert kvarn_native_split_count(4096) == 32
-    assert kvarn_native_split_count(4096) == 32
-    assert kvarn_decode._kvarn_native_split_count_cached.cache_info().hits == 1
-    assert kvarn_native_split_count(1024) == 1
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "16")
-    assert kvarn_native_split_count(4096) == 16
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "3")
-    with pytest.raises(ValueError, match="must be one of"):
-        kvarn_native_split_count(4096)
-
-
-def test_native_split_count_defaults_to_validated_multisplit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    kvarn_decode._kvarn_native_split_count_cached.cache_clear()
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLIT_POLICY", raising=False)
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
-
-    assert kvarn_native_split_policy_requested() == ("fixed", 16)
-    assert kvarn_native_split_count(4096) == 16
-    assert "KVARN_NATIVE_XPU_SPLITS" not in os.environ
-    assert kvarn_native_split_count(512) == 1
-
-
-def test_page_pair_split_count_matches_cpp_k128_boundaries() -> None:
-    page_pair = kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR
-
-    # At S=32 the K64 variants have 32 work units here, but page-pair has only
-    # 16 and must collapse exactly as the C++ wrapper does.
-    assert kvarn_native_split_count(1985, 32) == 32
-    assert kvarn_native_split_count(1985, 32, kernel_variant=page_pair) == 1
-
-    # The page-pair launch reaches its 32nd K128 unit immediately after the
-    # end of page 31.
-    assert kvarn_native_split_count(3968, 32, kernel_variant=page_pair) == 1
-    assert kvarn_native_split_count(3969, 32, kernel_variant=page_pair) == 32
-    assert kvarn_native_split_scratch_count(1985, 32, "fixed") == 32
-    assert (
-        kvarn_native_split_scratch_count(
-            1985,
-            32,
-            "fixed",
-            page_pair,
-        )
-        == 1
-    )
-
-
-@pytest.mark.parametrize(
-    "kernel_variant",
-    [
-        kvarn_decode.KVARN_NATIVE_KERNEL_BASELINE,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_SCALAR,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_SIMD_UNPACK,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_BLOCK_OUTPUT_STORE,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_CURRENT_HALF_V_PREFETCH,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAGE_RECORD_CURSOR,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAGE_METADATA_CURSOR,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAIRED_NIBBLE_HALF2,
-    ],
-)
-def test_k64_variants_keep_established_split_boundaries(kernel_variant: int) -> None:
-    assert kvarn_native_split_count(1984, 32, kernel_variant=kernel_variant) == 1
-    assert kvarn_native_split_count(1985, 32, kernel_variant=kernel_variant) == 32
-
-
-@pytest.mark.parametrize("kernel_variant", [5, 99, -1])
-def test_native_split_count_rejects_reserved_or_unknown_variants(
-    kernel_variant: int,
-) -> None:
-    with pytest.raises(ValueError, match="reserved|unknown"):
-        kvarn_native_split_count(4096, 32, kernel_variant=kernel_variant)
-
-
-@pytest.mark.parametrize(
-    ("batch_size", "expected_splits"),
-    [(1, 32), (2, 16), (3, 8), (4, 8), (5, 4), (8, 4), (9, 2), (12, 2)],
-)
-def test_b70_q6_split_policy_is_batch_aware(
-    monkeypatch: pytest.MonkeyPatch, batch_size: int, expected_splits: int
-) -> None:
-    kvarn_decode._kvarn_native_split_count_cached.cache_clear()
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
-
-    policy, max_splits = kvarn_native_split_policy_requested()
-
-    assert (policy, max_splits) == ("b70_q6", 32)
-    assert (
-        kvarn_native_split_count(
-            4096,
-            max_splits,
-            batch_size=batch_size,
-            split_policy=policy,
-        )
-        == expected_splits
-    )
-    assert kvarn_native_split_scratch_count(4096, max_splits, policy) == 32
-
-
-def test_b70_q6_split_policy_preserves_short_context_collapse(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
-
-    assert kvarn_native_split_count(1024, batch_size=1) == 1
-    assert kvarn_native_split_count(1024, batch_size=2) == 16
-
-
-@pytest.mark.parametrize(
-    ("batch_size", "context", "expected_splits"),
-    [
-        (1, 4096, 32),
-        (1, 16_384, 32),
-        (1, 65_023, 32),
-        (2, 65_023, 16),
-        (3, 65_023, 8),
-        (4, 4096, 8),
-        (4, 16_384, 8),
-        (4, 48 * 1024, 8),
-        (4, 48 * 1024 + 1, 32),
-        (4, 65_023, 32),
-        (5, 65_023, 4),
-        (8, 65_023, 4),
-        (9, 65_023, 2),
-        (12, 65_023, 2),
-    ],
-)
-@pytest.mark.parametrize(
-    "kernel_variant",
-    [
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-    ],
-)
-def test_b70_q6_v2_split_policy_context_and_batch_boundaries(
-    batch_size: int, context: int, expected_splits: int, kernel_variant: int
-) -> None:
-    assert (
-        kvarn_native_split_count(
-            context,
-            32,
-            batch_size=batch_size,
-            split_policy="b70_q6_v2",
-            kernel_variant=kernel_variant,
-        )
-        == expected_splits
-    )
-
-
-@pytest.mark.parametrize(
-    ("batch_size", "context", "expected_splits"),
-    [
-        # Both profiled variants use K64 work units. S=32 becomes valid on the
-        # 32nd work unit.
-        (1, 1984, 1),
-        (1, 1985, 32),
-        # Before the long-context B4 switch, S=8 becomes valid on unit eight.
-        (4, 448, 1),
-        (4, 449, 8),
-    ],
-)
-@pytest.mark.parametrize(
-    "kernel_variant",
-    [
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-    ],
-)
-def test_b70_q6_v2_preserves_k64_work_unit_collapse(
-    batch_size: int, context: int, expected_splits: int, kernel_variant: int
-) -> None:
-    assert (
-        kvarn_native_split_count(
-            context,
-            32,
-            batch_size=batch_size,
-            split_policy="b70_q6_v2",
-            kernel_variant=kernel_variant,
-        )
-        == expected_splits
-    )
-
-
-@pytest.mark.parametrize(
-    "variant",
-    [
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
-        kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH_SPLIT_REDUCER,
-    ],
-)
-def test_b70_q6_v2_reserves_max_scratch_across_dynamic_schedule(
-    variant: int,
-) -> None:
-    assert kvarn_native_split_scratch_count(4096, 32, "b70_q6_v2", variant) == 32
-    assert kvarn_native_split_scratch_count(65_023, 32, "b70_q6_v2", variant) == 32
-    with pytest.raises(ValueError, match="requires max_splits=32"):
-        kvarn_native_split_count(
-            65_023,
-            16,
-            batch_size=4,
-            split_policy="b70_q6_v2",
-            kernel_variant=variant,
-        )
-
-
-def test_b70_q6_v2_policy_request_and_legacy_policy_remains_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6_v2")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
-    assert kvarn_native_split_policy_requested() == ("b70_q6_v2", 32)
-
-    # V1 is intentionally stable even where V2 changes B4 to S=32.
-    assert (
-        kvarn_native_split_count(
-            65_023,
-            32,
-            batch_size=4,
-            split_policy="b70_q6",
-            kernel_variant=kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
-        )
-        == 8
-    )
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "32")
-    with pytest.raises(ValueError, match="conflicts.*b70_q6_v2"):
-        kvarn_native_split_policy_requested()
-
-
-@pytest.mark.parametrize("batch_size", [0, 13])
-def test_b70_q6_v2_rejects_unsupported_batch_boundaries(batch_size: int) -> None:
-    with pytest.raises(ValueError, match="batch sizes 1 through 12"):
-        kvarn_native_split_count(
-            4096,
-            32,
-            batch_size=batch_size,
-            split_policy="b70_q6_v2",
-            kernel_variant=kvarn_decode.KVARN_NATIVE_KERNEL_Q6_NEXT_PAGE_PREFETCH,
-        )
 
 
 @pytest.mark.parametrize(
@@ -761,13 +185,11 @@ def test_b70_q6_id18_v1_split_policy_is_batch_aware(
     )
 
 
-def test_b70_q6_id18_v1_policy_contract(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6_id18_v1")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
-
-    assert kvarn_native_split_policy_requested() == ("b70_q6_id18_v1", 32)
+def test_b70_q6_id18_v1_policy_contract() -> None:
+    assert kvarn_native_split_policy_requested("b70_q6_id18_v1") == (
+        "b70_q6_id18_v1",
+        32,
+    )
     assert (
         kvarn_native_split_scratch_count(
             65_023,
@@ -806,44 +228,6 @@ def test_b70_q6_id18_v1_policy_contract(
             kernel_variant=kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
         )
 
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "24")
-    with pytest.raises(ValueError, match="conflicts.*b70_q6_id18_v1"):
-        kvarn_native_split_policy_requested()
-
-
-def test_b70_q6_page_pair_uses_k128_but_keeps_full_scratch_capacity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6")
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS", raising=False)
-    page_pair = kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PAGE_PAIR
-
-    assert (
-        kvarn_native_split_count(
-            1985,
-            batch_size=1,
-            kernel_variant=page_pair,
-        )
-        == 1
-    )
-    assert (
-        kvarn_native_split_count(
-            3969,
-            batch_size=1,
-            kernel_variant=page_pair,
-        )
-        == 32
-    )
-    assert (
-        kvarn_native_split_scratch_count(
-            1985,
-            32,
-            "b70_q6",
-            page_pair,
-        )
-        == 32
-    )
-
 
 def test_batch_aware_policy_views_capacity_scratch_contiguously_for_every_batch() -> (
     None
@@ -857,7 +241,7 @@ def test_batch_aware_policy_views_capacity_scratch_contiguously_for_every_batch(
         1: 32,
         2: 16,
         3: 8,
-        4: 8,
+        4: 24,
         5: 4,
         6: 4,
         7: 4,
@@ -873,7 +257,8 @@ def test_batch_aware_policy_views_capacity_scratch_contiguously_for_every_batch(
             4096,
             32,
             batch_size=batch_size,
-            split_policy="b70_q6",
+            split_policy="b70_q6_id18_v1",
+            kernel_variant=kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR,
         )
         assert num_splits == expected_splits
 
@@ -893,23 +278,6 @@ def test_batch_aware_policy_views_capacity_scratch_contiguously_for_every_batch(
         assert temp_output.data_ptr() == scratch[0].data_ptr()
         assert exp_sums.data_ptr() == scratch[1].data_ptr()
         assert max_logits.data_ptr() == scratch[2].data_ptr()
-
-
-def test_b70_q6_split_policy_rejects_ambiguous_or_unsupported_selection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "b70_q6")
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLITS", "32")
-    with pytest.raises(ValueError, match="conflicts"):
-        kvarn_native_split_policy_requested()
-
-    monkeypatch.delenv("KVARN_NATIVE_XPU_SPLITS")
-    with pytest.raises(ValueError, match="batch sizes 1 through 12"):
-        kvarn_native_split_count(4096, batch_size=13)
-
-    monkeypatch.setenv("KVARN_NATIVE_XPU_SPLIT_POLICY", "unknown")
-    with pytest.raises(ValueError, match="must be one of"):
-        kvarn_native_split_policy_requested()
 
 
 def test_native_output_hadamard_schema_detection_is_backward_compatible() -> None:
@@ -1451,27 +819,26 @@ def _enable_xe2_request_stable_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch.ops._xpu_C, "is_xe2_arch", lambda: True)
 
 
-def test_xpu_forward_context_is_omitted_when_both_stability_axes_are_disabled(
+def test_xpu_forward_context_is_omitted_for_ineligible_stability_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm.model_executor.determinism.request_stable_linear as request_stable
     from vllm.platforms.xpu import XPUPlatform
 
     _enable_xe2_request_stable_profile(monkeypatch)
-    monkeypatch.setenv(request_stable.XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV, "0")
-    monkeypatch.setenv(request_stable.XPU_KVARN_REQUEST_STABLE_RMSNORM_ENV, "0")
-    request_stable._get_xpu_kvarn_request_stability_policy.cache_clear()
-    try:
-        assert (
-            XPUPlatform.set_additional_forward_context(
-                attn_metadata=None,
-                vllm_config=_request_stable_config(),
-                num_tokens=1,
-            )
-            == {}
+    monkeypatch.setattr(
+        request_stable,
+        "_is_xpu_kvarn_request_stable_profile",
+        lambda _vllm_config: False,
+    )
+    assert (
+        XPUPlatform.set_additional_forward_context(
+            attn_metadata=None,
+            vllm_config=_request_stable_config(),
+            num_tokens=1,
         )
-    finally:
-        request_stable._get_xpu_kvarn_request_stability_policy.cache_clear()
+        == {}
+    )
 
 
 def test_xpu_forward_context_exposes_validated_kvarn_request_slices(

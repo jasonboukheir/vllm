@@ -2058,8 +2058,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             )
             logger.info_once(
                 "[KVARN_FACTORY] selected_cached_prefill_materializer=%s; "
-                "selectors=KVARN_NATIVE_XPU,KVARN_NATIVE_XPU_MATERIALIZE; "
-                "eligibility_fallback=reference; immutable for engine lifetime",
+                "release default; eligibility_fallback=reference; "
+                "immutable for engine lifetime",
                 cls._cached_prefill_materializer,
             )
         return cls._cached_prefill_materializer
@@ -3002,6 +3002,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         """Compile + autotune every decode-path Triton kernel on tiny synthetic
         state (see the note at the call site in ``_ensure_pool``).
         Uses throwaway tensors only — never touches the real cache/pool."""
+        # The eager-only XPU profile uses the native decoder/materializer.
+        # Do not autotune unused generic decode and speculative paths during
+        # its memory profile. Genuine fallbacks can compile on demand; this
+        # profile never captures graphs.
+        if getattr(self, "_kvarn_xpu_beta_profile", False):
+            return
         from vllm.v1.attention.ops.triton_kvarn_decode import (
             _kvarn_build_packed_kv_kernel,
             _kvarn_fused_decode_kernel,
@@ -3178,56 +3184,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             HQ=Hq,
             **common_vq,
         )
-        # 2c. Shared-dequant verify kernel (uniform-QLEN spec verify) — runs
-        # its @triton.autotune sweep here so capture never benchmarks. QLEN is
-        # the deployment's 1 + num_speculative_tokens.
-        try:
-            from vllm.config import get_current_vllm_config
-
-            _spec = get_current_vllm_config().speculative_config
-            _qlen = 1 + int(_spec.num_speculative_tokens) if _spec else 0
-        except Exception:
-            _qlen = 0
-        if _qlen >= 2:
-            from vllm.v1.attention.ops.triton_kvarn_decode import (
-                _kvarn_fused_verify_stage1,
-            )
-
-            nq = B * _qlen
-            sl_vq = sl.repeat_interleave(_qlen)
-            qv = torch.zeros(nq, Hq, D, dtype=torch.float16, device=device)
-            mid_o_v = torch.zeros(
-                nq * Hq, splits, D, dtype=torch.float32, device=device
-            )
-            mid_lse_v = torch.zeros(nq * Hq, splits, dtype=torch.float32, device=device)
-            common_v = dict(common)
-            _kvarn_fused_verify_stage1[(B, Hk, splits)](
-                qv,
-                bt,
-                sl_vq,
-                b2s,
-                cache,
-                pool_k,
-                pool_v,
-                mid_o_v,
-                mid_lse_v,
-                self.scale,
-                Hq * D,
-                D,
-                bt.stride(0),
-                cache.stride(0),
-                cache.stride(1),
-                pool_k.stride(0),
-                pool_k.stride(1),
-                pool_k.stride(2),
-                mid_o_v.stride(0),
-                mid_o_v.stride(1),
-                mid_lse_v.stride(0),
-                QLEN=_qlen,
-                HQ=Hq,
-                NUM_KV_SPLITS=splits,
-                **common_v,
-            )
         # 3. Packed-KV build kernel (materialize fallback + the cached-multiquery
         # spec-verify path).
         kp = torch.zeros(B * n_blocks * G, Hk, D, dtype=torch.float16, device=device)

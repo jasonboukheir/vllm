@@ -3,7 +3,6 @@
 """Request-stable operator dispatch for the scoped XPU KVarN profile."""
 
 import functools
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -22,8 +21,6 @@ logger = init_logger(__name__)
 
 XPU_KVARN_REQUEST_SLICES_KEY = "xpu_kvarn_request_slices"
 XPU_KVARN_CANONICAL_LINEAR_ROWS = 64
-XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV = "KVARN_REQUEST_STABLE_PROJECTION_ROWS"
-XPU_KVARN_REQUEST_STABLE_RMSNORM_ENV = "KVARN_REQUEST_STABLE_RMSNORM"
 _QWEN_GDN_CANONICAL_LINEAR_SUFFIXES = (
     ".linear_attn.in_proj_qkvz",
     ".linear_attn.in_proj_ba",
@@ -49,30 +46,14 @@ class XPUKvarnRequestStabilityPolicy:
     rmsnorm_source: str
 
 
-def _strict_enabled_selector(name: str) -> tuple[bool, str]:
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return True, "safe-default"
-    if raw_value == "1":
-        return True, name
-    if raw_value == "0":
-        return False, name
-    raise ValueError(f"{name} must be exactly '0' or '1', got {raw_value!r}")
-
-
 @functools.cache
 def _get_xpu_kvarn_request_stability_policy() -> XPUKvarnRequestStabilityPolicy:
-    projection_rows, projection_rows_source = _strict_enabled_selector(
-        XPU_KVARN_REQUEST_STABLE_PROJECTION_ROWS_ENV
-    )
-    rmsnorm, rmsnorm_source = _strict_enabled_selector(
-        XPU_KVARN_REQUEST_STABLE_RMSNORM_ENV
-    )
+    """Keep the qualified correctness policy without experimental opt-outs."""
     return XPUKvarnRequestStabilityPolicy(
-        projection_rows=projection_rows,
-        rmsnorm=rmsnorm,
-        projection_rows_source=projection_rows_source,
-        rmsnorm_source=rmsnorm_source,
+        projection_rows=True,
+        rmsnorm=True,
+        projection_rows_source="safe-default",
+        rmsnorm_source="safe-default",
     )
 
 
@@ -151,12 +132,10 @@ def _is_xpu_kvarn_request_stable_profile(vllm_config: Any) -> bool:
 def configure_xpu_kvarn_request_stability(
     vllm_config: Any,
 ) -> XPUKvarnRequestStabilityPolicy | None:
-    """Validate and log immutable KVarN request-stability selectors.
+    """Log the fixed KVarN request-stability policy.
 
-    The selectors are intentionally parsed only for KVarN engines. Their
-    process-cached values cannot change after startup. The returned booleans
-    are requested values; the scoped profile check determines whether they
-    become active.
+    The scoped profile check determines whether the correctness operations
+    become active; unsupported profiles retain their normal dispatch.
     """
     cache_config = getattr(vllm_config, "cache_config", None)
     cache_dtype = getattr(cache_config, "cache_dtype", None)
