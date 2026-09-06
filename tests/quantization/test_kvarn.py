@@ -43,6 +43,7 @@ from vllm.v1.attention.backends.kvarn_attn import (
     _kvarn_prefill_fp16_window_blocks,
     _kvarn_qlen1_inline_plan_requested,
     _kvarn_reclaimable_block_ids,
+    _kvarn_sinkhorn_source_requested,
     _kvarn_walk_back_flush_blocks,
     _KVarNMetadataStageRing,
     _KVarNQlen1MetadataKind,
@@ -2746,8 +2747,10 @@ def test_cache_layout_is_frozen_at_attention_initialization(
         KVarNAttentionImpl.reset_process_state()
 
 
+@pytest.mark.parametrize("writer_override", [None, "reference"])
 def test_compact_kvarn_dtype_selects_xpu_beta_profile_without_env(
     monkeypatch: pytest.MonkeyPatch,
+    writer_override: str | None,
 ) -> None:
     import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
 
@@ -2761,10 +2764,13 @@ def test_compact_kvarn_dtype_selects_xpu_beta_profile_without_env(
         "KVARN_NATIVE_XPU_KERNEL_VARIANT",
         "KVARN_FLUSH_INDEX_MATERIALIZATION",
         "KVARN_FLUSH_WRITER",
+        "KVARN_SINKHORN_SOURCE",
         "KVARN_FORWARD_POOL_ENSURE",
         "KVARN_QLEN1_INLINE_PLAN",
     ):
         monkeypatch.delenv(name, raising=False)
+    if writer_override is not None:
+        monkeypatch.setenv("KVARN_FLUSH_WRITER", writer_override)
     monkeypatch.setattr(kvarn_attn.current_platform, "is_xpu", lambda: True)
     monkeypatch.setattr(
         kvarn_attn, "kvarn_native_layout_abi_supported", lambda _op: True
@@ -2791,7 +2797,10 @@ def test_compact_kvarn_dtype_selects_xpu_beta_profile_without_env(
         assert impl._kvarn_native_max_splits == 32
         assert impl._kvarn_native_kernel_variant_name == "q6_prefetch_record_cursor"
         assert impl._kvarn_native_kernel_variant == 18
-        assert impl._kvarn_flush_writer == "native_xe2"
+        assert impl._kvarn_flush_writer == (writer_override or "native_xe2")
+        assert impl._kvarn_sinkhorn_source == (
+            "materialized" if writer_override == "reference" else "fused_materialized"
+        )
         assert impl._kvarn_forward_pool_ensure == "always"
         assert impl._kvarn_qlen1_inline_plan == "bound_native_v2"
         assert impl.use_bound_qlen1_inline_plan_v2
@@ -3458,6 +3467,64 @@ def test_flush_writer_selection_is_frozen_and_logged(
 
 
 @pytest.mark.parametrize(
+    ("raw_value", "expected", "source"),
+    [
+        (None, "materialized", "reference-default"),
+        ("materialized", "materialized", "KVARN_SINKHORN_SOURCE"),
+        ("fused_materialized", "fused_materialized", "KVARN_SINKHORN_SOURCE"),
+    ],
+)
+def test_sinkhorn_source_selector(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str | None,
+    expected: str,
+    source: str,
+) -> None:
+    if raw_value is None:
+        monkeypatch.delenv("KVARN_SINKHORN_SOURCE", raising=False)
+    else:
+        monkeypatch.setenv("KVARN_SINKHORN_SOURCE", raw_value)
+
+    assert _kvarn_sinkhorn_source_requested() == (expected, source)
+
+
+@pytest.mark.parametrize("raw_value", ["", "pool", "FUSED", " direct"])
+def test_sinkhorn_source_selector_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, raw_value: str
+) -> None:
+    monkeypatch.setenv("KVARN_SINKHORN_SOURCE", raw_value)
+    with pytest.raises(
+        ValueError,
+        match=(
+            "KVARN_SINKHORN_SOURCE must be exactly 'materialized' or "
+            "'fused_materialized'"
+        ),
+    ):
+        _kvarn_sinkhorn_source_requested()
+
+
+def test_sinkhorn_source_selection_is_frozen_and_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KVARN_SINKHORN_SOURCE", raising=False)
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        with patch("vllm.v1.attention.backends.kvarn_attn.logger.info_once") as marker:
+            assert KVarNAttentionImpl._select_sinkhorn_source() == "materialized"
+            monkeypatch.setenv("KVARN_SINKHORN_SOURCE", "fused_materialized")
+            assert KVarNAttentionImpl._select_sinkhorn_source() == "materialized"
+
+        marker.assert_called_once_with(
+            "[KVARN_SINKHORN] selected_source=%s; selector_source=%s; "
+            "immutable for engine lifetime",
+            "materialized",
+            "reference-default",
+        )
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+@pytest.mark.parametrize(
     ("override", "expected"),
     [
         ({}, True),
@@ -3560,6 +3627,73 @@ def test_batched_flush_native_writer_bypasses_reference_record_assembly(
         assert len(selected_block_ids) == len(set(selected_block_ids))
         assert all(0 <= block < cache.shape[0] for block in selected_block_ids)
         assert args[2] is cache
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_batched_flush_fused_sinkhorn_bypasses_unfused_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.attention.backends.kvarn_attn as kvarn_attn
+
+    KVarNAttentionImpl.reset_process_state()
+    group_key = ("pool-indexed-sinkhorn-test",)
+    cfg = SimpleNamespace(
+        head_dim=256,
+        group=128,
+        record_bytes=65_536,
+        k_packed_bytes=16_384,
+        v_packed_bytes=16_384,
+        sinkhorn_iters=8,
+    )
+    tail_key = torch.zeros(2, 128, 4, 256, dtype=torch.float16)
+    tail_value = torch.zeros_like(tail_key)
+    impl = SimpleNamespace(
+        kvarn_config=cfg,
+        num_kv_heads=4,
+        _group_key=group_key,
+        _tail_K_pool=tail_key,
+        _tail_V_pool=tail_value,
+        _tails={3: object(), 1: object()},
+        _kvarn_cache_layout="xe2_dpas",
+        _kvarn_flush_writer="native_xe2",
+        _kvarn_sinkhorn_source="fused_materialized",
+    )
+    cache = torch.full((4, 4, 65_536), 0xA5, dtype=torch.uint8)
+    KVarNAttentionImpl._block_to_slot_dict[group_key] = {3: 0, 1: 1}
+    balanced = tuple(torch.empty(0) for _ in range(6))
+    balance = Mock(return_value=balanced)
+    launch = Mock()
+
+    try:
+        with (
+            patch.object(kvarn_attn, "_sinkhorn_balance_fused_pool_kv", balance),
+            patch.object(
+                kvarn_attn,
+                "_sinkhorn_balance_kv",
+                side_effect=AssertionError("materialized Sinkhorn must not run"),
+            ),
+            patch.object(
+                kvarn_attn,
+                "_sinkhorn_pack_kv",
+                side_effect=AssertionError("reference packer must not run"),
+            ),
+            patch.object(kvarn_attn, "_launch_kvarn_native_balanced_writer", launch),
+        ):
+            KVarNAttentionImpl._batched_flush([(impl, 3, cache), (impl, 1, cache)])
+
+        assert not impl._tails
+        balance.assert_called_once()
+        balance_args = balance.call_args.args
+        assert balance_args[0] is tail_key
+        assert balance_args[1] is tail_value
+        assert balance_args[2].tolist() == [0, 1]
+        assert balance_args[3] is cfg
+        launch.assert_called_once()
+        launch_args = launch.call_args.args
+        assert launch_args[0] is balanced
+        assert launch_args[1].tolist() == [3, 1]
+        assert launch_args[2] is cache
     finally:
         KVarNAttentionImpl.reset_process_state()
 

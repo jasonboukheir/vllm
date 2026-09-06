@@ -110,7 +110,10 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_prefill_store_variant_requested,
     validate_kvarn_native_factory_selection,
 )
-from vllm.v1.attention.ops.triton_kvarn_sinkhorn import kvarn_sinkhorn_triton
+from vllm.v1.attention.ops.triton_kvarn_sinkhorn import (
+    kvarn_sinkhorn_fused_pool_kv_triton,
+    kvarn_sinkhorn_triton,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
@@ -125,6 +128,9 @@ _KVARN_FLUSH_INDEX_MATERIALIZATION_SHARED = "shared"
 _KVARN_FLUSH_WRITER_ENV = "KVARN_FLUSH_WRITER"
 _KVARN_FLUSH_WRITER_REFERENCE = "reference"
 _KVARN_FLUSH_WRITER_NATIVE_XE2 = "native_xe2"
+_KVARN_SINKHORN_SOURCE_ENV = "KVARN_SINKHORN_SOURCE"
+_KVARN_SINKHORN_SOURCE_MATERIALIZED = "materialized"
+_KVARN_SINKHORN_SOURCE_FUSED_MATERIALIZED = "fused_materialized"
 _KVARN_FORWARD_POOL_ENSURE_ENV = "KVARN_FORWARD_POOL_ENSURE"
 _KVARN_FORWARD_POOL_ENSURE_ALWAYS = "always"
 _KVARN_FORWARD_POOL_ENSURE_EPOCH_LATCH = "epoch_latch"
@@ -206,6 +212,30 @@ def _kvarn_flush_writer_requested(
             f"'{_KVARN_FLUSH_WRITER_NATIVE_XE2}', got {raw_value!r}"
         )
     return raw_value, _KVARN_FLUSH_WRITER_ENV
+
+
+def _kvarn_sinkhorn_source_requested(
+    default: str = _KVARN_SINKHORN_SOURCE_MATERIALIZED,
+) -> tuple[str, str]:
+    """Resolve the engine-lifetime source layout for Sinkhorn balancing."""
+    raw_value = os.environ.get(_KVARN_SINKHORN_SOURCE_ENV)
+    if raw_value is None:
+        source = (
+            "xpu-beta-default"
+            if default != _KVARN_SINKHORN_SOURCE_MATERIALIZED
+            else "reference-default"
+        )
+        return default, source
+    if raw_value not in {
+        _KVARN_SINKHORN_SOURCE_MATERIALIZED,
+        _KVARN_SINKHORN_SOURCE_FUSED_MATERIALIZED,
+    }:
+        raise ValueError(
+            f"{_KVARN_SINKHORN_SOURCE_ENV} must be exactly "
+            f"'{_KVARN_SINKHORN_SOURCE_MATERIALIZED}' or "
+            f"'{_KVARN_SINKHORN_SOURCE_FUSED_MATERIALIZED}', got {raw_value!r}"
+        )
+    return raw_value, _KVARN_SINKHORN_SOURCE_ENV
 
 
 def _kvarn_forward_pool_ensure_requested() -> tuple[str, str]:
@@ -477,6 +507,21 @@ def _sinkhorn_balance_kv(K_tiles, V_tiles, cfg):
     key = kvarn_sinkhorn_triton(K_tiles, iterations=cfg.sinkhorn_iters)
     value = kvarn_sinkhorn_triton(V_tiles, iterations=cfg.sinkhorn_iters)
     return (*key, *value)
+
+
+def _sinkhorn_balance_fused_pool_kv(
+    tail_key: torch.Tensor,
+    tail_value: torch.Tensor,
+    pool_slots: torch.Tensor,
+    cfg,
+) -> tuple[torch.Tensor, ...]:
+    """Fused-materialize and Sinkhorn-balance selected full pages."""
+    return kvarn_sinkhorn_fused_pool_kv_triton(
+        tail_key,
+        tail_value,
+        pool_slots,
+        iterations=cfg.sinkhorn_iters,
+    )
 
 
 def _sinkhorn_pack_kv(K_tiles, V_tiles, cfg, *, cache_layout: str):
@@ -2459,6 +2504,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     # them across steps would let recycled block ids observe a stale schedule.
     _flush_index_materialization: ClassVar[str | None] = None
     _flush_writer: ClassVar[str | None] = None
+    _sinkhorn_source: ClassVar[str | None] = None
     _forward_pool_ensure: ClassVar[str | None] = None
     _pool_runtime_policy: ClassVar[tuple[str | None, str | None] | None] = None
     _qlen1_inline_plan: ClassVar[str | None] = None
@@ -2527,6 +2573,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls._kernel_warmed.clear()
         cls._flush_index_materialization = None
         cls._flush_writer = None
+        cls._sinkhorn_source = None
         cls._forward_pool_ensure = None
         cls._pool_runtime_policy = None
         cls._qlen1_inline_plan = None
@@ -2573,6 +2620,21 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 source,
             )
         return cls._flush_writer
+
+    @classmethod
+    def _select_sinkhorn_source(
+        cls, default: str = _KVARN_SINKHORN_SOURCE_MATERIALIZED
+    ) -> str:
+        if cls._sinkhorn_source is None:
+            selection, source = _kvarn_sinkhorn_source_requested(default)
+            cls._sinkhorn_source = selection
+            logger.info_once(
+                "[KVARN_SINKHORN] selected_source=%s; selector_source=%s; "
+                "immutable for engine lifetime",
+                selection,
+                source,
+            )
+        return cls._sinkhorn_source
 
     @classmethod
     def _select_forward_pool_ensure(cls) -> str:
@@ -2859,6 +2921,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             if self._kvarn_xpu_beta_profile
             else _KVARN_FLUSH_WRITER_REFERENCE
         )
+        self._kvarn_sinkhorn_source = type(self)._select_sinkhorn_source(
+            _KVARN_SINKHORN_SOURCE_FUSED_MATERIALIZED
+            if self._kvarn_xpu_beta_profile
+            and self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_NATIVE_XE2
+            else _KVARN_SINKHORN_SOURCE_MATERIALIZED
+        )
         self._kvarn_forward_pool_ensure = type(self)._select_forward_pool_ensure()
         self._kvarn_pool_runtime_policy = type(self)._select_pool_runtime_policy()
         self._kvarn_qlen1_inline_plan = type(self)._select_qlen1_inline_plan(
@@ -2928,6 +2996,14 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                     "kvarn_pack_balanced_kv extension; percentile RTN is "
                     "not supported"
                 )
+        if (
+            self._kvarn_sinkhorn_source == _KVARN_SINKHORN_SOURCE_FUSED_MATERIALIZED
+            and self._kvarn_flush_writer != _KVARN_FLUSH_WRITER_NATIVE_XE2
+        ):
+            raise RuntimeError(
+                "KVARN_SINKHORN_SOURCE=fused_materialized requires "
+                "KVARN_FLUSH_WRITER=native_xe2"
+            )
 
         # Per-block fp16 tail buffer (in-progress tiles). Keyed by block_id.
         # Stage 3b uses a Python dict — small concurrent batch sizes only.
@@ -3433,29 +3509,44 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             cfg.value_bits,
             self._kvarn_cache_layout,
             self._kvarn_flush_writer,
+            self._kvarn_sinkhorn_source,
         )
         if warm_key not in cls._kernel_warmed:
-            warm_tiles = (
-                self.num_kv_heads
-                if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_NATIVE_XE2
-                else 1
-            )
-            k_dummy = torch.zeros(
-                warm_tiles,
-                cfg.head_dim,
-                cfg.group,
-                dtype=torch.float16,
-                device=device,
-            )
-            v_dummy = torch.zeros(
-                warm_tiles,
-                cfg.group,
-                cfg.head_dim,
-                dtype=torch.float16,
-                device=device,
-            )
             if self._kvarn_flush_writer == _KVARN_FLUSH_WRITER_NATIVE_XE2:
-                balanced = _sinkhorn_balance_kv(k_dummy, v_dummy, cfg)
+                if (
+                    self._kvarn_sinkhorn_source
+                    == _KVARN_SINKHORN_SOURCE_FUSED_MATERIALIZED
+                ):
+                    pool_shape = (
+                        1,
+                        cfg.group,
+                        self.num_kv_heads,
+                        cfg.head_dim,
+                    )
+                    tail_key = torch.zeros(
+                        pool_shape, dtype=torch.float16, device=device
+                    )
+                    tail_value = torch.zeros_like(tail_key)
+                    pool_slots = torch.zeros(1, dtype=torch.long, device=device)
+                    balanced = _sinkhorn_balance_fused_pool_kv(
+                        tail_key, tail_value, pool_slots, cfg
+                    )
+                else:
+                    k_dummy = torch.zeros(
+                        self.num_kv_heads,
+                        cfg.head_dim,
+                        cfg.group,
+                        dtype=torch.float16,
+                        device=device,
+                    )
+                    v_dummy = torch.zeros(
+                        self.num_kv_heads,
+                        cfg.group,
+                        cfg.head_dim,
+                        dtype=torch.float16,
+                        device=device,
+                    )
+                    balanced = _sinkhorn_balance_kv(k_dummy, v_dummy, cfg)
                 dummy_cache = torch.zeros(
                     1,
                     self.num_kv_heads,
@@ -3468,6 +3559,20 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                     balanced, dummy_blocks, dummy_cache
                 )
             else:
+                k_dummy = torch.zeros(
+                    1,
+                    cfg.head_dim,
+                    cfg.group,
+                    dtype=torch.float16,
+                    device=device,
+                )
+                v_dummy = torch.zeros(
+                    1,
+                    cfg.group,
+                    cfg.head_dim,
+                    dtype=torch.float16,
+                    device=device,
+                )
                 _sinkhorn_pack_kv(
                     k_dummy,
                     v_dummy,
@@ -4268,16 +4373,39 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 nB = len(bchunk)
                 slot_t = indices.pool_slots[c0 : c0 + CHUNK_BLOCKS]
                 bid_t = indices.block_ids[c0 : c0 + CHUNK_BLOCKS]
+                writer = getattr(impl, "_kvarn_flush_writer", None)
+                if writer is None:
+                    writer = cls._select_flush_writer()
+                sinkhorn_source = getattr(impl, "_kvarn_sinkhorn_source", None)
+                if sinkhorn_source is None:
+                    sinkhorn_source = cls._select_sinkhorn_source()
+                if (
+                    writer == _KVARN_FLUSH_WRITER_NATIVE_XE2
+                    and sinkhorn_source == _KVARN_SINKHORN_SOURCE_FUSED_MATERIALIZED
+                ):
+                    logger.info_once(
+                        "[KVARN_SINKHORN] active=fused_materialized; "
+                        "materializer=kvarn_sinkhorn_fused_pool_triton; "
+                        "writer=kvarn_pack_balanced_kv; cache_layout=%s; "
+                        "sinkhorn_iterations=%d",
+                        impl._kvarn_cache_layout,
+                        cfg.sinkhorn_iters,
+                    )
+                    balanced = _sinkhorn_balance_fused_pool_kv(
+                        impl._tail_K_pool,
+                        impl._tail_V_pool,
+                        slot_t,
+                        cfg,
+                    )
+                    _launch_kvarn_native_balanced_writer(balanced, bid_t, kvc)
+                    continue
                 # One gather per chunk (was nB tiny .float() ops).
                 K_rot = impl._tail_K_pool.index_select(0, slot_t).float()  # [nB,G,Hk,D]
                 V_rot = impl._tail_V_pool.index_select(0, slot_t).float()
                 # Tiles: K [N, D, G] (absorb=channel), V [N, G, D] (absorb=token).
                 K_tiles = K_rot.permute(0, 2, 3, 1).reshape(nB * Hk, D, G)
                 V_tiles = V_rot.permute(0, 2, 1, 3).reshape(nB * Hk, G, D)
-                if (
-                    getattr(impl, "_kvarn_flush_writer", cls._select_flush_writer())
-                    == _KVARN_FLUSH_WRITER_NATIVE_XE2
-                ):
+                if writer == _KVARN_FLUSH_WRITER_NATIVE_XE2:
                     balanced = _sinkhorn_balance_kv(K_tiles, V_tiles, cfg)
                     _launch_kvarn_native_balanced_writer(balanced, bid_t, kvc)
                     continue

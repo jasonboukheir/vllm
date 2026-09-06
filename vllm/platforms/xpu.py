@@ -59,11 +59,17 @@ def _check_kvarn_beta_unsupported_config(
     multimodal_config = getattr(vllm_config.model_config, "multimodal_config", None)
     language_model_only = bool(getattr(multimodal_config, "language_model_only", False))
     if vllm_config.model_config.is_multimodal_model and not language_model_only:
-        raise ValueError(
-            "XPU KVarN beta does not support vision/multimodal models; "
-            "use --language-model-only, a text-only model, or "
-            "--kv-cache-dtype=auto"
-        )
+        hf_config = getattr(vllm_config.model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) != "qwen3_5":
+            raise ValueError(
+                "XPU KVarN beta vision/multimodal support is limited to Qwen3.5 "
+                "image inputs; use --language-model-only or --kv-cache-dtype=auto"
+            )
+        if multimodal_config.get_limit_per_prompt("video") != 0:
+            raise ValueError(
+                "XPU KVarN beta vision requires video inputs disabled; "
+                'use --limit-mm-per-prompt \'{"video":0}\' or --kv-cache-dtype=auto'
+            )
 
 
 def get_mem_info_wrapper(

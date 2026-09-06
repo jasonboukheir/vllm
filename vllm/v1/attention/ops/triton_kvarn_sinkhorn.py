@@ -46,6 +46,7 @@ def _sinkhorn_log_kernel(
     CLIP_STD_MAX: tl.constexpr,
     LOG_S_MIN: tl.constexpr,
     LOG_S_MAX: tl.constexpr,
+    FP16_POOL_INPUT: tl.constexpr = False,
 ):
     """One program per tile. Loads a R x C tile into registers, does
     ``ITERATIONS`` alternating col/row log-domain normalizations, tracks
@@ -61,13 +62,17 @@ def _sinkhorn_log_kernel(
     tile_base = pid * stride_tn
     tile_ptrs = Tile_ptr + tile_base + r_offs[:, None] * stride_tr + c_offs[None, :]
     tile = tl.load(tile_ptrs).to(tl.float32)
+    if FP16_POOL_INPUT:
+        # Only the validated fused pool path can assert FP16 provenance.
+        # Keep the immutable input narrow; all normalization remains FP32.
+        tile = tile.to(tl.float16)
 
     # log_s_col [C], log_s_row [R]; initialised at zero (exp = 1)
     log_s_col = tl.zeros([C], dtype=tl.float32)
     log_s_row = tl.zeros([R], dtype=tl.float32)
 
     # cur = tile / s_col / s_row = tile (with mu = 1 initially)
-    cur = tile
+    cur = tile.to(tl.float32)
 
     # ── initial imbalance + best snapshot ─────────────────────────────────
     col_mean0 = tl.sum(cur, axis=0) / R
@@ -97,7 +102,15 @@ def _sinkhorn_log_kernel(
         log_s_col = tl.maximum(tl.minimum(log_s_col, LOG_S_MAX), LOG_S_MIN)
         s_col_lin = tl.exp(log_s_col)
         s_row_lin = tl.exp(log_s_row)
-        cur = tile / s_col_lin[None, :] / s_row_lin[:, None]
+        if FP16_POOL_INPUT:
+            # Explicit reloads shorten the live FP32 input lifetime.
+            cur = (
+                tl.load(tile_ptrs, volatile=True).to(tl.float32)
+                / s_col_lin[None, :]
+                / s_row_lin[:, None]
+            )
+        else:
+            cur = tile / s_col_lin[None, :] / s_row_lin[:, None]
 
         # Update row scales from new cur's per-row std
         row_mean = tl.sum(cur, axis=1) / C
@@ -108,7 +121,15 @@ def _sinkhorn_log_kernel(
         log_s_row = tl.maximum(tl.minimum(log_s_row, LOG_S_MAX), LOG_S_MIN)
         s_col_lin = tl.exp(log_s_col)
         s_row_lin = tl.exp(log_s_row)
-        cur = tile / s_col_lin[None, :] / s_row_lin[:, None]
+        if FP16_POOL_INPUT:
+            # Explicit reloads shorten the live FP32 input lifetime.
+            cur = (
+                tl.load(tile_ptrs, volatile=True).to(tl.float32)
+                / s_col_lin[None, :]
+                / s_row_lin[:, None]
+            )
+        else:
+            cur = tile / s_col_lin[None, :] / s_row_lin[:, None]
 
         # Imbalance + best-so-far update
         col_mean_n = tl.sum(cur, axis=0) / R
@@ -129,7 +150,7 @@ def _sinkhorn_log_kernel(
         imb_best = tl.where(better, imb, imb_best)
 
     # ── final: balanced = tile / sc_best / sr_best, write outputs ─────────
-    balanced = tile / sc_best[None, :] / sr_best[:, None]
+    balanced = tile.to(tl.float32) / sc_best[None, :] / sr_best[:, None]
     bal_ptrs = (
         Balanced_ptr + pid * stride_bn + r_offs[:, None] * stride_br + c_offs[None, :]
     )
@@ -141,6 +162,8 @@ def _sinkhorn_log_kernel(
 def kvarn_sinkhorn_triton(
     tiles: torch.Tensor,
     iterations: int = 16,
+    *,
+    _fp16_pool_input: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Triton driver for ``_sinkhorn_log_kernel``.
 
@@ -182,6 +205,15 @@ def kvarn_sinkhorn_triton(
     s_col = torch.empty(N, C, dtype=torch.float32, device=device)
     s_row = torch.empty(N, R, dtype=torch.float32, device=device)
 
+    # The public/general FP32 path must never narrow arbitrary input values.
+    # Enable only for the eight-iteration XPU beta shapes, with provenance
+    # supplied by the validated fused-pool entry point below.
+    fp16_pool_input = (
+        _fp16_pool_input
+        and device.type == "xpu"
+        and iterations == 8
+        and (R, C) in ((256, 128), (128, 256))
+    )
     _sinkhorn_log_kernel[(N,)](
         tiles,
         balanced,
@@ -200,6 +232,7 @@ def kvarn_sinkhorn_triton(
         CLIP_STD_MAX=_CLIP_STD_MAX,
         LOG_S_MIN=_LOG_S_MIN,
         LOG_S_MAX=_LOG_S_MAX,
+        FP16_POOL_INPUT=fp16_pool_input,
         # num_warps=8, not 4: the program keeps the whole [R, C] fp32 tile (plus
         # a working copy) live, so at 4 warps the per-thread footprint is several
         # KB of registers -> the compiler spills to CUDA local memory, and the
@@ -214,3 +247,149 @@ def kvarn_sinkhorn_triton(
         num_stages=2,
     )
     return balanced, s_col, s_row
+
+
+@triton.jit
+def _sinkhorn_pool_materialize_kernel(
+    TailKey_ptr,
+    TailValue_ptr,
+    PoolSlots_ptr,
+    KeyTiles_ptr,
+    ValueTiles_ptr,
+    stride_pp,
+    stride_pg,
+    stride_ph,
+    stride_pd,
+    NUM_KV_HEADS: tl.constexpr,
+    GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Gather, cast, and orient both K/V tile batches in one launch."""
+    tile_index = tl.program_id(0)
+    group_block = tl.program_id(1)
+    dim_block = tl.program_id(2)
+
+    block_index = (tile_index // NUM_KV_HEADS).to(tl.int64)
+    head_index = (tile_index - block_index * NUM_KV_HEADS).to(tl.int64)
+    pool_slot = tl.load(PoolSlots_ptr + block_index).to(tl.int64)
+    group_offsets = group_block * BLOCK_G + tl.arange(0, BLOCK_G)
+    dim_offsets = dim_block * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    source = (
+        pool_slot * stride_pp
+        + group_offsets[:, None] * stride_pg
+        + head_index * stride_ph
+        + dim_offsets[None, :] * stride_pd
+    )
+    key = tl.load(TailKey_ptr + source).to(tl.float32)
+    value = tl.load(TailValue_ptr + source).to(tl.float32)
+
+    key_output = (
+        tile_index * HEAD_DIM * GROUP
+        + dim_offsets[:, None] * GROUP
+        + group_offsets[None, :]
+    )
+    value_output = (
+        tile_index * GROUP * HEAD_DIM
+        + group_offsets[:, None] * HEAD_DIM
+        + dim_offsets[None, :]
+    )
+    tl.store(KeyTiles_ptr + key_output, tl.trans(key))
+    tl.store(ValueTiles_ptr + value_output, value)
+
+
+def _materialize_sinkhorn_pool_kv(
+    tail_key: torch.Tensor,
+    tail_value: torch.Tensor,
+    pool_slots: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create production-layout fp32 K/V tiles with one fused XPU launch."""
+    block_count = pool_slots.numel()
+    _, group, num_kv_heads, head_dim = tail_key.shape
+    tile_count = block_count * num_kv_heads
+    key_tiles = torch.empty(
+        tile_count,
+        head_dim,
+        group,
+        dtype=torch.float32,
+        device=tail_key.device,
+    )
+    value_tiles = torch.empty(
+        tile_count,
+        group,
+        head_dim,
+        dtype=torch.float32,
+        device=tail_key.device,
+    )
+    if tile_count == 0:
+        return key_tiles, value_tiles
+
+    block_g = 64
+    block_d = 128
+    grid = (
+        tile_count,
+        triton.cdiv(group, block_g),
+        triton.cdiv(head_dim, block_d),
+    )
+    _sinkhorn_pool_materialize_kernel[grid](
+        tail_key,
+        tail_value,
+        pool_slots,
+        key_tiles,
+        value_tiles,
+        tail_key.stride(0),
+        tail_key.stride(1),
+        tail_key.stride(2),
+        tail_key.stride(3),
+        NUM_KV_HEADS=num_kv_heads,
+        GROUP=group,
+        HEAD_DIM=head_dim,
+        BLOCK_G=block_g,
+        BLOCK_D=block_d,
+        num_warps=8,
+        num_stages=2,
+    )
+    return key_tiles, value_tiles
+
+
+def kvarn_sinkhorn_fused_pool_kv_triton(
+    tail_key: torch.Tensor,
+    tail_value: torch.Tensor,
+    pool_slots: torch.Tensor,
+    *,
+    iterations: int,
+) -> tuple[torch.Tensor, ...]:
+    """Fused-materialize and balance pages from the Xe2 beta tail-pool ABI."""
+    expected_shape = (128, 4, 256)
+    if (
+        tail_key.device.type != "xpu"
+        or tail_key.dtype != torch.float16
+        or not tail_key.is_contiguous()
+        or tail_key.shape[1:] != expected_shape
+        or tail_value.shape != tail_key.shape
+        or tail_value.device != tail_key.device
+        or tail_value.dtype != tail_key.dtype
+        or not tail_value.is_contiguous()
+        or pool_slots.device != tail_key.device
+        or pool_slots.dtype != torch.int64
+        or pool_slots.ndim != 1
+        or not pool_slots.is_contiguous()
+        or not 0 <= iterations <= 64
+    ):
+        raise ValueError(
+            "pool-indexed Sinkhorn requires contiguous XPU FP16 K/V pools "
+            "with shape [P,128,4,256], contiguous same-device int64 slots, "
+            "and 0..64 iterations"
+        )
+    key_tiles, value_tiles = _materialize_sinkhorn_pool_kv(
+        tail_key, tail_value, pool_slots
+    )
+    key = kvarn_sinkhorn_triton(
+        key_tiles, iterations=iterations, _fp16_pool_input=True
+    )
+    value = kvarn_sinkhorn_triton(
+        value_tiles, iterations=iterations, _fp16_pool_input=True
+    )
+    return (*key, *value)
