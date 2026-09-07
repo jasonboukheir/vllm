@@ -974,6 +974,59 @@ def _rms_norm_kernel(
         tl.store(output_row_start_ptr + col_idx, output, mask=mask)
 
 
+@triton.jit
+def _fused_add_rms_norm_kernel(
+    input_ptr,
+    residual_ptr,
+    weight_ptr,
+    output_ptr,
+    residual_output_ptr,
+    input_row_stride,
+    residual_row_stride,
+    output_row_stride,
+    residual_output_row_stride,
+    n_cols,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+):
+    """Row-local fused residual add and RMSNorm with a fixed reduction tree."""
+    row_idx = tl.program_id(0).to(tl.int64)
+    input_row = input_ptr + row_idx * input_row_stride
+    residual_row = residual_ptr + row_idx * residual_row_stride
+    output_row = output_ptr + row_idx * output_row_stride
+    residual_output_row = residual_output_ptr + row_idx * residual_output_row_stride
+
+    sum_sq = tl.zeros([1], dtype=tl.float32)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        value = tl.load(input_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        value += tl.load(residual_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        tl.store(
+            residual_output_row + col_idx,
+            value.to(input_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        sum_sq += tl.sum(tl.where(mask, value * value, 0.0))
+
+    inv_rms = 1.0 / tl.sqrt(sum_sq / n_cols + eps)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        value = tl.load(input_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        value += tl.load(residual_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        value *= inv_rms
+        if HAS_WEIGHT:
+            weight = tl.load(weight_ptr + col_idx, mask=mask, other=1.0)
+            value *= weight.to(tl.float32)
+        tl.store(
+            output_row + col_idx,
+            value.to(input_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
 def rms_norm_batch_invariant(
     input: torch.Tensor,
     weight: torch.Tensor | None,
@@ -995,15 +1048,6 @@ def rms_norm_batch_invariant(
         RMS normalized tensor, or ``(output, residual_out)`` when ``residual``
         is provided
     """
-    if residual is not None:
-        assert input.shape == residual.shape, (
-            f"Input shape {input.shape} must match residual shape {residual.shape}"
-        )
-        import vllm._custom_ops as ops
-
-        ops.fused_add_rms_norm(input, residual, weight, eps)
-        return input, residual
-
     if weight is not None:
         assert weight.dim() == 1, "Weight must be 1-dimensional"
         assert input.shape[-1] == weight.shape[0], (
@@ -1022,6 +1066,29 @@ def rms_norm_batch_invariant(
     output = torch.empty_like(input_2d)
     BLOCK_SIZE = 1024
     grid = (n_rows,)
+    if residual is not None:
+        assert input.shape == residual.shape, (
+            f"Input shape {input.shape} must match residual shape {residual.shape}"
+        )
+        residual_2d = residual.reshape(-1, residual.shape[-1]).contiguous()
+        residual_output = torch.empty_like(residual_2d)
+        _fused_add_rms_norm_kernel[grid](
+            input_2d,
+            residual_2d,
+            weight if weight is not None else input_2d,
+            output,
+            residual_output,
+            input_2d.stride(0),
+            residual_2d.stride(0),
+            output.stride(0),
+            residual_output.stride(0),
+            n_cols,
+            eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+            HAS_WEIGHT=weight is not None,
+        )
+        return output.reshape(original_shape), residual_output.reshape(original_shape)
+
     _rms_norm_kernel[grid](
         input_2d,
         weight if weight is not None else input_2d,
