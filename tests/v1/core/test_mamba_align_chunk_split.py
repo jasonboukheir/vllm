@@ -8,13 +8,19 @@ the wrong offset, and a later chunk crossing that boundary publishes it anyway.
 Requests resuming from it then restore a truncated state (#43559).
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import OPTConfig
 
+import vllm.platforms as platforms
+from vllm.platforms.cpu import CpuPlatform
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.sched import scheduler as scheduler_module
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -22,9 +28,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 
-from .utils import create_requests
+from .utils import create_requests, create_scheduler
 
 pytestmark = pytest.mark.cpu_test
 
@@ -89,6 +96,9 @@ def _split(
         use_eagle_block_drop = use_eagle
     stub = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
+        mamba_prefill_alignment=MAMBA_BLOCK_SIZE,
+        needs_mamba_cache_alignment=True,
+        use_eagle=use_eagle,
         use_eagle_block_drop=use_eagle_block_drop,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -100,6 +110,258 @@ def _split(
         ),
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
+
+
+XPU_GDN_CHUNK_SIZE = 64
+
+
+def _make_xpu_gdn_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    is_xpu: bool = True,
+    max_num_batched_tokens: int = 8192,
+    long_prefill_token_threshold: int = 0,
+    mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.QWEN_GDN_ATTN,
+    num_speculative_tokens: int | None = None,
+    supports_multimodal_inputs: bool = False,
+) -> Scheduler:
+    monkeypatch.setattr(platforms, "current_platform", CpuPlatform())
+    monkeypatch.setattr(
+        scheduler_module,
+        "current_platform",
+        SimpleNamespace(is_xpu=lambda: is_xpu),
+    )
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "cache"))
+    if supports_multimodal_inputs:
+        monkeypatch.setattr(
+            scheduler_module.MultiModalRegistry,
+            "supports_multimodal_inputs",
+            lambda *_args, **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            scheduler_module,
+            "MultiModalBudget",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                encoder_compute_budget=0,
+                encoder_cache_size=0,
+            ),
+        )
+    model_path = tmp_path / "opt"
+    OPTConfig(max_position_embeddings=65536).save_pretrained(model_path)
+    return create_scheduler(
+        model=str(model_path),
+        max_num_seqs=4,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=65536,
+        long_prefill_token_threshold=long_prefill_token_threshold,
+        num_speculative_tokens=num_speculative_tokens,
+        block_size=XPU_GDN_CHUNK_SIZE,
+        kv_cache_spec=MambaSpec(
+            block_size=XPU_GDN_CHUNK_SIZE,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_type=mamba_type,
+            mamba_cache_mode="none",
+        ),
+    )
+
+
+def _add_b4_ragged_requests(scheduler: Scheduler) -> list[Request]:
+    requests = [
+        create_requests(
+            1,
+            num_tokens=num_tokens,
+            block_size=XPU_GDN_CHUNK_SIZE,
+            req_ids=[request_id],
+        )[0]
+        for request_id, num_tokens in (
+            ("short-a", 127),
+            ("long-a", 4095),
+            ("long-b", 4095),
+            ("short-b", 127),
+        )
+    ]
+    for request in requests:
+        scheduler.add_request(request)
+    return requests
+
+
+def test_xpu_gdn_b4_budget_uses_absolute_64_token_grid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scheduler = _make_xpu_gdn_scheduler(monkeypatch, tmp_path)
+    _add_b4_ragged_requests(scheduler)
+
+    output = scheduler.schedule()
+
+    assert scheduler.cache_config.mamba_cache_mode == "none"
+    assert scheduler.mamba_prefill_alignment == XPU_GDN_CHUNK_SIZE
+    assert output.num_scheduled_tokens == {
+        "short-a": 127,
+        "long-a": 4095,
+        "long-b": 3968,
+    }
+    assert sum(output.num_scheduled_tokens.values()) == 8190
+    assert output.num_scheduled_tokens["long-b"] % XPU_GDN_CHUNK_SIZE == 0
+
+
+def test_xpu_gdn_final_tail_is_not_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scheduler = _make_xpu_gdn_scheduler(monkeypatch, tmp_path)
+    (request,) = create_requests(
+        1,
+        num_tokens=4095,
+        block_size=XPU_GDN_CHUNK_SIZE,
+    )
+    request.num_computed_tokens = 3968
+
+    assert scheduler._mamba_block_aligned_split(request, 127) == 127
+
+
+def test_xpu_gdn_arithmetic_grid_survives_internal_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scheduler = _make_xpu_gdn_scheduler(monkeypatch, tmp_path)
+    scheduler.mamba_has_prefill_checkpoint_blocks = True
+    (request,) = create_requests(
+        1,
+        num_tokens=4095,
+        block_size=XPU_GDN_CHUNK_SIZE,
+    )
+
+    assert scheduler._mamba_block_aligned_split(request, 3970) == 3968
+
+
+@pytest.mark.parametrize(
+    ("max_num_batched_tokens", "long_prefill_token_threshold", "match"),
+    [
+        (66, 0, "effective scheduler token budget"),
+        (8192, 63, "long_prefill_token_threshold"),
+    ],
+)
+def test_xpu_gdn_sub_64_config_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    max_num_batched_tokens: int,
+    long_prefill_token_threshold: int,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _make_xpu_gdn_scheduler(
+            monkeypatch,
+            tmp_path,
+            max_num_batched_tokens=max_num_batched_tokens,
+            long_prefill_token_threshold=long_prefill_token_threshold,
+        )
+
+
+def test_xpu_gdn_budget_reserves_an_aligned_prefill_after_b4_decodes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scheduler = _make_xpu_gdn_scheduler(
+        monkeypatch,
+        tmp_path,
+        max_num_batched_tokens=XPU_GDN_CHUNK_SIZE + 3,
+    )
+
+    decode_requests = create_requests(
+        3,
+        num_tokens=1,
+        block_size=XPU_GDN_CHUNK_SIZE,
+        req_ids=["decode-a", "decode-b", "decode-c"],
+    )
+    for request in decode_requests:
+        scheduler.add_request(request)
+    prompt_output = scheduler.schedule()
+    scheduler.update_from_output(
+        prompt_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id for request in decode_requests],
+            req_id_to_index={
+                request.request_id: index
+                for index, request in enumerate(decode_requests)
+            },
+            sampled_token_ids=[[0], [0], [0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    (prefill_request,) = create_requests(
+        1,
+        num_tokens=4095,
+        block_size=XPU_GDN_CHUNK_SIZE,
+        req_ids=["prefill"],
+    )
+    scheduler.add_request(prefill_request)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {
+        "decode-a": 1,
+        "decode-b": 1,
+        "decode-c": 1,
+        "prefill": XPU_GDN_CHUNK_SIZE,
+    }
+
+
+def test_non_xpu_gdn_default_scheduling_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scheduler = _make_xpu_gdn_scheduler(monkeypatch, tmp_path, is_xpu=False)
+    _add_b4_ragged_requests(scheduler)
+
+    output = scheduler.schedule()
+
+    assert scheduler.mamba_prefill_alignment == 1
+    assert not scheduler.need_mamba_block_aligned_split
+    assert output.num_scheduled_tokens == {
+        "short-a": 127,
+        "long-a": 4095,
+        "long-b": 3970,
+    }
+    assert sum(output.num_scheduled_tokens.values()) == 8192
+
+
+def test_xpu_generic_gdn_default_scheduling_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scheduler = _make_xpu_gdn_scheduler(
+        monkeypatch,
+        tmp_path,
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+
+    assert scheduler.mamba_prefill_alignment == 1
+    assert not scheduler.need_mamba_block_aligned_split
+
+
+@pytest.mark.parametrize(
+    "profile",
+    ["speculative", "multimodal"],
+)
+def test_xpu_qwen_gdn_out_of_scope_profiles_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    profile: str,
+) -> None:
+    scheduler = _make_xpu_gdn_scheduler(
+        monkeypatch,
+        tmp_path,
+        num_speculative_tokens=3 if profile == "speculative" else None,
+        supports_multimodal_inputs=profile == "multimodal",
+    )
+
+    assert scheduler.mamba_prefill_alignment == 1
+    assert not scheduler.need_mamba_block_aligned_split
 
 
 @pytest.mark.parametrize(
