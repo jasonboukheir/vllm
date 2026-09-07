@@ -17,13 +17,17 @@ from vllm.v1.attention.ops.kvarn_store import _pack_dpas_k4, _pack_dpas_v4
 
 @pytest.mark.parametrize("seq_len", [383, 384, 385])
 @pytest.mark.parametrize("query_len", [2, 3])
+@pytest.mark.parametrize("history_pages", [1, 1022])
 @torch.inference_mode()
-def test_dpas_mtp_verify_masks_future_and_overwrites_rejected_tail(seq_len, query_len):
+def test_dpas_mtp_verify_masks_future_and_overwrites_rejected_tail(
+    seq_len, query_len, history_pages
+):
     if not torch.xpu.is_available():
         pytest.skip("requires real XPU")
     cfg = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128_compact", 256)
     torch.manual_seed(37)
     device = torch.device("xpu")
+    seq_len += (history_pages - 1) * 128
     # Logical pages: resident sink, packed history, two resident tail pages.
     cache = torch.zeros((5, 4, cfg.record_bytes), dtype=torch.uint8)
     qk = torch.randint(0, 16, (4, 256, 128), dtype=torch.uint8)
@@ -83,7 +87,9 @@ def test_dpas_mtp_verify_masks_future_and_overwrites_rejected_tail(seq_len, quer
     md = KVarNMetadata(
         seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=device),
         slot_mapping=torch.zeros(query_len, dtype=torch.int64, device=device),
-        block_table=torch.tensor([[3, 1, 4, 0]], dtype=torch.int32, device=device),
+        block_table=torch.tensor(
+            [[3, *([1] * history_pages), 4, 0]], dtype=torch.int32, device=device
+        ),
         query_start_loc=torch.tensor([0, query_len], dtype=torch.int32, device=device),
         num_actual_tokens=query_len,
         max_query_len=query_len,
@@ -98,12 +104,20 @@ def test_dpas_mtp_verify_masks_future_and_overwrites_rejected_tail(seq_len, quer
     assert md.native_verify_metadata is not None
 
     def verify():
-        key = torch.cat([impl._tail_K_pool[0], packed_k, *impl._tail_K_pool[1:]])[
-            :seq_len
-        ]
-        value = torch.cat([impl._tail_V_pool[0], packed_v, *impl._tail_V_pool[1:]])[
-            :seq_len
-        ]
+        key = torch.cat(
+            [
+                impl._tail_K_pool[0],
+                packed_k.repeat(history_pages, 1, 1),
+                *impl._tail_K_pool[1:],
+            ]
+        )[:seq_len]
+        value = torch.cat(
+            [
+                impl._tail_V_pool[0],
+                packed_v.repeat(history_pages, 1, 1),
+                *impl._tail_V_pool[1:],
+            ]
+        )[:seq_len]
         qr = (q.reshape(-1, 256) @ impl._H_fp16).reshape_as(q).float()
         mask = torch.arange(seq_len, device=device)[None, :] <= (
             torch.arange(query_len, device=device)[:, None] + seq_len - query_len
@@ -127,8 +141,9 @@ def test_dpas_mtp_verify_masks_future_and_overwrites_rejected_tail(seq_len, quer
     for rejected_from in range(1, query_len):
         # No draft accepted, or a partially accepted draft prefix.
         for position in range(seq_len - query_len + rejected_from, seq_len):
-            slot, offset = position // 128 - 1, position % 128
-            impl._tail_V_pool[slot, offset].fill_(64)
+            slot, offset = position // 128 - history_pages, position % 128
+            # Keep a visible future-token signal despite long-context dilution.
+            impl._tail_V_pool[slot, offset].fill_(64 * (seq_len / 384))
         poisoned = verify()
         torch.testing.assert_close(
             original[:rejected_from], poisoned[:rejected_from], atol=0, rtol=0
