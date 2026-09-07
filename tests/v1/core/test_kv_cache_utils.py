@@ -29,6 +29,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.platforms.interface import Platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
 from vllm.utils.mem_constants import GiB_bytes
@@ -59,6 +60,8 @@ from vllm.v1.kv_cache_interface import (
     KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheLayout,
+    KVCachePoolSpec,
     KVCacheSpec,
     KVCacheSpecKind,
     KVCacheTensor,
@@ -1294,7 +1297,11 @@ def test_project_kv_cache_groups_to_worker():
     spec_b = new_kv_cache_spec(num_kv_heads=4)
 
     global_groups = [
-        KVCacheGroupSpec(["layer1", "layer2", "layer3"], spec_a),
+        KVCacheGroupSpec(
+            ["layer1", "layer2", "layer3"],
+            spec_a,
+            enable_kv_transfer=False,
+        ),
     ]
     worker_spec = {"layer1": spec_a, "layer2": spec_a}
     projected = kv_cache_utils._project_kv_cache_groups_to_worker(
@@ -1303,6 +1310,7 @@ def test_project_kv_cache_groups_to_worker():
     assert len(projected) == 1
     assert projected[0].layer_names == ["layer1", "layer2"]
     assert projected[0].kv_cache_spec is spec_a
+    assert not projected[0].enable_kv_transfer
 
     projected = kv_cache_utils._project_kv_cache_groups_to_worker(
         global_groups, {"layer4": spec_a}
@@ -1310,6 +1318,7 @@ def test_project_kv_cache_groups_to_worker():
     assert len(projected) == 1
     assert projected[0].layer_names == []
     assert projected[0].kv_cache_spec is spec_a
+    assert not projected[0].enable_kv_transfer
 
     uniform_spec = UniformTypeKVCacheSpecs(
         block_size=16,
@@ -1487,6 +1496,239 @@ if is_kv_cache_spec_uniform(specs):
         check=True,
         timeout=60,
     )
+
+
+def test_kv_cache_config_supports_independent_group_capacities():
+    """Physical cache pools may have different block counts."""
+    groups = [
+        KVCacheGroupSpec(["full"], new_kv_cache_spec(block_size=128)),
+        KVCacheGroupSpec(["mamba"], new_mamba_spec(block_size=1664)),
+    ]
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=130, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=10, group_ids=[1]),
+        ],
+    )
+
+    assert config.num_blocks_for_group(0) == 130
+    assert config.num_blocks_for_group(1) == 10
+    assert config.pool_id_for_group(0) == 0
+    assert config.pool_id_for_group(1) == 1
+    assert config.num_blocks == 10
+    assert config.max_num_blocks == 130
+    assert config.has_independent_kv_cache_pools
+
+
+def test_kv_cache_config_defaults_each_group_to_shared_capacity():
+    """Existing uniform-pool configurations retain their old behavior."""
+    groups = [
+        KVCacheGroupSpec(["full"], new_kv_cache_spec()),
+        KVCacheGroupSpec(["mamba"], new_mamba_spec()),
+    ]
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+    )
+
+    assert config.num_blocks_for_group(0) == 10
+    assert config.num_blocks_for_group(1) == 10
+    assert config.pool_id_for_group(0) == 0
+    assert config.pool_id_for_group(1) == 0
+    assert not config.has_independent_kv_cache_pools
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        "NixlConnector",
+        "MooncakeConnector",
+        "OffloadingConnector",
+        "SimpleCPUOffloadConnector",
+        "MultiConnector",
+    ],
+)
+def test_independent_kv_cache_pools_reject_kv_connectors(connector):
+    """Beta KVarN must fail closed until connectors carry physical pool IDs."""
+    groups = [
+        KVCacheGroupSpec(["full"], new_kv_cache_spec(block_size=128)),
+        KVCacheGroupSpec(["mamba"], new_mamba_spec(block_size=512)),
+    ]
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=5, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=3, group_ids=[1]),
+        ],
+    )
+    transfer = KVTransferConfig(kv_connector=connector, kv_role="kv_both")
+    vllm_config = SimpleNamespace(kv_transfer_config=transfer)
+
+    with pytest.raises(NotImplementedError, match="independent KV cache pools"):
+        kv_cache_utils._validate_kv_transfer_pool_compat(vllm_config, [config])
+
+
+def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
+    """KVarN tiles and Mamba states retain their natural page geometry."""
+    groups = [
+        KVCacheGroupSpec(["full.0", "full.1"], new_kv_cache_spec(block_size=128)),
+        KVCacheGroupSpec(["mamba.0"], new_mamba_spec(block_size=512)),
+    ]
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=512),
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v4_g128",
+            mamba_cache_mode="none",
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=3),
+    )
+
+    blocks_per_request = [
+        group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+        // group.kv_cache_spec.page_size_bytes
+        for group in groups
+    ]
+    bytes_per_request = sum(
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes * blocks
+        for group, blocks in zip(groups, blocks_per_request)
+    )
+    null_bytes = sum(
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in groups
+    )
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=bytes_per_request * 3 + null_bytes,
+    )
+
+    expected_pool_blocks = [blocks * 3 + 1 for blocks in blocks_per_request]
+    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == (
+        expected_pool_blocks
+    )
+    assert config.num_blocks == min(expected_pool_blocks)
+    assert [tensor.pool_id for tensor in config.kv_cache_tensors] == [0, 1]
+    assert [tensor.size for tensor in config.kv_cache_tensors] == [
+        len(groups[0].layer_names)
+        * groups[0].kv_cache_spec.page_size_bytes
+        * expected_pool_blocks[0],
+        len(groups[1].layer_names)
+        * groups[1].kv_cache_spec.page_size_bytes
+        * expected_pool_blocks[1],
+    ]
+    assert sum(tensor.size for tensor in config.kv_cache_tensors) == (
+        bytes_per_request * 3 + null_bytes
+    )
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+        == bytes_per_request
+    )
+
+
+@pytest.mark.parametrize("max_model_len", [128, 8192, 65536])
+def test_mamba_none_pool_cost_is_constant_with_context_length(max_model_len):
+    spec = MambaSpec(
+        block_size=max_model_len,
+        shapes=((1_603_584,),),
+        dtypes=(torch.bfloat16,),
+        mamba_cache_mode="none",
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+    )
+
+    assert spec.max_memory_usage_bytes(vllm_config) == spec.page_size_bytes
+    assert spec.max_num_blocks_per_req(vllm_config, max_model_len) == 1
+
+
+def test_kvarn_hybrid_alignment_shares_logical_boundary_not_physical_page():
+    cache_config = SimpleNamespace(
+        cache_dtype="kvarn_k4v4_g128",
+        block_size=128,
+        mamba_block_size=8192,
+        mamba_cache_mode="align",
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(),
+    )
+
+    Platform._align_hybrid_block_size(vllm_config, SimpleNamespace())
+
+    assert cache_config.block_size == 128
+    assert cache_config.mamba_block_size == 128
+
+
+def test_kvarn_hybrid_non_align_mode_preserves_mamba_logical_block_size():
+    cache_config = SimpleNamespace(
+        cache_dtype="kvarn_k4v4_g128",
+        block_size=128,
+        mamba_block_size=8192,
+        mamba_cache_mode="all",
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(),
+    )
+
+    Platform._align_hybrid_block_size(vllm_config, SimpleNamespace())
+
+    assert cache_config.block_size == 128
+    assert cache_config.mamba_block_size == 8192
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "is_hybrid", "expected_calls"),
+    [
+        ("kvarn_k4v4_g128_compact", True, ["hybrid"]),
+        ("kvarn_k4v4_g128_compact", False, ["heterogeneous"]),
+        ("auto", True, ["hybrid", "heterogeneous"]),
+    ],
+)
+def test_kvarn_hybrid_skips_shared_pool_heterogeneous_alignment(
+    monkeypatch, cache_dtype, is_hybrid, expected_calls
+):
+    """Independent KVarN pools must retain their natural page geometry."""
+    calls = []
+    monkeypatch.setattr(
+        Platform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        Platform,
+        "_align_hybrid_block_size",
+        classmethod(lambda cls, vllm_config, backend: calls.append("hybrid")),
+    )
+    monkeypatch.setattr(
+        Platform,
+        "_align_heterogeneous_kv_block_size",
+        classmethod(lambda cls, vllm_config, backend: calls.append("heterogeneous")),
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            user_specified_block_size=True,
+            cache_dtype=cache_dtype,
+            kv_cache_dtype_skip_layers=["sliding_window"],
+        ),
+        model_config=SimpleNamespace(is_hybrid=is_hybrid),
+    )
+
+    Platform.update_block_size_for_backend(vllm_config)
+
+    assert calls == expected_calls
 
 
 @pytest.mark.parametrize(
@@ -1671,6 +1913,28 @@ def test_get_max_concurrency_for_kv_cache_config():
         vllm_config, kv_cache_config_scheduler_shape
     ) == get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config_uniform_group
+    )
+
+    # A physical pool may own more than one logical group. Its per-request
+    # demand is the sum of those groups, not the largest individual demand.
+    kv_cache_config_multi_group_pool = KVCacheConfig(
+        num_blocks=1153 * 3,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer_0"], full_attention_spec),
+            KVCacheGroupSpec(["layer_1"], sliding_window_spec),
+            KVCacheGroupSpec(["layer_2"], full_attention_spec),
+        ],
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=1153 * 3 + 1, group_ids=[0, 1]),
+            KVCachePoolSpec(num_blocks=1024 * 4 + 1, group_ids=[2]),
+        ],
+    )
+    assert (
+        get_max_concurrency_for_kv_cache_config(
+            vllm_config, kv_cache_config_multi_group_pool
+        )
+        == 3
     )
 
 

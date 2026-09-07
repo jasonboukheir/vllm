@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -53,6 +54,11 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
 
 logger = init_logger(__name__)
+
+
+def _validate_inline_qkv_cache_update(enabled: bool, backend_name: str) -> None:
+    if enabled and (backend_name != "KVARN" or not current_platform.is_xpu()):
+        raise RuntimeError("qkv_scatter_inline requires the XPU KVarN path")
 
 
 def validate_kv_sharing_target(
@@ -425,6 +431,21 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_sharing_target_layer_name,
             **extra_impl_args,
         )
+        # Expose the layer name on the impl so backends that scope per-layer /
+        # per-KV-cache-group state (e.g. KVarN's slot allocator) can identify
+        # which group an impl belongs to by matching the builder's layer_names.
+        with contextlib.suppress(Exception):
+            self.impl.layer_name = prefix  # type: ignore[attr-defined]
+        configure_qkv_update = getattr(
+            self.impl, "configure_fused_qkv_cache_update", None
+        )
+        self.use_fused_qkv_cache_update = bool(
+            configure_qkv_update(prefix) if configure_qkv_update is not None else False
+        )
+        self.use_inline_qkv_cache_update = bool(
+            getattr(self.impl, "use_inline_qkv_cache_update", False)
+        )
+        self._inline_qkv_attention_active_logged = False
         self.backend = AttentionBackendEnum[self.attn_backend.get_name()]
         self.dtype = dtype
 
@@ -433,6 +454,10 @@ class Attention(nn.Module, AttentionLayerBase):
         # opaque custom op. For other platforms, we directly call them
         # and let torch.compile handle them.
         self.use_direct_call = not current_platform.opaque_attention_op()
+        _validate_inline_qkv_cache_update(
+            self.use_inline_qkv_cache_update,
+            self.attn_backend.get_name(),
+        )
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -535,43 +560,73 @@ class Attention(nn.Module, AttentionLayerBase):
         kv_cache_dummy_dep = None
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
-            if (
+            update_kv_cache = (
                 not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
-            ):
-                kv_cache_dummy_dep = unified_kv_cache_update(
-                    key, value, self.layer_name
-                )
-            unified_attention_with_output(
-                query,
-                key,
-                value,
-                output,
-                self.layer_name,
-                kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
+            if update_kv_cache and self.use_inline_qkv_cache_update:
+                unified_qkv_attention_with_output(
+                    query,
+                    key,
+                    value,
+                    output,
+                    self.layer_name,
+                )
+            else:
+                if update_kv_cache:
+                    if self.use_fused_qkv_cache_update:
+                        kv_cache_dummy_dep = unified_qkv_cache_update(
+                            query, key, value, self.layer_name
+                        )
+                    else:
+                        kv_cache_dummy_dep = unified_kv_cache_update(
+                            key, value, self.layer_name
+                        )
+                unified_attention_with_output(
+                    query,
+                    key,
+                    value,
+                    output,
+                    self.layer_name,
+                    kv_cache_dummy_dep=kv_cache_dummy_dep,
+                )
         else:
             # Skip this if sharing KV cache with an earlier attention layer.
             encoded = _encode_layer_name(self.layer_name)
-            if (
+            update_kv_cache = (
                 not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
-            ):
-                kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
-                    key, value, encoded
-                )
-            torch.ops.vllm.unified_attention_with_output(
-                query,
-                key,
-                value,
-                output,
-                encoded,
-                kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
+            if update_kv_cache and self.use_inline_qkv_cache_update:
+                torch.ops.vllm.unified_qkv_attention_with_output(
+                    query,
+                    key,
+                    value,
+                    output,
+                    encoded,
+                )
+            else:
+                if update_kv_cache:
+                    if self.use_fused_qkv_cache_update:
+                        kv_cache_dummy_dep = torch.ops.vllm.unified_qkv_cache_update(
+                            query, key, value, encoded
+                        )
+                    else:
+                        kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
+                            key, value, encoded
+                        )
+                torch.ops.vllm.unified_attention_with_output(
+                    query,
+                    key,
+                    value,
+                    output,
+                    encoded,
+                    kv_cache_dummy_dep=kv_cache_dummy_dep,
+                )
         return output.view(-1, hidden_size)
 
     def extra_repr(self) -> str:
@@ -742,6 +797,141 @@ direct_register_custom_op(
     op_func=unified_kv_cache_update,
     fake_impl=unified_kv_cache_update_fake,
     mutates_args=[],
+)
+
+
+@eager_break_during_capture
+def unified_qkv_cache_update(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """KVarN-only Q rotation plus K/V cache update dependency."""
+    layer_name = _resolve_layer_name(layer_name)
+    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    if layer_slot_mapping is not None:
+        assert hasattr(attn_layer.impl, "do_qkv_cache_update"), (
+            f"{attn_layer.impl.__class__.__name__} does not support QKV cache update"
+        )
+        attn_layer.impl.do_qkv_cache_update(  # type: ignore[attr-defined]
+            attn_layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            layer_slot_mapping,
+        )
+
+    return key.new_empty(0)
+
+
+def unified_qkv_cache_update_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.empty(0, device=key.device, dtype=key.dtype)
+
+
+direct_register_custom_op(
+    op_name="unified_qkv_cache_update",
+    op_func=unified_qkv_cache_update,
+    fake_impl=unified_qkv_cache_update_fake,
+    mutates_args=[],
+    tags=(torch.Tag.cudagraph_unsafe,),
+)
+
+
+@eager_break_during_capture
+@maybe_transfer_kv_layer
+def unified_qkv_attention_with_output(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+    output_scale: torch.Tensor | None = None,
+    output_block_scale: torch.Tensor | None = None,
+) -> None:
+    """Run the experimental KVarN QKV update and attention in one context."""
+    layer_name = _resolve_layer_name(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
+    if not attn_layer._inline_qkv_attention_active_logged:
+        logger.info(
+            "[KVARN_FRONTEND_INLINE] active=qkv_scatter_inline; "
+            "wrapper=unified_qkv_attention_with_output; layer=%s",
+            layer_name,
+        )
+        attn_layer._inline_qkv_attention_active_logged = True
+    if getattr(attn_layer.impl, "use_bound_qlen1_inline_plan_v2", False):
+        qlen1_inline = getattr(attn_layer.impl, "forward_bound_qlen1_inline_v2", None)
+    elif getattr(attn_layer.impl, "use_trusted_qlen1_inline_plan", False):
+        qlen1_inline = getattr(attn_layer.impl, "forward_trusted_qlen1_inline", None)
+    else:
+        qlen1_inline = None
+    if (
+        layer_slot_mapping is not None
+        and qlen1_inline is not None
+        and qlen1_inline(
+            attn_layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            layer_slot_mapping,
+            attn_metadata,
+            output,
+        )
+    ):
+        return
+    if layer_slot_mapping is not None:
+        assert hasattr(attn_layer.impl, "do_qkv_cache_update"), (
+            f"{attn_layer.impl.__class__.__name__} does not support QKV cache update"
+        )
+        attn_layer.impl.do_qkv_cache_update(  # type: ignore[attr-defined]
+            attn_layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            layer_slot_mapping,
+        )
+
+    attn_layer.impl.forward(
+        attn_layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output=output,
+        output_scale=output_scale,
+        output_block_scale=output_block_scale,
+    )
+
+
+def unified_qkv_attention_with_output_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+    output_scale: torch.Tensor | None = None,
+    output_block_scale: torch.Tensor | None = None,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="unified_qkv_attention_with_output",
+    op_func=unified_qkv_attention_with_output,
+    mutates_args=["output", "output_block_scale"],
+    fake_impl=unified_qkv_attention_with_output_fake,
+    tags=(torch.Tag.cudagraph_unsafe,),
 )
 
 
