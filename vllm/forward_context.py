@@ -324,6 +324,7 @@ def set_forward_context(
         cudagraph_runtime_mode=cudagraph_runtime_mode,
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
+        is_padding=is_padding,
     )
 
     forward_context = create_forward_context(

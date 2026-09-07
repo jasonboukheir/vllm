@@ -3,7 +3,7 @@
 
 import contextlib
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -26,6 +26,113 @@ else:
     VllmConfig = None
 
 logger = init_logger(__name__)
+
+# These switches were useful while qualifying the beta implementation, but are
+# deliberately not part of the release contract.  Fail closed rather than
+# silently running a different cache implementation when an old launch
+# environment is reused.
+_RETIRED_KVARN_ENV_VARS = (
+    "KVARN_QUANT_SLIDING",
+    "KVARN_FLUSH_INDEX_MATERIALIZATION",
+    "KVARN_FLUSH_WRITER",
+    "KVARN_SINKHORN_SOURCE",
+    "KVARN_FORWARD_POOL_ENSURE",
+    "KVARN_QLEN1_INLINE_PLAN",
+    "KVARN_METADATA_LIFECYCLE",
+    "KVARN_NATIVE_XPU_LAYER",
+    "KVARN_FAST_FLUSH",
+    "KVARN_DUMP_TILES",
+    "KVARN_FUSED_VERIFY",
+    "KVARN_FUSED_VERIFY_MAXQ",
+    "KVARN_FUSED_VERIFY_MIN_BLOCKS",
+    "KVARN_FUSED_DECODE",
+    "KVARN_RTN_QUANTILE",
+    "KVARN_SINKHORN_ITERS",
+    "KVARN_SINK_TOKENS",
+    "KVARN_PREFILL_FP16_WINDOW_BLOCKS",
+    "KVARN_DECODE_FP16_WINDOW_BLOCKS",
+    "KVARN_DECODE_FP16_LOW_WATER_BLOCKS",
+    "KVARN_DECODE_FLUSH_SCOPE",
+    "KVARN_NATIVE_XPU",
+    "KVARN_SPLIT_K",
+    "KVARN_NUM_KV_SPLITS",
+    "KVARN_SHARED_VERIFY",
+    "KVARN_ONEDNN_DETERMINISTIC",
+    "KVARN_REQUEST_STABLE_PROJECTION_ROWS",
+    "KVARN_REQUEST_STABLE_RMSNORM",
+    "VLLM_KVARN_DEFER_PREFILL_FLUSH",
+)
+
+
+def _check_kvarn_beta_unsupported_config(
+    vllm_config: "VllmConfig", cudagraph_none: object
+) -> None:
+    """Fail clearly for combinations outside the XPU KVarN beta contract."""
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    if not isinstance(cache_dtype, str) or not cache_dtype.startswith("kvarn_"):
+        return
+
+    retired = [name for name in _RETIRED_KVARN_ENV_VARS if name in os.environ]
+    retired.extend(name for name in os.environ if name.startswith("KVARN_NATIVE_XPU_"))
+    if retired:
+        raise ValueError(
+            "retired KVarN experiment environment override(s): "
+            + ", ".join(retired)
+            + "; remove them and use the qualified release defaults"
+        )
+
+    if vllm_config.speculative_config is not None:
+        spec = vllm_config.speculative_config
+        model = vllm_config.model_config
+        scheduler = vllm_config.scheduler_config
+        parallel = vllm_config.parallel_config
+        if not (
+            cache_dtype == "kvarn_k4v4_g128_compact"
+            and getattr(spec, "method", None) == "mtp"
+            and getattr(spec, "num_speculative_tokens", None) in (1, 2)
+            and getattr(spec, "kv_cache_dtype", None) in (None, cache_dtype)
+            and getattr(model.hf_config, "model_type", None) == "qwen3_5"
+            and model.dtype == torch.bfloat16
+            and scheduler.max_num_seqs == 1
+            and scheduler.max_num_batched_tokens <= 2048
+            and parallel.tensor_parallel_size == 1
+            and parallel.pipeline_parallel_size == 1
+        ):
+            raise ValueError(
+                "XPU KVarN speculative decoding/MTP is limited to one or two bundled "
+                "Qwen3.5 MTP tokens, compact K4V4, BF16, B1, TP1/PP1, "
+                "max-num-batched-tokens<=2048; "
+                "disable speculation or use --kv-cache-dtype=auto"
+            )
+    if vllm_config.use_v2_model_runner:
+        raise ValueError(
+            "XPU KVarN beta requires Model Runner V1; unset "
+            "VLLM_USE_V2_MODEL_RUNNER=1 or use --kv-cache-dtype=auto"
+        )
+    if vllm_config.compilation_config.cudagraph_mode != cudagraph_none:
+        raise ValueError(
+            "XPU KVarN beta does not support graph mode; use --enforce-eager "
+            "or set cudagraph_mode=NONE, or use --kv-cache-dtype=auto"
+        )
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError(
+            "XPU KVarN beta does not support prefix caching; disable it "
+            "or use --kv-cache-dtype=auto"
+        )
+    multimodal_config = getattr(vllm_config.model_config, "multimodal_config", None)
+    language_model_only = bool(getattr(multimodal_config, "language_model_only", False))
+    if vllm_config.model_config.is_multimodal_model and not language_model_only:
+        hf_config = getattr(vllm_config.model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) != "qwen3_5":
+            raise ValueError(
+                "XPU KVarN beta vision/multimodal support is limited to Qwen3.5 "
+                "image inputs; use --language-model-only or --kv-cache-dtype=auto"
+            )
+        if multimodal_config.get_limit_per_prompt("video") != 0:
+            raise ValueError(
+                "XPU KVarN beta vision requires video inputs disabled; "
+                "use --limit-mm-per-prompt '{\"video\":0}' or --kv-cache-dtype=auto"
+            )
 
 
 def get_mem_info_wrapper(
@@ -110,6 +217,7 @@ class XPUPlatform(Platform):
     ray_device_key: str = "GPU"
     dist_backend: str = "xccl"  # xccl only
     device_control_env_var: str = "ZE_AFFINITY_MASK"
+    _kvarn_request_stable_xe2_validated = False
     supported_quantization: list[str] = [
         "awq",
         "gptq",
@@ -140,6 +248,185 @@ class XPUPlatform(Platform):
         pass
 
     @classmethod
+    def set_additional_forward_context(
+        cls,
+        *,
+        attn_metadata: Any,
+        vllm_config: "VllmConfig",
+        dp_metadata: Any = None,
+        num_tokens: int | None = None,
+        num_tokens_across_dp: Any = None,
+        cudagraph_runtime_mode: Any = None,
+        ubatch_slices: Any = None,
+        is_padding: torch.Tensor | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        from vllm.model_executor.determinism.request_stable_linear import (
+            XPU_KVARN_CANONICAL_LINEAR_ROWS,
+            XPU_KVARN_REQUEST_SLICES_KEY,
+            XPUKvarnRequestSlices,
+            use_xpu_kvarn_request_stable_context,
+        )
+
+        if not use_xpu_kvarn_request_stable_context(vllm_config):
+            return {}
+        if not cls._kvarn_request_stable_xe2_validated:
+            if not torch.ops._xpu_C.is_xe2_arch():
+                raise RuntimeError(
+                    "the frozen XPU KVarN request-stable profile requires an Xe2 device"
+                )
+            cls._kvarn_request_stable_xe2_validated = True
+        if attn_metadata is None or attn_metadata == {}:
+            # Profiling and warmup passes can omit attention metadata.
+            return {}
+        if (
+            getattr(cudagraph_runtime_mode, "name", None) != "NONE"
+            or dp_metadata is not None
+            or num_tokens_across_dp is not None
+            or ubatch_slices is not None
+            or is_padding is not None
+            or not isinstance(attn_metadata, dict)
+        ):
+            raise RuntimeError(
+                "the frozen XPU KVarN request-stable profile requires an eager, "
+                "unpadded, non-ubatched forward"
+            )
+
+        from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+        from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+        static_context = vllm_config.compilation_config.static_forward_context
+        qwen_gdn_names = {
+            name
+            for name, layer in static_context.items()
+            if getattr(layer, "mamba_type", None)
+            is MambaAttentionBackendEnum.QWEN_GDN_ATTN
+        }
+        if not qwen_gdn_names:
+            raise RuntimeError(
+                "the frozen XPU KVarN profile has no registered Qwen GDN layers"
+            )
+        missing_names = qwen_gdn_names.difference(attn_metadata)
+        if missing_names:
+            raise RuntimeError(
+                "the frozen XPU KVarN forward is missing Qwen GDN metadata for "
+                + ", ".join(sorted(missing_names))
+            )
+
+        if any(
+            not isinstance(attn_metadata[name], GDNAttentionMetadata)
+            for name in qwen_gdn_names
+        ):
+            raise RuntimeError(
+                "the frozen XPU KVarN profile received non-GDN Qwen metadata"
+            )
+        metadata_by_id = {
+            id(attn_metadata[name]): attn_metadata[name] for name in qwen_gdn_names
+        }
+
+        expected_slices: tuple[tuple[int, int, int, bool], ...] | None = None
+        expected_metadata_signature: tuple[int, ...] | None = None
+        for metadata in metadata_by_id.values():
+            disallowed_spec_fields = (
+                metadata.spec_query_start_loc,
+                metadata.spec_state_indices_tensor,
+                metadata.spec_sequence_masks,
+                metadata.spec_token_indx,
+                metadata.non_spec_token_indx,
+                metadata.num_accepted_tokens,
+            )
+            if (
+                metadata.num_spec_decodes != 0
+                or metadata.num_spec_decode_tokens != 0
+                or any(value is not None for value in disallowed_spec_fields)
+            ):
+                raise RuntimeError(
+                    "XPU KVarN request-stable operators require ordinary no-spec "
+                    "GDN metadata"
+                )
+
+            boundaries = metadata.non_spec_query_start_loc_cpu
+            positions = metadata.non_spec_num_computed_tokens_cpu
+            phases = metadata.non_spec_is_prefilling_cpu
+            num_requests = metadata.num_decodes + metadata.num_prefills
+            if boundaries is None or len(boundaries) != num_requests + 1:
+                raise RuntimeError(
+                    "XPU KVarN GDN metadata is missing complete CPU request boundaries"
+                )
+            if positions is None or len(positions) != num_requests:
+                raise RuntimeError(
+                    "XPU KVarN GDN metadata is missing CPU request start positions"
+                )
+            if any(position < 0 for position in positions):
+                raise RuntimeError(
+                    "XPU KVarN GDN request start positions must be non-negative"
+                )
+            if phases is None or len(phases) != num_requests:
+                raise RuntimeError(
+                    "XPU KVarN GDN metadata is missing CPU request phases"
+                )
+            if boundaries[0] != 0 or any(
+                stop <= start for start, stop in zip(boundaries, boundaries[1:])
+            ):
+                raise RuntimeError(
+                    "XPU KVarN GDN CPU request boundaries must be positive and "
+                    "contiguous from row 0"
+                )
+            if (
+                boundaries[-1] != metadata.num_actual_tokens
+                or boundaries[-1] != num_tokens
+                or metadata.num_decode_tokens + metadata.num_prefill_tokens
+                != metadata.num_actual_tokens
+            ):
+                raise RuntimeError(
+                    "XPU KVarN GDN request boundaries do not cover the model rows"
+                )
+            if (
+                boundaries[metadata.num_decodes] != metadata.num_decode_tokens
+                or boundaries[-1] - boundaries[metadata.num_decodes]
+                != metadata.num_prefill_tokens
+            ):
+                raise RuntimeError(
+                    "XPU KVarN GDN request boundaries disagree with decode/prefill "
+                    "token counts"
+                )
+
+            request_slices = tuple(
+                (start, stop, position, is_prefill)
+                for start, stop, position, is_prefill in zip(
+                    boundaries, boundaries[1:], positions, phases
+                )
+            )
+            metadata_signature = (
+                metadata.num_decodes,
+                metadata.num_prefills,
+                metadata.num_decode_tokens,
+                metadata.num_prefill_tokens,
+                metadata.num_actual_tokens,
+            )
+            for start, stop, position, is_prefill in request_slices:
+                span = stop - start
+                if (
+                    is_prefill or span > 1
+                ) and position % XPU_KVARN_CANONICAL_LINEAR_ROWS != 0:
+                    raise RuntimeError(
+                        "XPU KVarN multi-row projection did not start on the "
+                        "canonical 64-row grid"
+                    )
+            if expected_slices is None:
+                expected_slices = XPUKvarnRequestSlices(request_slices)
+                expected_metadata_signature = metadata_signature
+            elif metadata_signature != expected_metadata_signature:
+                raise RuntimeError("XPU KVarN GDN layers disagree on dispatch counts")
+            elif request_slices != expected_slices:
+                raise RuntimeError(
+                    "XPU KVarN GDN layers disagree on packed request metadata"
+                )
+
+        assert expected_slices is not None
+        return {XPU_KVARN_REQUEST_SLICES_KEY: expected_slices}
+
+    @classmethod
     def get_attn_backend_cls(
         cls,
         selected_backend: "AttentionBackendEnum",
@@ -151,6 +438,13 @@ class XPUPlatform(Platform):
         if kv_cache_dtype is not None and kv_cache_dtype.startswith("turboquant_"):
             logger.info_once("Using TurboQuant attention backend.")
             return AttentionBackendEnum.TURBOQUANT.get_path()
+        if (
+            kv_cache_dtype is not None
+            and kv_cache_dtype.startswith("kvarn_")
+            and not attn_selector_config.use_mla
+        ):
+            logger.info_once("Using KVarN attention backend on XPU.")
+            return AttentionBackendEnum.KVARN.get_path()
 
         dtype = attn_selector_config.dtype
         if attn_selector_config.use_sparse:
@@ -285,6 +579,8 @@ class XPUPlatform(Platform):
         # lazy import to avoid circular import
         from vllm.config import CUDAGraphMode
 
+        _check_kvarn_beta_unsupported_config(vllm_config, CUDAGraphMode.NONE)
+
         compilation_config = vllm_config.compilation_config
         if compilation_config.compile_sizes is None:
             compilation_config.compile_sizes = []
@@ -383,6 +679,58 @@ class XPUPlatform(Platform):
                 "XPU platform: set server shutdown_timeout=%d.",
                 vllm_config.shutdown_timeout,
             )
+
+        cache_config = vllm_config.cache_config
+        model_config = vllm_config.model_config
+        scheduler_config = vllm_config.scheduler_config
+        cache_dtype = getattr(cache_config, "cache_dtype", None)
+        if (
+            model_config is not None
+            and isinstance(cache_dtype, str)
+            and cache_dtype.startswith("kvarn_")
+            and not cache_dtype.startswith("kvarn_mla")
+            and not getattr(model_config, "use_mla", False)
+        ):
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+
+            head_size = model_config.get_head_size()
+            if head_size not in (128, 256, 512):
+                raise ValueError(
+                    f"{cache_dtype} requires head_dim in (128, 256, 512), but "
+                    f"this model has head_dim={head_size}; use a different "
+                    "--kv-cache-dtype for this model."
+                )
+
+            skip_layers = cache_config.kv_cache_dtype_skip_layers
+            if "sliding_window" not in skip_layers:
+                skip_layers.append("sliding_window")
+
+            kvarn_config = KVarNConfig.from_cache_dtype(cache_dtype, head_size)
+            weight_bytes = kvarn_config.estimate_weight_bytes(
+                model_config.model,
+                tensor_parallel_size=vllm_config.parallel_config.tensor_parallel_size,
+            )
+            supported = kvarn_config.max_supported_seqs(
+                total_gpu_bytes=cls.get_device_total_memory(),
+                num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+                num_layers=KVarNConfig.num_kvarn_layers(
+                    model_config, vllm_config.parallel_config
+                ),
+                max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
+                gpu_memory_utilization=cache_config.gpu_memory_utilization,
+                weight_bytes=weight_bytes,
+            )
+            if scheduler_config.max_num_seqs > supported:
+                logger.warning(
+                    "KVarN (%s): capping max_num_seqs %d -> %d so the XPU "
+                    "fp16 tail pool fits its memory budget.",
+                    cache_dtype,
+                    scheduler_config.max_num_seqs,
+                    supported,
+                )
+                scheduler_config.max_num_seqs = supported
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:

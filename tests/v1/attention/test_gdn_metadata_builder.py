@@ -198,6 +198,23 @@ def test_has_initial_state_after_reclassification():
     assert meta.has_initial_state[0].item() is True
 
 
+def test_non_spec_cpu_boundaries_are_immutable():
+    builder = _create_gdn_builder()
+    batch = BatchSpec(seq_lens=[1, 4, 9], query_lens=[1, 3, 5])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    common.is_prefilling = torch.tensor([False, True, True])
+
+    meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    common.query_start_loc_cpu.fill_(99)
+    assert common._num_computed_tokens_cpu is not None
+    common._num_computed_tokens_cpu.fill_(99)
+    common.is_prefilling.fill_(False)
+
+    assert meta.non_spec_query_start_loc_cpu == (0, 1, 4, 9)
+    assert meta.non_spec_num_computed_tokens_cpu == (0, 1, 4)
+    assert meta.non_spec_is_prefilling_cpu == (False, True, True)
+
+
 def test_full_cudagraph_spec_metadata_uses_request_count():
     """FULL cudagraph token padding must not pad request-indexed metadata."""
     num_speculative_tokens = 3
