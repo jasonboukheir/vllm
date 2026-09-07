@@ -115,23 +115,17 @@ def test_fused_add_rms_norm_batch_invariant_residual_path(
         dim=0,
     )
 
-    def fused_add_rms_norm(x, residual, w, e) -> tuple[torch.Tensor, torch.Tensor]:
-        import vllm._custom_ops as ops
-
-        ops.fused_add_rms_norm(x, residual, w, e)
-        return x, residual
-
-    out_single, residual_out_single = fused_add_rms_norm(
-        x_single.clone(),
-        residual_single.clone(),
+    out_single, residual_out_single = rms_norm_batch_invariant(
+        x_single,
         weight,
-        eps,
+        eps=eps,
+        residual=residual_single,
     )
-    out_batch, residual_out_batch = fused_add_rms_norm(
-        x_batch.clone(),
-        residual_batch.clone(),
+    out_batch, residual_out_batch = rms_norm_batch_invariant(
+        x_batch,
         weight,
-        eps,
+        eps=eps,
+        residual=residual_batch,
     )
 
     merged_single = x_single + residual_single
