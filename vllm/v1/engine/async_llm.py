@@ -120,6 +120,11 @@ class AsyncLLM(EngineClient):
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
         self.observability_config = vllm_config.observability_config
+        # Keep the frontend profiler state defined when profiling is disabled
+        # for the API process (the normal ``ignore_frontend=True`` case).  The
+        # profile endpoints still forward start/stop to EngineCore and must not
+        # fail while checking the optional frontend profiler.
+        self.profiler = profiler
 
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
