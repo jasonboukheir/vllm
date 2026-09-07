@@ -6,6 +6,7 @@ Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -221,3 +222,94 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+@pytest.mark.parametrize(
+    "prefills,decodes,spec_decodes,present",
+    [
+        (1, 1, 2, True),
+        (0, 2, 0, True),
+        (0, 0, 2, True),
+        (0, 0, 0, True),
+        (0, 0, 0, False),
+    ],
+)
+def test_xpu_gdn_adapter_trims_only_request_padding(
+    monkeypatch, prefills, decodes, spec_decodes, present
+):
+    """The native boundary receives live rows without losing rollback columns."""
+    from vllm import _xpu_ops, forward_context
+
+    non_spec = prefills + decodes
+    lengths = {
+        "non_spec_query_start_loc": non_spec + 1,
+        "non_spec_state_indices_tensor": non_spec,
+        "spec_query_start_loc": spec_decodes + 1,
+        "spec_state_indices_tensor": spec_decodes,
+        "num_accepted_tokens": spec_decodes,
+    }
+    values = {}
+    for name, length in lengths.items():
+        rows = length + 4
+        values[name] = (
+            (
+                torch.arange(rows * 3, dtype=torch.int32).view(rows, 3)
+                if name == "spec_state_indices_tensor"
+                else torch.arange(rows, dtype=torch.int32)
+            )
+            if present
+            else None
+        )
+    saved = {k: v.clone() for k, v in values.items() if v is not None}
+    metadata = GDNAttentionMetadata(
+        num_prefills=prefills,
+        num_prefill_tokens=prefills * 2,
+        num_decodes=decodes,
+        num_decode_tokens=decodes,
+        num_spec_decodes=spec_decodes,
+        num_spec_decode_tokens=spec_decodes * 3,
+        # Graph token extent is deliberately different from every live count.
+        num_actual_tokens=32,
+        **values,
+    )
+    layer = SimpleNamespace(
+        prefix="layer",
+        conv1d=SimpleNamespace(weight=torch.ones(4, 1, 3), bias=None),
+        num_k_heads=1,
+        num_v_heads=1,
+        head_k_dim=4,
+        head_v_dim=4,
+        kv_cache=(torch.zeros(1), torch.zeros(1)),
+        activation="silu",
+        A_log=torch.zeros(1),
+        dt_bias=torch.zeros(1),
+        tp_size=1,
+        gqa_interleaved_layout=True,
+    )
+    context = SimpleNamespace(
+        no_compile_layers={"layer": layer}, attn_metadata={"layer": metadata}
+    )
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
+    captured = {}
+
+    def native_boundary(*args, **kwargs):
+        captured.update(kwargs)
+        for actual, expected in zip(args[:4], data):
+            assert actual is expected
+
+    monkeypatch.setattr(torch.ops._xpu_C, "gdn_attention", native_boundary)
+    data = [torch.zeros(32, 4) for _ in range(4)]
+    _xpu_ops._gdn_attention_core_xpu_impl(*data, "layer")
+    assert captured["num_actual_tokens"] == 32
+    for name, length in lengths.items():
+        source, actual = values[name], captured[name]
+        if source is None:
+            assert actual is None
+        else:
+            assert actual.shape == (length, *source.shape[1:])
+            assert (
+                actual.untyped_storage().data_ptr()
+                == source.untyped_storage().data_ptr()
+            )
+            torch.testing.assert_close(actual, source[:length])
+            torch.testing.assert_close(source, saved[name])
