@@ -21,6 +21,11 @@ the native packed-cache reader with a separate causal bound per query, without
 materializing the entire history. Rejected proposals cannot commit permanent
 cache pages. No tuning overrides are required.
 
+The MTP startup guard does not impose a separate context-length ceiling.
+Use `--max-model-len` to select the combined input/output context; the model's
+position limit and vLLM's profiled KV-cache capacity determine whether it fits.
+Passing those startup checks does not replace long-context correctness testing.
+
 Unsupported speculative methods, draft counts and serving combinations fail
 the XPU KVarN guard. Do not enable graphs/V2/prefix caching to work around it.
 Use `--kv-cache-dtype auto` for cache rollback, or omit the speculative config

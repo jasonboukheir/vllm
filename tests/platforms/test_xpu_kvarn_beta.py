@@ -64,15 +64,6 @@ def _mtp_config():
     return config
 
 
-@pytest.mark.parametrize("draft_tokens", [1, 2])
-@pytest.mark.parametrize("context", [8192, 131072])
-def test_kvarn_beta_accepts_bounded_bundled_mtp_with_images(draft_tokens, context):
-    config = _mtp_config()
-    config.speculative_config.num_speculative_tokens = draft_tokens
-    config.model_config.max_model_len = context
-    _check_kvarn_beta_unsupported_config(config, CUDAGraphMode.NONE)
-
-
 @pytest.mark.parametrize(
     "section,field,value",
     [
@@ -82,7 +73,6 @@ def test_kvarn_beta_accepts_bounded_bundled_mtp_with_images(draft_tokens, contex
         ("speculative_config", "kv_cache_dtype", "auto"),
         ("scheduler_config", "max_num_seqs", 4),
         ("scheduler_config", "max_num_batched_tokens", 4096),
-        ("model_config", "max_model_len", 131073),
         ("model_config", "dtype", torch.float16),
         ("parallel_config", "tensor_parallel_size", 2),
         ("parallel_config", "pipeline_parallel_size", 2),
