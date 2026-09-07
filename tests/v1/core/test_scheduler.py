@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from transformers import OPTConfig
 
 import vllm.envs as envs
 from vllm.config import (
@@ -3946,16 +3947,24 @@ def test_scheduler_no_ec_connector_by_default():
     assert scheduler.ec_connector is None
 
 
-def test_mamba_align_encoder_cache_cap_makes_progress():
+def test_mamba_align_encoder_cache_cap_makes_progress(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
     """Two individually cacheable images must not deadlock Mamba alignment."""
     block_size = 768
     encoder_cache_size = 600
+    model_path = tmp_path / "opt"
+    OPTConfig().save_pretrained(model_path)
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "cache"))
     scheduler = create_scheduler(
+        model=str(model_path),
         max_num_batched_tokens=8192,
         block_size=block_size,
         enable_prefix_caching=True,
     )
     scheduler.need_mamba_block_aligned_split = True
+    scheduler.mamba_prefill_alignment = block_size
+    scheduler.needs_mamba_cache_alignment = True
     scheduler.max_num_encoder_input_tokens = encoder_cache_size
     scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=encoder_cache_size)
 
@@ -3999,16 +4008,24 @@ def test_mamba_align_encoder_cache_cap_makes_progress():
     assert output.scheduled_encoder_inputs[request.request_id] == [1]
 
 
-def test_mamba_align_eagle_schedules_encoder_at_boundary():
+def test_mamba_align_eagle_schedules_encoder_at_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
     """EAGLE lookahead at an aligned MM boundary requires encoder cache."""
     block_size = 512
+    model_path = tmp_path / "opt"
+    OPTConfig().save_pretrained(model_path)
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "cache"))
     scheduler = create_scheduler(
+        model=str(model_path),
         max_num_batched_tokens=700,
         max_model_len=2048,
         block_size=block_size,
         enable_prefix_caching=True,
     )
     scheduler.need_mamba_block_aligned_split = True
+    scheduler.mamba_prefill_alignment = block_size
+    scheduler.needs_mamba_cache_alignment = True
     scheduler.use_eagle = True
     scheduler.num_prefill_lookahead = 1
     scheduler.max_num_encoder_input_tokens = 2048
