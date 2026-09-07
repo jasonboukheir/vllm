@@ -1,31 +1,31 @@
-# KVarN KV cache
+# KVarN KV cache on Intel XPU
 
-KVarN's scoped Intel XPU profile uses request-stable model operations in
-addition to its quantized KV-cache kernels. The stable operations are enabled
-by default. Two diagnostic selectors allow a runtime-factory launcher to
-measure their costs independently without rebuilding vLLM:
+Use `--kv-cache-dtype kvarn_k4v4_g128_compact` to select the qualified B70
+K4V4/G128 profile. Native Xe2 DPAS cache layout, ID18 decoder, adaptive splits,
+Sinkhorn writer and request-stable model operations are fixed release defaults.
+Historical `KVARN_*` experiment selectors are retired and rejected at startup;
+do not use old factory-ablation instructions to configure a server.
 
-| Child-process environment variable | `1` (default) | `0` |
-| ---------------------------------- | ------------- | --- |
-| `KVARN_REQUEST_STABLE_PROJECTION_ROWS` | Use canonical request-stable row counts for model and logits projections. | Use ordinary projection dispatch. |
-| `KVARN_REQUEST_STABLE_RMSNORM` | Use the request-stable Gemma RMSNorm reduction. | Use ordinary RMSNorm dispatch, including the fused XPU implementation when available. |
+## Qwen images and bundled MTP
 
-Values must be exactly `0` or `1`. Invalid values fail during KVarN worker
-startup. An absent value selects `1`, preserving the qualified behavior. Each
-selection is cached for the lifetime of the engine process, so changing its
-environment after startup has no effect.
+The xpu-v1.7 release qualifies the AEON Qwen3.5-family W4A16 checkpoint
+`jasonboukheir/Qwen3.8-27B-AEON-Ultimate-Uncensored-BF16-W4A16-AutoRound`,
+revision `6b0622f4354481d5d04577d48ba0db844efc1330`, with BF16 activations,
+B1, TP1/PP1, V1/eager, no prefix cache, context up to8192, prefill budget2048,
+and up to two448x448 images with video disabled.
 
-The axes are independent. Request metadata remains attached while either axis
-is active and is omitted only when both are disabled. This keeps the cache
-layout ABI unchanged: these selectors affect model-operation scheduling, not
-the KVarN cache writer, reader, or layout.
+Add `--speculative-config '{"method":"mtp","num_speculative_tokens":2}'`
+for the recommended two-token bundled MTP configuration. One draft token is
+also correctness-qualified; MTP remains opt-in. Eligible verification uses
+the native packed-cache reader with a separate causal bound per query, without
+materializing the entire history. Rejected proposals cannot commit permanent
+cache pages. No tuning overrides are required.
 
-`KVARN_ONEDNN_DETERMINISTIC` remains a third, independent selector. Disabling
-one or both request-stability axes, or oneDNN determinism, is an experimental
-performance ablation and requires replay-correctness qualification before it
-can replace the defaults.
+Unsupported speculative methods, draft counts and serving combinations fail
+the XPU KVarN guard. Do not enable graphs/V2/prefix caching to work around it.
+Use `--kv-cache-dtype auto` for cache rollback, or omit the speculative config
+to disable MTP. The bounded synthetic image gate is not a general vision
+benchmark or a qualification of other models, video or broader concurrency.
 
-These switches activate only for the frozen eager, single-XPU Qwen profile.
-Other profiles remain fail-closed on their ordinary dispatch paths. The
-startup log records each selected value, its source, and profile eligibility
-under the `[KVARN_FACTORY]` prefix.
+Release results and remaining work:
+[KVarN B70 megaissue](https://git.sunnycareboo.com/jasonbk/vllm-xpu-nix/issues/5).

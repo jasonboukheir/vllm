@@ -82,10 +82,29 @@ def _check_kvarn_beta_unsupported_config(
         )
 
     if vllm_config.speculative_config is not None:
-        raise ValueError(
-            "XPU KVarN beta does not support speculative decoding/MTP; "
-            "disable it or use --kv-cache-dtype=auto"
-        )
+        spec = vllm_config.speculative_config
+        model = vllm_config.model_config
+        scheduler = vllm_config.scheduler_config
+        parallel = vllm_config.parallel_config
+        if not (
+            cache_dtype == "kvarn_k4v4_g128_compact"
+            and getattr(spec, "method", None) == "mtp"
+            and getattr(spec, "num_speculative_tokens", None) in (1, 2)
+            and getattr(spec, "kv_cache_dtype", None) in (None, cache_dtype)
+            and getattr(model.hf_config, "model_type", None) == "qwen3_5"
+            and model.dtype == torch.bfloat16
+            and model.max_model_len <= 8192
+            and scheduler.max_num_seqs == 1
+            and scheduler.max_num_batched_tokens <= 2048
+            and parallel.tensor_parallel_size == 1
+            and parallel.pipeline_parallel_size == 1
+        ):
+            raise ValueError(
+                "XPU KVarN speculative decoding/MTP is limited to one or two bundled "
+                "Qwen3.5 MTP tokens, compact K4V4, BF16, B1, TP1/PP1, "
+                "max-model-len<=8192 and max-num-batched-tokens<=2048; "
+                "disable speculation or use --kv-cache-dtype=auto"
+            )
     if vllm_config.use_v2_model_runner:
         raise ValueError(
             "XPU KVarN beta requires Model Runner V1; unset "
