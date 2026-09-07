@@ -402,6 +402,39 @@ def test_v2_model_runner_supports_extract_hidden_states():
     assert config._get_v2_model_runner_unsupported_features() == []
 
 
+@pytest.mark.parametrize("runner_env", [None, "0"])
+def test_kvarn_uses_v1_model_runner_by_default(monkeypatch, runner_env):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(vllm_config_module, "HAS_TRITON", True)
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
+    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    if runner_env is None:
+        monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", runner_env)
+    config = VllmConfig(
+        cache_config=CacheConfig(cache_dtype="kvarn_k4v4_g128_compact"),
+        device_config=DeviceConfig(device="cpu"),
+    )
+
+    assert not config.use_v2_model_runner
+
+
+def test_explicit_v2_model_runner_rejects_kvarn(monkeypatch):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(vllm_config_module, "HAS_TRITON", True)
+    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+    with pytest.raises(ValueError, match="KVarN KV cache.*requires Model Runner V1"):
+        VllmConfig(
+            cache_config=CacheConfig(cache_dtype="kvarn_k4v4_g128_compact"),
+            device_config=DeviceConfig(device="cpu"),
+        )
+
+
 def test_dflash2_draft_forces_v2_model_runner():
     """A DFlash2 draft must reach the V2 speculator, the only one that runs its
     candidate selector; on V1 it would draft as DFlash1 without raising."""

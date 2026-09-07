@@ -96,7 +96,11 @@ class SingleTypeKVCacheManager(ABC):
             and isinstance(kv_cache_spec, AttentionSpec)
             and not isinstance(kv_cache_spec, CircularBufferSpec)
         )
+        self._record_new_mamba_block_ids = needs_kv_cache_zeroing and isinstance(
+            kv_cache_spec, MambaSpec
+        )
         self.new_block_ids: list[int] = []
+        self.new_mamba_block_ids: list[int] = []
 
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request
@@ -148,6 +152,12 @@ class SingleTypeKVCacheManager(ABC):
             len(new_computed_blocks) > 0
             and num_local_computed_tokens % self.block_size != 0
         )
+
+    def _record_allocated_blocks(self, blocks: Sequence[KVCacheBlock]) -> None:
+        if self._record_new_block_ids:
+            self.new_block_ids.extend(block.block_id for block in blocks)
+        if self._record_new_mamba_block_ids:
+            self.new_mamba_block_ids.extend(block.block_id for block in blocks)
 
     def get_num_blocks_to_allocate(
         self,
@@ -333,8 +343,7 @@ class SingleTypeKVCacheManager(ABC):
         )
         allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
         req_blocks.extend(allocated_blocks)
-        if self._record_new_block_ids:
-            self.new_block_ids.extend(b.block_id for b in allocated_blocks)
+        self._record_allocated_blocks(allocated_blocks)
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -362,7 +371,7 @@ class SingleTypeKVCacheManager(ABC):
             block_idx, source_block = self._partial_hit_reqs.pop(request_id)
             cow_block = self.block_pool.get_new_blocks(1)[0]
             self._apply_cow(request_id, block_idx, source_block, cow_block)
-            self.new_block_ids.append(cow_block.block_id)
+            self._record_allocated_blocks([cow_block])
             cow_blocks.append(cow_block)
 
         req_blocks = self.req_to_blocks[request_id]
@@ -373,8 +382,7 @@ class SingleTypeKVCacheManager(ABC):
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
-            if self._record_new_block_ids:
-                self.new_block_ids.extend(b.block_id for b in new_blocks)
+            self._record_allocated_blocks(new_blocks)
             return cow_blocks + new_blocks
 
     @property
@@ -386,6 +394,12 @@ class SingleTypeKVCacheManager(ABC):
         """Drain and return block IDs allocated since the last call."""
         ids = self.new_block_ids
         self.new_block_ids = []
+        return ids
+
+    def take_new_mamba_block_ids(self) -> list[int]:
+        """Drain newly allocated recurrent-state IDs in this group's pool."""
+        ids = self.new_mamba_block_ids
+        self.new_mamba_block_ids = []
         return ids
 
     def take_pending_cow_copies(

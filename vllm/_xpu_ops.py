@@ -25,6 +25,169 @@ else:
     except ImportError:
         from torch.library import impl_abstract as register_fake
 
+
+# The Xe2 KVarN operators are registered by vllm-xpu-kernels. They mutate
+# caller-owned outputs and intentionally return nothing, so their fake kernels
+# only need to preserve that schema contract for Dynamo/FakeTensor tracing.
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode"):
+
+    @register_fake("_vllm_fa2_C::kvarn_decode")
+    def _kvarn_decode_fake(
+        query: torch.Tensor,
+        packed_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        output: torch.Tensor,
+        max_seq_len: int,
+        softmax_scale: float,
+        unrotate_output: bool = False,
+        write_bf16_output: bool = False,
+        num_kv_splits: int = 0,
+        kernel_variant: int = 0,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_decode_with_scratch"):
+
+    @register_fake("_vllm_fa2_C::kvarn_decode_with_scratch")
+    def _kvarn_decode_with_scratch_fake(
+        query: torch.Tensor,
+        packed_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        temp_output: torch.Tensor,
+        exp_sums: torch.Tensor,
+        max_logits: torch.Tensor,
+        output: torch.Tensor,
+        max_seq_len: int,
+        softmax_scale: float,
+        unrotate_output: bool = False,
+        write_bf16_output: bool = False,
+        num_kv_splits: int = 0,
+        kernel_variant: int = 0,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_materialize_packed_kv"):
+
+    @register_fake("_vllm_fa2_C::kvarn_materialize_packed_kv")
+    def _kvarn_materialize_packed_kv_fake(
+        packed_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        max_seq_len: int,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_dequant"):
+
+    @register_fake("_vllm_fa2_C::kvarn_dequant")
+    def _kvarn_dequant_fake(
+        packed_cache: torch.Tensor,
+        key_output: torch.Tensor,
+        value_output: torch.Tensor,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_scatter"):
+
+    @register_fake("_vllm_fa2_C::kvarn_hadamard_scatter")
+    def _kvarn_hadamard_scatter_fake(
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        group: int,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_qkv_scatter"):
+
+    @register_fake("_vllm_fa2_C::kvarn_hadamard_qkv_scatter")
+    def _kvarn_hadamard_qkv_scatter_fake(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        query_output: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        group: int,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard_qkv_scatter_current_stream"):
+
+    @register_fake("_vllm_fa2_C::kvarn_hadamard_qkv_scatter_current_stream")
+    def _kvarn_hadamard_qkv_scatter_current_stream_fake(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_to_slot: torch.Tensor,
+        query_output: torch.Tensor,
+        tail_key: torch.Tensor,
+        tail_value: torch.Tensor,
+        group: int,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_pack_balanced_kv"):
+
+    @register_fake("_vllm_fa2_C::kvarn_pack_balanced_kv")
+    def _kvarn_pack_balanced_kv_fake(
+        key_balanced: torch.Tensor,
+        key_sinkhorn_col: torch.Tensor,
+        key_sinkhorn_row: torch.Tensor,
+        value_balanced: torch.Tensor,
+        value_sinkhorn_col: torch.Tensor,
+        value_sinkhorn_row: torch.Tensor,
+        block_ids: torch.Tensor,
+        packed_cache: torch.Tensor,
+        dpas_layout: bool = False,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops._vllm_fa2_C, "kvarn_hadamard"):
+
+    @register_fake("_vllm_fa2_C::kvarn_hadamard")
+    def _kvarn_hadamard_fake(
+        input: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        return
+
+
 if hasattr(torch.ops._xpu_C, "fp8_gemm"):
 
     @register_fake("_xpu_C::fp8_gemm")

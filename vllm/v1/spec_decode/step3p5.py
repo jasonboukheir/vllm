@@ -137,6 +137,10 @@ class Step3p5MTPProposer(EagleProposer):
             if gid in self._per_group_block_tables:
                 cm = copy(common_attn_metadata)
                 cm.block_table_tensor = self._per_group_block_tables[gid][:num_reqs]
+                # This table belongs to a different KV-cache group. The CPU
+                # mirror on the shallow copy still describes the primary
+                # group, so fail closed to the device-table fallback.
+                cm.block_table_cpu = None
                 if gid in self._per_group_slot_mappings:
                     sm = self._per_group_slot_mappings[gid]
                     if sm.shape[0] >= num_actual_tokens:

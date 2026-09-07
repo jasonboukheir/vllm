@@ -10,7 +10,10 @@ from torch.nn.parameter import Parameter
 from typing_extensions import TypeIs
 
 import vllm.envs as envs
-from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+from vllm.config import (
+    get_current_vllm_config,
+    get_current_vllm_config_or_none,
+)
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -23,6 +26,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.determinism.batch_invariant import (
     linear_batch_invariant,
+)
+from vllm.model_executor.determinism.request_stable_linear import (
+    apply_linear_by_request,
+    use_xpu_kvarn_request_stable_projection_rows,
 )
 from vllm.model_executor.layers.quantization import resolve_quant_method
 from vllm.model_executor.layers.quantization.base_config import (
@@ -289,6 +296,10 @@ class LinearBase(PluggableLayer):
             raise ValueError("All linear layers should support quant method.")
         self.return_bias = return_bias
         self.disable_tp = disable_tp
+        vllm_config = get_current_vllm_config_or_none()
+        self._xpu_kvarn_request_stable = vllm_config is not None and (
+            use_xpu_kvarn_request_stable_projection_rows(vllm_config)
+        )
         if disable_tp:
             self.tp_rank, self.tp_size = 0, 1
         else:
@@ -315,6 +326,13 @@ class LinearBase(PluggableLayer):
             if isinstance(param, BasevLLMParameter):
                 param.tp_rank = self.tp_rank
                 param.tp_size = self.tp_size
+
+    def _apply_quant_method(
+        self, x: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        if not self._xpu_kvarn_request_stable:
+            return self.quant_method.apply(self, x, bias)
+        return apply_linear_by_request(self, x, bias)
 
 
 # --8<-- [start:replicated_linear]
@@ -408,7 +426,7 @@ class ReplicatedLinear(LinearBase):
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
 
-        output = self.quant_method.apply(self, x, bias)
+        output = self._apply_quant_method(x, bias)
 
         if not self.return_bias:
             return output
@@ -599,7 +617,7 @@ class ColumnParallelLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        output_parallel = self._apply_quant_method(input_, bias)
 
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
@@ -1763,7 +1781,7 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+        output_parallel = self._apply_quant_method(input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
