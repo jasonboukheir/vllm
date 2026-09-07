@@ -764,6 +764,7 @@ class CompilationConfig:
     # Use PyTorch operator format: "namespace::name"
     _attention_ops: ClassVar[list[str]] = [
         "vllm::unified_attention_with_output",
+        "vllm::unified_qkv_attention_with_output",
         "vllm::unified_mla_attention_with_output",
         "vllm::mamba_mixer2",
         "vllm::mamba_mixer",
@@ -1188,6 +1189,7 @@ class CompilationConfig:
                         )
                         self.pass_config.fuse_qk_norm_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
+                    self.splitting_ops.append("vllm::unified_qkv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
 
             elif len(self.splitting_ops) == 0:
@@ -1296,6 +1298,7 @@ class CompilationConfig:
 
         kv_cache_update_ops = [
             "vllm::unified_kv_cache_update",
+            "vllm::unified_qkv_cache_update",
             "vllm::unified_mla_kv_cache_update",
         ]
         return self.splitting_ops is not None and all(

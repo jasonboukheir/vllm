@@ -93,6 +93,9 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
                 # the target forward pass, but the drafter operates on the
                 # unpadded batch.
                 cm.block_table_tensor = self._per_group_block_tables[gid][:batch_size]
+                # The shallow-copy CPU mirror belongs to the primary cache
+                # group and cannot describe this substituted table.
+                cm.block_table_cpu = None
             else:
                 cm = common_attn_metadata
             attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
