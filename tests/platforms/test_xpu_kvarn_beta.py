@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm.config import CUDAGraphMode
 from vllm.platforms.xpu import (
@@ -30,11 +31,17 @@ def _config(
             enable_prefix_caching=prefix_caching,
         ),
         speculative_config=SimpleNamespace() if speculative else None,
+        scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=2048),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, pipeline_parallel_size=1
+        ),
         use_v2_model_runner=use_v2,
         compilation_config=SimpleNamespace(
             cudagraph_mode=(CUDAGraphMode.FULL if graph else CUDAGraphMode.NONE)
         ),
         model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            max_model_len=8192,
             is_multimodal_model=multimodal,
             hf_config=SimpleNamespace(model_type=model_type),
             multimodal_config=(
@@ -47,6 +54,44 @@ def _config(
             ),
         ),
     )
+
+
+def _mtp_config():
+    config = _config(multimodal=True, model_type="qwen3_5")
+    config.speculative_config = SimpleNamespace(
+        method="mtp", num_speculative_tokens=1, kv_cache_dtype=None
+    )
+    return config
+
+
+@pytest.mark.parametrize("draft_tokens", [1, 2])
+def test_kvarn_beta_accepts_bounded_bundled_mtp_with_images(draft_tokens):
+    config = _mtp_config()
+    config.speculative_config.num_speculative_tokens = draft_tokens
+    _check_kvarn_beta_unsupported_config(config, CUDAGraphMode.NONE)
+
+
+@pytest.mark.parametrize(
+    "section,field,value",
+    [
+        ("speculative_config", "method", "draft_model"),
+        ("speculative_config", "num_speculative_tokens", 0),
+        ("speculative_config", "num_speculative_tokens", 3),
+        ("speculative_config", "kv_cache_dtype", "auto"),
+        ("scheduler_config", "max_num_seqs", 4),
+        ("scheduler_config", "max_num_batched_tokens", 4096),
+        ("model_config", "max_model_len", 16384),
+        ("model_config", "dtype", torch.float16),
+        ("parallel_config", "tensor_parallel_size", 2),
+        ("parallel_config", "pipeline_parallel_size", 2),
+        ("cache_config", "cache_dtype", "kvarn_k4v2_g128_compact"),
+    ],
+)
+def test_kvarn_mtp_rejects_unqualified_envelope(section, field, value):
+    config = _mtp_config()
+    setattr(getattr(config, section), field, value)
+    with pytest.raises(ValueError, match="speculative decoding/MTP"):
+        _check_kvarn_beta_unsupported_config(config, CUDAGraphMode.NONE)
 
 
 def test_kvarn_beta_accepts_supported_eager_text_configuration() -> None:

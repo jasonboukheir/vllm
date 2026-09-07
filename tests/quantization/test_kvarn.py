@@ -348,8 +348,45 @@ def _cached_prefill_impl() -> KVarNAttentionImpl:
     return impl
 
 
+@pytest.mark.parametrize("count", [2, 3, 4])
+def test_native_verify_view_preserves_physical_pages_and_causal_prefixes(count):
+    from vllm.v1.attention.backends.kvarn_attn import _native_verify_view
+
+    md = KVarNMetadata(
+        seq_lens=torch.tensor([385], dtype=torch.int32),
+        slot_mapping=torch.arange(count),
+        block_table=torch.tensor([[3, 1, 4, 0]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, count], dtype=torch.int32),
+        num_actual_tokens=count,
+        max_query_len=count,
+        max_seq_len=385,
+        is_prefill=True,
+        has_cached_multiquery=True,
+    )
+    view = _native_verify_view(md)
+    if count == 4:
+        assert view is None
+        return
+    assert view is not None
+    assert view.seq_lens.tolist() == list(range(386 - count, 386))
+    assert view.block_table.tolist() == [[3, 1, 4, 0]] * count
+    assert view.block_table.is_contiguous()
+    assert view.max_query_len == 1 and view.num_decodes == count
+    assert md.seq_lens.tolist() == [385] and md.max_query_len == count
+    assert md.native_verify_metadata is None
+    md.causal = False
+    assert _native_verify_view(md) is None
+    md.causal = True
+    md.has_cached_multiquery = False
+    assert _native_verify_view(md) is None
+    md.has_cached_multiquery = True
+    md.block_table = md.block_table.repeat(2, 1)
+    assert _native_verify_view(md) is None
+
+
 def _cached_prefill_metadata() -> SimpleNamespace:
     return SimpleNamespace(
+        native_verify_metadata=None,
         is_prefill=True,
         max_query_len=11,
         num_decodes=0,
@@ -2765,6 +2802,15 @@ def test_dpas_layout_bypasses_natural_fused_verify_reader(
     )
 
 
+def test_dpas_spec_as_decode_verify_uses_layout_aware_materializer():
+    impl = object.__new__(KVarNAttentionImpl)
+    impl._kvarn_dpas_layout = True
+    query, cache, metadata, expected = (object() for _ in range(4))
+    with patch.object(impl, "_cached_multiquery_path", return_value=expected) as run:
+        assert impl._verify_decode_path(query, cache, metadata) is expected
+    run.assert_called_once_with(query, cache, metadata)
+
+
 def test_reset_process_state_releases_previous_model_generation():
     KVarNAttentionImpl.reset_process_state()
     try:
@@ -3734,6 +3780,89 @@ def test_lifecycle_builder_preserves_shared_multiquery_prefix():
         assert {0, 1, 2, 200, 201, 103, 202} <= block_to_slot.keys()
     finally:
         KVarNAttentionImpl.reset_process_state()
+
+
+@pytest.mark.parametrize(
+    "draft_tokens,accepted_drafts", [(1, 0), (1, 1), (2, 0), (2, 1), (2, 2)]
+)
+@pytest.mark.parametrize("window", [0, 16], ids=["immediate", "blessed-window"])
+def test_mtp_lifecycle_flush_waits_for_commit_after_page_filling_verify(
+    draft_tokens, accepted_drafts, window
+):
+    """A proposed last token cannot make its page permanent before acceptance."""
+    boundary = 18 * 128
+    query_len = draft_tokens + 1
+    builder, block_to_slot = _make_kvarn_lifecycle_builder(
+        set(range(18)), sinks={0}, pool_size=20
+    )
+    builder._lifecycle_policy = lambda: (window, 4 if window else 0, 0, "batch_cohort")
+    flush_calls = []
+    row = list(range(19))
+    try:
+        # Target input plus drafts fill page 17 before their acceptance is known.
+        _run_kvarn_lifecycle_build(
+            builder,
+            [row],
+            [boundary],
+            [query_len],
+            num_decodes=1,
+            flush_calls=flush_calls,
+        )
+        assert 17 in block_to_slot
+        assert all(17 not in call for call in flush_calls)
+        # One target token is always kept. Only acceptance commits the last slot.
+        committed = boundary - draft_tokens + accepted_drafts
+        _run_kvarn_lifecycle_build(
+            builder,
+            [row],
+            [committed + query_len],
+            [query_len],
+            num_decodes=1,
+            flush_calls=flush_calls,
+        )
+        assert (17 not in block_to_slot) == (
+            window == 0 and accepted_drafts == draft_tokens
+        )
+        if accepted_drafts < draft_tokens:
+            assert all(17 not in call for call in flush_calls)
+            # Later correction/accepted tokens overwrite the entire rejected suffix.
+            _run_kvarn_lifecycle_build(
+                builder,
+                [row],
+                [boundary + query_len],
+                [query_len],
+                num_decodes=1,
+                flush_calls=flush_calls,
+            )
+            assert (17 not in block_to_slot) == (window == 0)
+        assert 0 in block_to_slot
+        assert 1 <= builder._block_fill[18] <= query_len
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_mtp_decode_and_plain_decode_use_same_committed_history_window():
+    """Speculation must not silently select the prefill quantization policy."""
+    results = []
+    for q_len in (1, 2, 3):
+        builder, block_to_slot = _make_kvarn_lifecycle_builder(
+            set(range(18)), sinks={0}, pool_size=20
+        )
+        builder._kvarn_xpu_beta_profile = True
+        calls = []
+        try:
+            _run_kvarn_lifecycle_build(
+                builder,
+                [list(range(19))],
+                [18 * 128 + q_len],
+                [q_len],
+                num_decodes=1,
+                flush_calls=calls,
+            )
+            results.append((calls, set(block_to_slot)))
+        finally:
+            KVarNAttentionImpl.reset_process_state()
+    assert results[0] == results[1] == results[2]
 
 
 def test_lifecycle_builder_flushes_before_capacity_and_reclaims_completion():

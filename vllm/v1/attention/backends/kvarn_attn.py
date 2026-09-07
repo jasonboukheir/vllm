@@ -965,11 +965,35 @@ class KVarNMetadata(AttentionMetadata):
     vq_req: torch.Tensor | None = None  # [num_decode_tokens] int32 block-table row
     vq_seqlen: torch.Tensor | None = None  # [num_decode_tokens] int32 causal length
     vq_qlen: int = 0  # uniform decode query len (>=2), else 0
+    native_verify_metadata: KVarNMetadata | None = None
     # Non-causal (bidirectional) attention: each query row attends to the full
     # context (no bottom-right causal staircase). Set by DFlash cross-attention
     # drafting via CommonAttentionMetadata.causal=False. When False, the verify
     # plan stores a flat full-context length per row instead of committed+j+1.
     causal: bool = True
+
+
+def _native_verify_view(md: KVarNMetadata) -> KVarNMetadata | None:
+    """Make a native-only B1 causal query view without modifying cache lifecycle."""
+    count = md.num_actual_tokens
+    if (
+        count not in (2, 3)
+        or md.block_table.shape[0] != 1
+        or not md.has_cached_multiquery
+        or not md.causal
+    ):
+        return None
+    return replace(
+        md,
+        block_table=md.block_table.expand(count, -1).contiguous(),
+        seq_lens=md.seq_lens[:1]
+        + torch.arange(1 - count, 1, dtype=torch.int32, device=md.seq_lens.device),
+        max_query_len=1,
+        is_prefill=False,
+        num_decodes=count,
+        num_decode_tokens=count,
+        native_verify_metadata=None,
+    )
 
 
 class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
@@ -984,7 +1008,6 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
     # state mutation (slot allocation, sink marking, tile-boundary flush,
     # the vq verify plan) happens in KVarNMetadataBuilder.build() between
     # captured graph replays; the forward is pure tensor ops.
-    # KVARN_FUSED_VERIFY=0 reverts to single-token-only support.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
@@ -1266,9 +1289,12 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     continue
                 q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
                 committed_len = max(sl - q_len, 0)
+                # Spec-as-decode rows use the decode history policy even with
+                # multiple verification queries. Keep the real committed bound.
+                policy_q_len = 1 if b < num_decodes else q_len
                 if _protect_kvarn_prefill_window_blocks(
                     block_table_np[b],
-                    q_len=q_len,
+                    q_len=policy_q_len,
                     committed_len=committed_len,
                     group=GROUP,
                     bt_cols=bt_cols,
@@ -1281,7 +1307,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 else:
                     decode_resident = _kvarn_decode_resident_suffix(
                         block_table_np[b],
-                        q_len=q_len,
+                        q_len=policy_q_len,
                         committed_len=committed_len,
                         group=GROUP,
                         bt_cols=bt_cols,
@@ -1712,7 +1738,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         has_cached_multiquery = any(cached_multiquery_rows)
         prefill_has_cached_multiquery = any(cached_multiquery_rows[num_decodes:])
 
-        return KVarNMetadata(
+        metadata = KVarNMetadata(
             seq_lens=cam.seq_lens,
             slot_mapping=cam.slot_mapping,
             block_table=cam.block_table_tensor,
@@ -1744,6 +1770,11 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             vq_qlen=vq_qlen,
             causal=getattr(cam, "causal", True),
         )
+        # Small cached target/drafter queries are independent causal decode
+        # rows. Prepare their shared view once, without changing cache lifecycle.
+        if device.type == "xpu" and len(seq_lens_cpu) == 1:
+            metadata.native_verify_metadata = _native_verify_view(metadata)
+        return metadata
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2375,12 +2406,18 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
 
             _cfg = get_current_vllm_config()
             self._max_num_seqs = _cfg.scheduler_config.max_num_seqs
+            self._native_query_multiplier = (
+                1 + _cfg.speculative_config.num_speculative_tokens
+                if _cfg.speculative_config is not None
+                else 1
+            )
             self._max_num_batched_tokens = _cfg.scheduler_config.max_num_batched_tokens
             self._max_model_len = _cfg.model_config.max_model_len
             self._num_hidden_layers = getattr(
                 _cfg.model_config.hf_config, "num_hidden_layers", 32
             )
         except Exception:
+            self._native_query_multiplier = 1
             self._max_num_seqs = 256
             self._max_num_batched_tokens = 8192
             self._num_hidden_layers = 32
@@ -2427,7 +2464,13 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             and getattr(self, "use_bound_qlen1_inline_plan_v2", False)
         ):
             return None
-        batch_capacity = min(max(int(self._max_num_seqs), 1), 12)
+        batch_capacity = min(
+            max(
+                int(self._max_num_seqs) * getattr(self, "_native_query_multiplier", 1),
+                1,
+            ),
+            12,
+        )
         split_capacity = kvarn_native_split_scratch_count(
             self._max_model_len,
             self._kvarn_native_max_splits,
@@ -2913,7 +2956,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 self._kvarn_native_split_policy,
                 self._kvarn_native_kernel_variant,
             )
-            native_batch = min(max(self._max_num_seqs, 1), 12)
+            native_batch = min(
+                max(
+                    self._max_num_seqs * getattr(self, "_native_query_multiplier", 1), 1
+                ),
+                12,
+            )
             native_key = (device, D, Hk, native_batch, native_splits)
             self._ensure_native_decode_scratch(
                 native_key,
@@ -4730,6 +4778,10 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         inside the captured region (graph-pool managed) — same pattern as
         the single-token fused decode.
         """
+        # The virtual-query Triton reader only understands natural records.
+        # Use the native causal query view when eligible, otherwise materialize.
+        if self._kvarn_dpas_layout:
+            return self._cached_multiquery_path(q, kv_cache, attn_metadata)
         md = attn_metadata
         group = self.kvarn_config.group
         max_ctx_blocks = max((self._max_model_len + group - 1) // group, 1)
@@ -5150,6 +5202,18 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         """
         md = attn_metadata
         B = md.block_table.shape[0]
+        if (
+            self._kvarn_dpas_layout
+            and self.num_heads == 24
+            and self.num_kv_heads == 4
+            and md.native_verify_metadata is not None
+        ):
+            logger.info_once(
+                "[KVARN_MTP_VERIFY] selected=native_virtual_rows; "
+                "causal packed-cache decode"
+            )
+            with torch.profiler.record_function("kvarn_native_mtp_verify"):
+                return self._decode_path(q, kv_cache, md.native_verify_metadata)
         # Small-qlen multi-query (the spec-decode verify step: every decode
         # step under MTP) goes to the FUSED verify kernel: per-token virtual
         # rows over the dual-source decode kernel, no fp16 materialization.
@@ -5161,7 +5225,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         # slowdown). Crossover ~12K; default threshold 64 blocks (8K).
         # The materialize+FA route also keeps LARGE qlen (chunked-prefill
         # continuations), where one materialization amortizes over thousands
-        # of query tokens. KVARN_FUSED_VERIFY=0 forces materialize always.
+        # of query tokens.
         _group = self.kvarn_config.group
         dpas_layout = self._kvarn_dpas_layout
         if _use_kvarn_fused_verify(
