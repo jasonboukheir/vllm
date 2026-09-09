@@ -422,6 +422,7 @@ def test_update_draft_decode_metadata_updates_fa3_scheduler_metadata(
         num_decode_tokens=3,
         num_prefill_tokens=0,
         scheduler_metadata=torch.tensor([-1, -1, -1], dtype=torch.int32),
+        xpu_is_prefill_only=True,
         prefix_scheduler_metadata=None,
         max_num_splits=4,
         causal=True,
@@ -435,6 +436,7 @@ def test_update_draft_decode_metadata_updates_fa3_scheduler_metadata(
 
     assert torch.equal(metadata.scheduler_metadata, expected)
     assert torch.equal(builder.scheduler_metadata[:3], expected)
+    assert not metadata.xpu_is_prefill_only
 
 
 def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypatch):
@@ -472,6 +474,7 @@ def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypat
         num_decode_tokens=1,
         num_prefill_tokens=0,
         scheduler_metadata=None,
+        xpu_is_prefill_only=True,
         prefix_scheduler_metadata=None,
         max_num_splits=1,
         causal=True,
@@ -485,3 +488,4 @@ def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypat
 
     assert not called
     assert metadata.scheduler_metadata is None
+    assert not metadata.xpu_is_prefill_only

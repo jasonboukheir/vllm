@@ -280,6 +280,9 @@ class FlashAttentionMetadata:
     num_decode_tokens: int = 0
     num_prefill_tokens: int = 0
 
+    # A CPU-validated hint for XPU's existing prefill-only dispatch.
+    xpu_is_prefill_only: bool = False
+
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
@@ -332,6 +335,35 @@ def _maybe_symmetrize_window(
     if window is not None and window[0] >= 0 and window[1] == 0 and non_causal:
         return (window[0], window[0])
     return window
+
+
+def _is_packed_single_prefill(metadata: CommonAttentionMetadata) -> bool:
+    """Check existing CPU metadata without synchronizing the device."""
+    query_starts = metadata.query_start_loc_cpu
+    prefilling = metadata.is_prefilling
+    seq_lens = metadata.seq_lens_cpu_upper_bound
+    if (
+        metadata.num_reqs != 1
+        or metadata.max_query_len <= 16
+        or metadata.num_actual_tokens != metadata.max_query_len
+        or metadata.query_start_loc.numel() != 2
+        or metadata.seq_lens.numel() != 1
+        or metadata.block_table_tensor.shape[0] != 1
+        or query_starts.device.type != "cpu"
+        or query_starts.numel() != 2
+        or prefilling is None
+        or prefilling.device.type != "cpu"
+        or prefilling.numel() != 1
+        or seq_lens is None
+        or seq_lens.device.type != "cpu"
+        or seq_lens.numel() != 1
+    ):
+        return False
+    return (
+        bool(prefilling[0])
+        and query_starts.tolist() == [0, metadata.max_query_len]
+        and int(seq_lens[0]) >= metadata.max_query_len
+    )
 
 
 class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
@@ -745,6 +777,17 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             causal=causal,
         )
 
+        attn_metadata.xpu_is_prefill_only = (
+            current_platform.is_xpu()
+            and self.headdim == 256
+            and self.kv_cache_dtype in (torch.float16, torch.bfloat16)
+            and causal is True
+            and self.dcp_world_size == 1
+            and not use_cascade
+            and not fast_build
+            and _is_packed_single_prefill(common_attn_metadata)
+        )
+
         # Compute mm_prefix range tensor if the batch contains
         # multimodal tokens with bidirectional ranges.  Built for every FA
         # group; Gemma4 nulls the field for its non-sliding layers.
@@ -790,6 +833,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         return attn_metadata
 
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> FlashAttentionMetadata:
+        metadata = super().build_for_cudagraph_capture(common_attn_metadata)
+        metadata.xpu_is_prefill_only = False
+        return metadata
+
     def update_block_table(
         self,
         metadata: FlashAttentionMetadata,
@@ -802,6 +852,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         return new_metadata
 
     def update_draft_decode_metadata(self, metadata: FlashAttentionMetadata) -> None:
+        metadata.xpu_is_prefill_only = False
         if metadata.scheduler_metadata is None:
             return
 
@@ -1184,6 +1235,19 @@ class FlashAttentionImpl(AttentionImpl):
                     s_aux=self.sinks,
                     mask_mod=rswa_mask_mod_fn or mm_mask_mod,
                     aux_tensors=rswa_aux or mm_aux,
+                    **(
+                        {"is_mix_batch": False}
+                        if current_platform.is_xpu()
+                        and attn_metadata.xpu_is_prefill_only
+                        and causal is True
+                        and self.sliding_window == (-1, -1)
+                        and self.sinks is None
+                        and self.alibi_slopes is None
+                        and self.logits_soft_cap == 0
+                        and rswa_mask_mod_fn is None
+                        and mm_mask_mod is None
+                        else {}
+                    ),
                 )
                 return output
 
