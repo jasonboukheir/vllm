@@ -829,6 +829,191 @@ def test_causal_backend_correctness(
         )
 
 
+@pytest.mark.parametrize(
+    "overrides,mode,expected",
+    [
+        ({}, "build", True),
+        ({"num_actual_tokens": 65}, "build", False),
+        ({"num_reqs": 2}, "build", False),
+        ({"query_start_loc_cpu": torch.tensor([1, 65])}, "build", False),
+        ({"query_start_loc_cpu": torch.tensor([0, 63])}, "build", False),
+        ({"max_query_len": 16, "num_actual_tokens": 16}, "build", False),
+        ({"is_prefilling": torch.tensor([False])}, "build", False),
+        ({"is_prefilling": None}, "build", False),
+        ({"seq_lens_cpu_upper_bound": None}, "build", False),
+        ({"seq_lens_cpu_upper_bound": torch.tensor([63])}, "build", False),
+        ({"query_start_loc_cpu": torch.empty(2, device="meta")}, "build", False),
+        ({"is_prefilling": torch.empty(1, device="meta")}, "build", False),
+        ({"seq_lens_cpu_upper_bound": torch.empty(1, device="meta")}, "build", False),
+        ({"block_table_tensor": torch.zeros(2, 64)}, "build", False),
+        ({"query_start_loc": torch.zeros(3)}, "build", False),
+        ({"seq_lens": torch.zeros(2)}, "build", False),
+        ({}, "capture", False),
+        ({}, "draft", False),
+        ({}, "cascade", False),
+        ({}, "non_xpu", False),
+        ({}, "dcp", False),
+        ({}, "other_head_size", False),
+        ({}, "fp8", False),
+        ({"causal": False}, "build", False),
+    ],
+)
+def test_flash_attn_prefill_hint_requires_trusted_unpadded_host_metadata(
+    monkeypatch, overrides, mode, expected
+):
+    from vllm.v1.attention.backends import flash_attn as flash_attn_backend
+
+    metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[1024], query_lens=[64]), 16, torch.device("cpu")
+    )
+    metadata.is_prefilling = torch.tensor([True])
+    for name, value in overrides.items():
+        setattr(metadata, name, value)
+
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: mode != "non_xpu")
+    builder = object.__new__(flash_attn_backend.FlashAttentionMetadataBuilder)
+    builder.aot_schedule = False
+    builder.aot_sliding_window = (-1, -1)
+    builder.use_full_cuda_graph = False
+    builder.headdim = 128 if mode == "other_head_size" else 256
+    builder.kv_cache_dtype = torch.float8_e4m3fn if mode == "fp8" else torch.bfloat16
+    builder.dcp_world_size = 2 if mode == "dcp" else 1
+    builder.dcp_rank = 0
+    builder.cp_kv_cache_interleave_size = 1
+    builder._dcp_context_kv_lens = torch.zeros(1, dtype=torch.int32)
+    builder.device = torch.device("cpu")
+    builder.rswa_window = None
+
+    if mode == "capture":
+        result = builder.build_for_cudagraph_capture(metadata)
+    elif mode == "draft":
+        result = builder.build_for_drafting(metadata, draft_index=0)
+    else:
+        result = builder.build(int(mode == "cascade"), metadata)
+    assert result.xpu_is_prefill_only is expected
+
+
+@pytest.mark.parametrize(
+    "feature",
+    [
+        "ordinary",
+        "hint",
+        "window",
+        "sinks",
+        "alibi",
+        "softcap",
+        "non_xpu",
+        "noncausal",
+        "mm_mask",
+        "rswa_mask",
+    ],
+)
+def test_flash_attn_forward_preserves_prefill_feature_routes(monkeypatch, feature):
+    from vllm.v1.attention.backends import flash_attn as flash_attn_backend
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        flash_attn_backend, "flash_attn_varlen_func", captured.update, raising=False
+    )
+    monkeypatch.setattr(flash_attn_backend, "get_flash_attn_version", lambda **kw: 2)
+    monkeypatch.setattr(
+        flash_attn_backend, "flash_attn_supports_sinks", lambda: True, raising=False
+    )
+    mask = lambda *args: True
+    monkeypatch.setattr(
+        flash_attn_backend, "_make_mm_prefix_mask_mod", lambda **kw: mask
+    )
+    monkeypatch.setattr(flash_attn_backend, "_make_rswa_mask_mod", lambda: mask)
+    impl = flash_attn_backend.FlashAttentionImpl(
+        num_heads=2,
+        head_size=256,
+        scale=1 / 16,
+        num_kv_heads=1,
+        alibi_slopes=[0.5, 0.5] if feature == "alibi" else None,
+        sliding_window=16 if feature == "window" else None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=1 if feature == "softcap" else None,
+        sinks=torch.zeros(2) if feature == "sinks" else None,
+    )
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: feature != "non_xpu")
+    metadata = SimpleNamespace(
+        num_actual_tokens=64,
+        max_query_len=64,
+        query_start_loc=torch.tensor([0, 64], dtype=torch.int32),
+        max_seq_len=64,
+        seq_lens=torch.tensor([64], dtype=torch.int32),
+        block_table=torch.arange(4, dtype=torch.int32).unsqueeze(0),
+        use_cascade=False,
+        scheduler_metadata=None,
+        causal=feature != "noncausal",
+        mm_prefix_query_range_tensor=None,
+        rswa_prefix_lens=None,
+        max_num_splits=0,
+        xpu_is_prefill_only=feature != "hint",
+    )
+    if feature in ("mm_mask", "rswa_mask"):
+        impl.vllm_flash_attn_version = 4
+        if feature == "mm_mask":
+            metadata.mm_prefix_query_range_tensor = torch.zeros(
+                64, 2, dtype=torch.int32
+            )
+        else:
+            metadata.rswa_prefix_lens = torch.tensor([16], dtype=torch.int32)
+            metadata.rswa_window_tensor = torch.tensor([16], dtype=torch.int32)
+
+    query = torch.empty(64, 2, 256)
+    output = torch.empty_like(query)
+    result = impl.forward(
+        MockAttentionLayer(torch.device("cpu")),
+        query,
+        torch.empty(64, 1, 256),
+        torch.empty(64, 1, 256),
+        torch.empty(4, 1, 16, 512),
+        metadata,
+        output,
+    )
+    assert result is output
+    assert captured
+    if feature == "ordinary":
+        assert captured["is_mix_batch"] is False
+    else:
+        assert "is_mix_batch" not in captured
+
+
+@pytest.mark.parametrize(
+    "paged,is_mix_batch", [(True, None), (True, False), (False, None)]
+)
+def test_xpu_flash_attn_adapter_preserves_prefill_dispatch_choice(
+    monkeypatch, paged, is_mix_batch
+):
+    pytest.importorskip("vllm_xpu_kernels._xpu_C")
+    import vllm._xpu_ops as xpu_ops
+
+    captured = {}
+
+    def native(**kwargs):
+        captured.update(kwargs)
+        return kwargs["out"]
+
+    monkeypatch.setattr(xpu_ops, "flash_attn_varlen_func", native)
+    q = torch.empty(64, 2, 32)
+    kv = torch.empty(4, 16, 1, 32) if paged else torch.empty(64, 1, 32)
+    result = xpu_ops.xpu_ops.flash_attn_varlen_func(
+        q=q,
+        k=kv,
+        v=kv,
+        cu_seqlens_q=torch.tensor([0, 64], dtype=torch.int32),
+        max_seqlen_q=64,
+        max_seqlen_k=64,
+        block_table=torch.arange(4).unsqueeze(0) if paged else None,
+        seqused_k=torch.tensor([64]) if paged else None,
+        cu_seqlens_k=None if paged else torch.tensor([0, 64]),
+        **({} if is_mix_batch is None else {"is_mix_batch": is_mix_batch}),
+    )
+    assert captured["is_mix_batch"] is (True if is_mix_batch is None else is_mix_batch)
+    assert result is captured["out"]
+
+
 @pytest.mark.skipif(
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
     reason="FlashInfer is not available.",
