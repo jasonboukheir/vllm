@@ -93,14 +93,13 @@ def _check_kvarn_beta_unsupported_config(
             and getattr(spec, "kv_cache_dtype", None) in (None, cache_dtype)
             and getattr(model.hf_config, "model_type", None) == "qwen3_5"
             and model.dtype == torch.bfloat16
-            and scheduler.max_num_seqs == 1
             and scheduler.max_num_batched_tokens <= 2048
             and parallel.tensor_parallel_size == 1
             and parallel.pipeline_parallel_size == 1
         ):
             raise ValueError(
                 "XPU KVarN speculative decoding/MTP is limited to one or two bundled "
-                "Qwen3.5 MTP tokens, compact K4V4, BF16, B1, TP1/PP1, "
+                "Qwen3.5 MTP tokens, compact K4V4, BF16, TP1/PP1, "
                 "max-num-batched-tokens<=2048; "
                 "disable speculation or use --kv-cache-dtype=auto"
             )
