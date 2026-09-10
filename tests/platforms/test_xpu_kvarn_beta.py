@@ -71,7 +71,6 @@ def _mtp_config():
         ("speculative_config", "num_speculative_tokens", 0),
         ("speculative_config", "num_speculative_tokens", 3),
         ("speculative_config", "kv_cache_dtype", "auto"),
-        ("scheduler_config", "max_num_seqs", 4),
         ("scheduler_config", "max_num_batched_tokens", 4096),
         ("model_config", "dtype", torch.float16),
         ("parallel_config", "tensor_parallel_size", 2),
@@ -84,6 +83,15 @@ def test_kvarn_mtp_rejects_unqualified_envelope(section, field, value):
     setattr(getattr(config, section), field, value)
     with pytest.raises(ValueError, match="speculative decoding/MTP"):
         _check_kvarn_beta_unsupported_config(config, CUDAGraphMode.NONE)
+
+
+@pytest.mark.parametrize("max_num_seqs", [1, 4, 16])
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
+def test_kvarn_mtp_accepts_scheduler_concurrency(max_num_seqs, num_speculative_tokens):
+    config = _mtp_config()
+    config.scheduler_config.max_num_seqs = max_num_seqs
+    config.speculative_config.num_speculative_tokens = num_speculative_tokens
+    _check_kvarn_beta_unsupported_config(config, CUDAGraphMode.NONE)
 
 
 def test_kvarn_beta_accepts_supported_eager_text_configuration() -> None:
