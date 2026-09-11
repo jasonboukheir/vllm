@@ -1840,7 +1840,7 @@ def get_kv_cache_config_from_groups(
             _physical_blocks_per_request(vllm_config, group)
             for group in kv_cache_groups
         ]
-        bytes_per_block = [
+        bytes_per_group_block = [
             len(group.layer_names) * group.kv_cache_spec.page_size_bytes
             for group in kv_cache_groups
         ]
@@ -1861,7 +1861,9 @@ def get_kv_cache_config_from_groups(
 
         reserved_bytes = sum(
             block_count * block_bytes
-            for block_count, block_bytes in zip(pool_block_counts, bytes_per_block)
+            for block_count, block_bytes in zip(
+                pool_block_counts, bytes_per_group_block
+            )
         )
         if reserved_bytes > available_memory:
             raise ValueError(
@@ -1888,7 +1890,7 @@ def get_kv_cache_config_from_groups(
             for group_id in attention_group_ids
         }
         bytes_per_quantum = sum(
-            bytes_per_block[group_id] * blocks_per_quantum[group_id]
+            bytes_per_group_block[group_id] * blocks_per_quantum[group_id]
             for group_id in attention_group_ids
         )
         # get_kv_cache_configs has already translated num_gpu_blocks_override
@@ -2555,7 +2557,19 @@ def _max_memory_usage_bytes_from_groups(
     if independent_pools and glm5_layout is not None:
         raise ValueError("KVarN independent pools cannot use the GLM-5 layout")
     if independent_pools:
-        return _independent_pool_bytes_per_request(vllm_config, kv_cache_groups)
+        # Allocation reserves recurrent state for every scheduler slot before
+        # assigning the remaining bytes to attention. Admission and auto-fit
+        # must use that same reservation, even for one full-context request.
+        max_num_seqs = getattr(
+            getattr(vllm_config, "scheduler_config", None), "max_num_seqs", 1
+        )
+        return sum(
+            len(group.layer_names)
+            * group.kv_cache_spec.page_size_bytes
+            * _physical_blocks_per_request(vllm_config, group)
+            * (max_num_seqs if isinstance(group.kv_cache_spec, MambaSpec) else 1)
+            for group in kv_cache_groups
+        )
     if glm5_layout is not None:
         (
             attn_group,
