@@ -1631,7 +1631,55 @@ def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
     assert (
         kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
         == bytes_per_request
+        + 2 * groups[1].kv_cache_spec.page_size_bytes * blocks_per_request[1]
     )
+
+
+@pytest.mark.parametrize("max_num_seqs", [1, 4])
+@pytest.mark.parametrize("cache_mode,state_blocks", [("none", 3), ("align", 4)])
+def test_kvarn_estimated_context_fits_concurrent_recurrent_reservation(
+    max_num_seqs, cache_mode, state_blocks
+):
+    """Auto-fit must leave the recurrent slots that allocation actually reserves."""
+    attention = new_kv_cache_spec(block_size=128)
+    mamba = new_mamba_spec(
+        block_size=8192,
+        shapes=((attention.page_size_bytes // 4,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode=cache_mode,
+    )
+    groups = [
+        KVCacheGroupSpec(["full"], attention),
+        KVCacheGroupSpec(["mamba"], mamba),
+    ]
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=8192),
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v4_g128_compact",
+            mamba_cache_mode=cache_mode,
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+    )
+    # Eight usable attention pages, all recurrent slots, and one null per pool.
+    available = (8 + max_num_seqs * state_blocks + 2) * attention.page_size_bytes
+    null_bytes = attention.page_size_bytes + mamba.page_size_bytes
+    estimated = kv_cache_utils._estimate_max_model_len_from_groups(
+        config, groups, available - null_bytes
+    )
+    assert estimated == 1024
+    assert config.model_config.max_model_len == 8192
+    config.model_config.max_model_len = estimated
+    allocated = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, groups, available
+    )
+    assert allocated.num_blocks_for_group(0) == 9
+    assert allocated.num_blocks_for_group(1) == 1 + max_num_seqs * state_blocks
+    config.model_config.max_model_len += 128
+    with pytest.raises(ValueError, match="Insufficient attention KV cache"):
+        kv_cache_utils.get_kv_cache_config_from_groups(config, groups, available)
 
 
 @pytest.mark.parametrize("max_model_len", [128, 8192, 65536])
