@@ -3884,6 +3884,35 @@ def test_mtp_decode_and_plain_decode_use_same_committed_history_window(k4v2):
     assert results[0][1] == ({0, *range(10, 19)} if k4v2 else {0, 18})
 
 
+@pytest.mark.parametrize("target_bits", [2, 4])
+@pytest.mark.parametrize("layer_bits,expected", [(2, (16, 8)), (4, (4, 0))])
+def test_kvarn_builder_history_follows_layer_cache_spec(
+    monkeypatch, target_bits, layer_bits, expected
+):
+    """A draft layer must retain the history policy of its own cache format."""
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.kvarn_attn._kvarn_xpu_beta_profile_enabled",
+        lambda dtype: True,
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            cache_dtype=f"kvarn_k4v{target_bits}_g128_compact"
+        ),
+        model_config=SimpleNamespace(max_model_len=8192, get_head_size=lambda: 256),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+    )
+    spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=4,
+        head_size=256,
+        dtype=torch.uint8,
+        kv_quant_mode=get_kv_quant_mode(f"kvarn_k4v{layer_bits}_g128_compact"),
+    )
+    builder = KVarNMetadataBuilder(spec, ["draft.attn"], config, torch.device("cpu"))
+    assert builder._lifecycle_policy()[1:3] == expected
+
+
 def test_k4v2_recent_history_uses_existing_prefill_pool_reservation():
     builder = object.__new__(KVarNMetadataBuilder)
     builder._kvarn_xpu_beta_profile = True

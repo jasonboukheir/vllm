@@ -1574,6 +1574,61 @@ def test_independent_kv_cache_pools_reject_kv_connectors(connector):
         kv_cache_utils._validate_kv_transfer_pool_compat(vllm_config, [config])
 
 
+@pytest.mark.parametrize("target_bits,draft_bits", [(4, 4), (2, 2), (2, 4)])
+def test_kvarn_independent_pools_keep_compatible_layers_together(
+    target_bits, draft_bits
+):
+    """A distinct draft precision must not fragment every target/recurrent layer."""
+    from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionBackend
+    from vllm.v1.kv_cache_interface import get_kv_quant_mode
+
+    def attention(bits):
+        return KVarNAttentionBackend.customize_spec(
+            new_kv_cache_spec(
+                block_size=128,
+                num_kv_heads=4,
+                head_size=256,
+                dtype=torch.uint8,
+                kv_quant_mode=get_kv_quant_mode(f"kvarn_k4v{bits}_g128_compact"),
+            )
+        )
+
+    specs = {f"target.{i}": attention(target_bits) for i in range(16)}
+    specs["draft"] = attention(draft_bits)
+    specs.update({f"mamba.{i}": new_mamba_spec(block_size=512) for i in range(48)})
+    original = specs.copy()
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=512),
+        cache_config=SimpleNamespace(
+            cache_dtype=f"kvarn_k4v{target_bits}_g128_compact",
+            mamba_cache_mode="none",
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=3, disable_hybrid_kv_cache_manager=False
+        ),
+        speculative_config=None,
+    )
+    groups = get_kv_cache_groups(config, specs)
+    assert sorted(len(g.layer_names) for g in groups) == (
+        [17, 48] if target_bits == draft_bits else [1, 16, 48]
+    )
+    assert specs == original
+    old_groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(specs)
+    allocations = [
+        kv_cache_utils.get_kv_cache_config_from_groups(config, gs, 1 << 28)
+        for gs in (old_groups, groups)
+    ]
+    assert get_kv_cache_capacity(config, allocations[0]) == get_kv_cache_capacity(
+        config, allocations[1]
+    )
+    assert sum(t.size for t in allocations[0].kv_cache_tensors) == sum(
+        t.size for t in allocations[1].kv_cache_tensors
+    )
+
+
 def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
     """KVarN tiles and Mamba states retain their natural page geometry."""
     groups = [

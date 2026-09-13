@@ -1067,27 +1067,26 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         except Exception:
             self._max_model_len = 4096
 
-        # KVarN tile / group size (= vLLM block size). Sourced from the configured
+        # KVarN tile / group size (= vLLM block size). Sourced from this group's
         # kv-cache dtype so non-128 groups (e.g. g64) drive the flush + slot math
         # in build() correctly. Every storage / kernel path already reads
         # cfg.group; this is the one place the builder needs it without an impl
         # handle. Falls back to 128 if it cannot be parsed.
+        cache_dtype = kv_cache_spec.kv_quant_mode.name.lower()
         self._group = 128
         try:
             from vllm.model_executor.layers.quantization.kvarn.config import (
                 KVarNConfig,
             )
 
-            _cd = vllm_config.cache_config.cache_dtype
+            _cd = cache_dtype
             _hd = vllm_config.model_config.get_head_size()
             self._group = KVarNConfig.from_cache_dtype(_cd, _hd).group
         except Exception:
             self._group = 128
-        self._kvarn_xpu_beta_profile = _kvarn_xpu_beta_profile_enabled(
-            vllm_config.cache_config.cache_dtype
-        )
+        self._kvarn_xpu_beta_profile = _kvarn_xpu_beta_profile_enabled(cache_dtype)
         self._kvarn_xpu_k4v2_profile = self._kvarn_xpu_beta_profile and (
-            vllm_config.cache_config.cache_dtype == "kvarn_k4v2_g128_compact"
+            cache_dtype == "kvarn_k4v2_g128_compact"
         )
 
         # Persistent cu_seqlens buffers (allocated lazily in build()).

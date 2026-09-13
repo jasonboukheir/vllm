@@ -1461,6 +1461,8 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
 
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    *,
+    independent_pools: bool = False,
 ) -> list[KVCacheGroupSpec]:
     """
     Generates the KV cache groups for hybrid models with multiple
@@ -1551,6 +1553,12 @@ def _get_kv_cache_groups_uniform_page_size(
         else:
             layer_buckets.append(list(layer_names))
             spec_buckets.append([layer_spec])
+
+    if independent_pools:
+        # Separate allocations need no common layer count. Splitting by the
+        # smallest bucket turns a single mixed-precision draft into one
+        # scheduler group and metadata builder per layer.
+        return create_kv_cache_group_specs(kv_cache_spec, layer_buckets)
 
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
@@ -2423,7 +2431,9 @@ def get_kv_cache_groups(
             if fallback_groups is None:
                 raise
             return fallback_groups
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+    groups = _get_kv_cache_groups_uniform_page_size(
+        filtered_spec, independent_pools=independent_kvarn_pools
+    )
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
