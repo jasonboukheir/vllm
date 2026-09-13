@@ -1586,6 +1586,55 @@ def test_hybrid_cache_integration(default_vllm_config, dist_init):
     assert _is_req_state_block_table_match(runner, req_id)
 
 
+@pytest.mark.parametrize(
+    ("backend_name", "drafter_state", "expected_layers"),
+    [
+        ("KVARN", "present", ["target.attn"]),
+        ("KVARN", "none", ["target.attn", "draft.attn"]),
+        ("KVARN", "absent", ["target.attn", "draft.attn"]),
+        ("FLASH_ATTN", "present", ["target.attn", "draft.attn"]),
+        ("FLASH_ATTN", "absent", ["target.attn", "draft.attn"]),
+    ],
+)
+def test_target_kvarn_builder_does_not_own_draft_cache(
+    monkeypatch, backend_name, drafter_state, expected_layers
+):
+    """A target flush must not retag or flush the drafter's independent pool."""
+    backend = Mock()
+    backend.get_name.return_value = backend_name
+    backend.full_cls_name.return_value = ("test", backend_name)
+    layers = {name: Mock(num_heads=24) for name in ["target.attn", "draft.attn"]}
+    for layer in layers.values():
+        layer.get_attn_backend.return_value = backend
+    monkeypatch.setattr(
+        gpu_model_runner_module, "get_layers_from_vllm_config", lambda *args: layers
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module, "check_attention_cp_compatibility", lambda *args: None
+    )
+    runner = SimpleNamespace(
+        attn_groups=[],
+        vllm_config=Mock(),
+        kv_sharing_fast_prefill_eligible_layers=set(),
+        _check_and_update_cudagraph_mode=Mock(),
+    )
+    # MTP-off and non-final pipeline ranks do not create a drafter attribute.
+    if drafter_state != "absent":
+        runner.drafter = (
+            SimpleNamespace(_draft_attn_layer_names={"draft.attn"})
+            if drafter_state == "present"
+            else None
+        )
+    spec = FullAttentionSpec(
+        block_size=128, num_kv_heads=4, head_size=256, dtype=torch.uint8
+    )
+    group = KVCacheGroupSpec(layer_names=list(layers), kv_cache_spec=spec)
+    config = KVCacheConfig(num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[group])
+    GPUModelRunner.initialize_attn_backend(runner, config)
+    assert runner.attn_groups[0][0].layer_names == expected_layers
+    assert group.layer_names == ["target.attn", "draft.attn"]
+
+
 def test_is_uniform_decode() -> None:
     # Normal
     assert GPUModelRunner._is_uniform_decode(

@@ -7164,6 +7164,9 @@ class GPUModelRunner(
         Initialize the attention backends and attention metadata builders.
         """
         assert len(self.attn_groups) == 0, "Attention backends are already initialized"
+        draft_layer_names: set[str] = getattr(
+            getattr(self, "drafter", None), "_draft_attn_layer_names", set()
+        )
 
         class AttentionGroupKey(NamedTuple):
             """Deduplication key for attention groups within a KV cache group.
@@ -7198,6 +7201,14 @@ class GPUModelRunner(
             # layer.
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_backend = layers[layer_name].get_attn_backend()
+
+                if (
+                    attn_backend.get_name() == "KVARN"
+                    and layer_name in draft_layer_names
+                ):
+                    # KVarN builders own mutable tail-pool and flush state.
+                    # The drafter's builder must exclusively own its layers.
+                    continue
 
                 if layer_name in self.kv_sharing_fast_prefill_eligible_layers:
                     attn_backend = create_fast_prefill_custom_backend(
