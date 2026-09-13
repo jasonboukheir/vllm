@@ -50,6 +50,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.turboquant_attn import TurboQuantAttentionBackend
 from vllm.v1.attention.ops.kvarn_store import (
     _pack_dpas_k4,
+    _pack_dpas_v,
     _pack_dpas_v4,
     kvarn_store_tile_k_batch_from_sinkhorn,
     kvarn_store_tile_v_batch_from_sinkhorn,
@@ -929,7 +930,9 @@ def test_fused_qkv_frontend_eligibility_fails_closed(
         "kvarn_native_store_supported",
         lambda *, op_available, **_: op_available,
     )
-    monkeypatch.setattr(kvarn_attn, "kvarn_native_decode_abi_supported", lambda _: True)
+    monkeypatch.setattr(
+        kvarn_attn, "kvarn_native_decode_abi_supported", lambda *_: True
+    )
     monkeypatch.setattr(kvarn_attn, "kvarn_native_layout_abi_supported", lambda _: True)
 
     assert impl._native_qkv_scatter_eligible(layer, query, key, value, slots, metadata)
@@ -1131,7 +1134,7 @@ def test_trusted_native_decode_plan_caches_static_dispatch_facts(
         decode_module, "kvarn_native_problem_supported", lambda **_: True
     )
     monkeypatch.setattr(
-        decode_module, "kvarn_native_decode_abi_supported", lambda _: True
+        decode_module, "kvarn_native_decode_abi_supported", lambda *_: True
     )
     monkeypatch.setattr(
         decode_module, "kvarn_native_output_hadamard_supported", lambda _: True
@@ -1602,7 +1605,9 @@ def test_captured_native_qkv_fallback_does_not_publish_pool_proof(
     pool_ensure = Mock()
     monkeypatch.setenv("KVARN_NATIVE_XPU", "1")
     monkeypatch.setattr(kvarn_attn, "_active_kvarn_metadata", lambda _: metadata)
-    monkeypatch.setattr(kvarn_attn, "kvarn_native_decode_abi_supported", lambda _: True)
+    monkeypatch.setattr(
+        kvarn_attn, "kvarn_native_decode_abi_supported", lambda *_: True
+    )
     monkeypatch.setattr(kvarn_attn, "kvarn_native_layout_abi_supported", lambda _: True)
     monkeypatch.setattr(kvarn_attn, "kvarn_native_store_supported", native_store)
     monkeypatch.setattr(torch.xpu, "is_current_stream_capturing", lambda: True)
@@ -2406,15 +2411,16 @@ def test_pure_qlen1_builder_skips_fa_staging_and_slot_mapping_d2h():
         KVarNAttentionImpl.reset_process_state()
 
 
-def test_dpas_pack_matches_frozen_xe2_fragment_coordinates():
+@pytest.mark.parametrize("value_bits", [2, 4])
+def test_dpas_pack_matches_frozen_xe2_fragment_coordinates(value_bits):
     dims = torch.arange(256, dtype=torch.int32)[:, None]
     tokens = torch.arange(128, dtype=torch.int32)[None, :]
     q_k = ((3 * dims + 5 * tokens + dims // 16 + tokens // 16) & 15).unsqueeze(0)
     q_v = (7 * tokens.T + 11 * dims.T + tokens.T // 8 + dims.T // 32) & 15
-    q_v = q_v.unsqueeze(0)
+    q_v = (q_v & ((1 << value_bits) - 1)).unsqueeze(0)
 
     expected_k = torch.empty((2, 4, 4, 16, 32), dtype=torch.uint8)
-    expected_v = torch.empty((2, 8, 4, 16, 16), dtype=torch.uint8)
+    expected_v = torch.empty((2, 8, 4, 16, 4 * value_bits), dtype=torch.uint8)
     for half in range(2):
         for tile in range(4):
             for subgroup in range(4):
@@ -2438,10 +2444,10 @@ def test_dpas_pack_matches_frozen_xe2_fragment_coordinates():
         for tile in range(8):
             for subgroup in range(4):
                 for lane in range(16):
-                    for byte in range(16):
+                    for byte in range(4 * value_bits):
                         values = []
-                        for nibble in range(2):
-                            slot = 2 * byte + nibble
+                        for nibble in range(8 // value_bits):
+                            slot = (8 // value_bits) * byte + nibble
                             inner = slot % 16
                             dim = lane // 2 + 8 * (inner % 2) + 16 * (slot // 16)
                             token = 2 * (inner // 2) + lane % 2
@@ -2452,19 +2458,20 @@ def test_dpas_pack_matches_frozen_xe2_fragment_coordinates():
                                     tile * 32 + dim,
                                 ]
                             )
-                        expected_v[half, tile, subgroup, lane, byte] = values[0] | (
-                            values[1] << 4
+                        expected_v[half, tile, subgroup, lane, byte] = sum(
+                            int(v) << (i * value_bits) for i, v in enumerate(values)
                         )
 
     torch.testing.assert_close(
         _pack_dpas_k4(q_k).flatten(), expected_k.flatten(), rtol=0, atol=0
     )
     torch.testing.assert_close(
-        _pack_dpas_v4(q_v).flatten(), expected_v.flatten(), rtol=0, atol=0
+        _pack_dpas_v(q_v, value_bits).flatten(), expected_v.flatten(), rtol=0, atol=0
     )
 
 
-def test_dpas_store_preserves_metadata_and_fails_closed_on_wrong_shape():
+@pytest.mark.parametrize("value_bits", [2, 4])
+def test_dpas_store_preserves_metadata_and_fails_closed_on_wrong_shape(value_bits):
     balanced_k = torch.randn(2, 256, 128)
     balanced_v = torch.randn(2, 128, 256)
     k_s_col = torch.rand(2, 128)
@@ -2476,9 +2483,11 @@ def test_dpas_store_preserves_metadata_and_fails_closed_on_wrong_shape():
     dpas_k = kvarn_store_tile_k_batch_from_sinkhorn(
         balanced_k, k_s_col, k_s_row, 4, dpas_layout=True
     )
-    natural_v = kvarn_store_tile_v_batch_from_sinkhorn(balanced_v, v_s_col, v_s_row, 4)
+    natural_v = kvarn_store_tile_v_batch_from_sinkhorn(
+        balanced_v, v_s_col, v_s_row, value_bits
+    )
     dpas_v = kvarn_store_tile_v_batch_from_sinkhorn(
-        balanced_v, v_s_col, v_s_row, 4, dpas_layout=True
+        balanced_v, v_s_col, v_s_row, value_bits, dpas_layout=True
     )
 
     for field in ("s_col_K", "zp_K", "s_row_K"):
@@ -2567,7 +2576,7 @@ def test_compact_kvarn_dtype_selects_xpu_beta_profile_without_env(
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(kvarn_attn.current_platform, "is_xpu", lambda: True)
     monkeypatch.setattr(
-        kvarn_attn, "kvarn_native_layout_abi_supported", lambda _op: True
+        kvarn_attn, "kvarn_native_layout_abi_supported", lambda *_op: True
     )
     KVarNAttentionImpl.reset_process_state()
     try:
@@ -2609,7 +2618,8 @@ def test_compact_kvarn_dtype_selects_xpu_beta_profile_without_env(
         ({"head_dim": 128}, False),
         ({"group": 64}, False),
         ({"key_bits": 2}, False),
-        ({"value_bits": 2}, False),
+        ({"value_bits": 2, "record_bytes": 26_880}, True),
+        ({"value_bits": 3}, False),
         ({"num_kv_heads": 8}, False),
         ({"record_bytes": 35_071}, False),
         ({"record_bytes": 35_074}, False),
@@ -2664,6 +2674,7 @@ def test_batched_flush_native_writer_bypasses_reference_record_assembly(
         record_bytes=65_536,
         k_packed_bytes=16_384,
         v_packed_bytes=16_384,
+        value_bits=4,
     )
     impl = SimpleNamespace(
         kvarn_config=cfg,
@@ -2718,6 +2729,7 @@ def test_batched_flush_fused_sinkhorn_bypasses_unfused_materialization(
         record_bytes=65_536,
         k_packed_bytes=16_384,
         v_packed_bytes=16_384,
+        value_bits=4,
         sinkhorn_iters=8,
     )
     tail_key = torch.zeros(2, 128, 4, 256, dtype=torch.float16)
@@ -3122,7 +3134,7 @@ def test_kvarn_and_nvfp4_ds_mla_quant_modes_are_distinct():
     members = KVQuantMode.__members__.values()
     assert len(KVQuantMode.__members__) == len({member.value for member in members})
     assert {get_kv_quant_mode(name).value for name in KVARN_PRESETS} == set(
-        range(100, 105)
+        range(100, 106)
     )
 
 
@@ -3132,6 +3144,7 @@ def test_kvarn_and_nvfp4_ds_mla_quant_modes_are_distinct():
         ("kvarn_k4v2_g128", 26880, 32768, 256),
         ("kvarn_k4v4_g128", 35072, 65536, 512),
         ("kvarn_k4v4_g128_compact", 35072, 35072, 274),
+        ("kvarn_k4v2_g128_compact", 26880, 26880, 210),
         ("kvarn_k4v2_g64", 14208, 16384, 256),
         ("kvarn_k4v4_g64", 18304, 32768, 512),
     ],
@@ -3844,7 +3857,8 @@ def test_mtp_lifecycle_flush_waits_for_commit_after_page_filling_verify(
         KVarNAttentionImpl.reset_process_state()
 
 
-def test_mtp_decode_and_plain_decode_use_same_committed_history_window():
+@pytest.mark.parametrize("k4v2", [False, True])
+def test_mtp_decode_and_plain_decode_use_same_committed_history_window(k4v2):
     """Speculation must not silently select the prefill quantization policy."""
     results = []
     for q_len in (1, 2, 3):
@@ -3852,6 +3866,7 @@ def test_mtp_decode_and_plain_decode_use_same_committed_history_window():
             set(range(18)), sinks={0}, pool_size=20
         )
         builder._kvarn_xpu_beta_profile = True
+        builder._kvarn_xpu_k4v2_profile = k4v2
         calls = []
         try:
             _run_kvarn_lifecycle_build(
@@ -3866,6 +3881,21 @@ def test_mtp_decode_and_plain_decode_use_same_committed_history_window():
         finally:
             KVarNAttentionImpl.reset_process_state()
     assert results[0] == results[1] == results[2]
+    assert results[0][1] == ({0, *range(10, 19)} if k4v2 else {0, 18})
+
+
+def test_k4v2_recent_history_uses_existing_prefill_pool_reservation():
+    builder = object.__new__(KVarNMetadataBuilder)
+    builder._kvarn_xpu_beta_profile = True
+    builder._kvarn_xpu_k4v2_profile = True
+    prefill, high_water, low_water, scope = builder._lifecycle_policy()
+    assert (high_water, low_water, scope) == (16, 8, "batch_cohort")
+    assert high_water <= prefill
+    configs = [
+        KVarNConfig.from_cache_dtype(f"kvarn_k4v{bits}_g128_compact", 256)
+        for bits in (2, 4)
+    ]
+    assert configs[0].pool_slots(4, 2048) == configs[1].pool_slots(4, 2048)
 
 
 def test_lifecycle_builder_flushes_before_capacity_and_reclaims_completion():

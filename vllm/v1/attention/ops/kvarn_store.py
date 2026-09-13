@@ -97,13 +97,20 @@ def _pack_dpas_k4(q: torch.Tensor) -> torch.Tensor:
     return _pack_4bit(slots).reshape(n, 256, 64)
 
 
-def _pack_dpas_v4(q: torch.Tensor) -> torch.Tensor:
+def _pack_dpas_v(q: torch.Tensor, bits: int = 4) -> torch.Tensor:
     """Pack logical ``[N, 128, 256]`` V values in Xe2 DPAS fragment order."""
     if q.ndim != 3 or q.shape[1:] != (128, 256):
         raise ValueError("DPAS V packing requires [N, 128, 256] input")
+    if bits not in (2, 4):
+        raise ValueError("DPAS V packing requires 2-bit or 4-bit values")
     n = q.shape[0]
     slots = q.reshape(n, 2, 4, 8, 2, 8, 2, 2, 8).permute(0, 1, 5, 2, 8, 4, 6, 3, 7)
-    return _pack_4bit(slots).reshape(n, 128, 128)
+    slots = slots.reshape(n, 2, 8, 4, 16, 32)
+    return _pack_lowbit(slots, bits).reshape(n, 128, 32 * bits)
+
+
+def _pack_dpas_v4(q: torch.Tensor) -> torch.Tensor:
+    return _pack_dpas_v(q, 4)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -243,12 +250,7 @@ def kvarn_store_tile_v_batch_from_sinkhorn(
     s_row_V = (s_row * scale.squeeze(-1)).to(torch.float16)  # [N, R=group]
     zp_V = (s_row * zp.squeeze(-1)).to(torch.float16)
     s_col_V = s_col.to(torch.float16)  # [N, C=D]
-    if dpas_layout:
-        if bits != 4:
-            raise ValueError("DPAS V packing requires 4-bit values")
-        q_packed = _pack_dpas_v4(q)
-    else:
-        q_packed = _pack_lowbit(q, bits)  # [N, R, C/pack]
+    q_packed = _pack_dpas_v(q, bits) if dpas_layout else _pack_lowbit(q, bits)
     return {
         "q_packed_uint8": q_packed,
         "s_col_V": s_col_V,

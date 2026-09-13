@@ -72,7 +72,10 @@ def _is_xpu_kvarn_request_stable_profile(vllm_config: Any) -> bool:
     if model_config is None or cache_config is None or parallel_config is None:
         return False
 
-    if getattr(cache_config, "cache_dtype", None) != "kvarn_k4v4_g128_compact":
+    if getattr(cache_config, "cache_dtype", None) not in (
+        "kvarn_k4v4_g128_compact",
+        "kvarn_k4v2_g128_compact",
+    ):
         return False
     if getattr(cache_config, "mamba_cache_mode", None) != "none":
         return False

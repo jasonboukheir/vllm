@@ -85,7 +85,7 @@ def _native_prefill_store(**overrides) -> dict:
         {"num_kv_heads": 8},
         {"head_dim": 128},
         {"group": 64},
-        {"value_bits": 2},
+        {"value_bits": 3},
         {"record_bytes": 35_071},
         {"sliding_window": 1024},
         {"key_dtype": torch.float32, "value_dtype": torch.float32},
@@ -112,7 +112,7 @@ def test_native_prefill_store_rejects_unsupported_dispatch(
         {"num_kv_heads": 8},
         {"head_dim": 128},
         {"group": 64},
-        {"value_bits": 2},
+        {"value_bits": 3},
         {"record_bytes": 35_071},
         {"sliding_window": 1024},
         {"key_dtype": torch.float32, "value_dtype": torch.float32},
@@ -163,8 +163,9 @@ def test_dpas_layout_refuses_natural_reader_fallback() -> None:
 def test_dpas_layout_problem_validation_is_fail_closed() -> None:
     assert not _kvarn_dpas_layout_for_problem(False, 128, 64, 2, 2)
     assert _kvarn_dpas_layout_for_problem(True, 256, 128, 4, 4)
+    assert _kvarn_dpas_layout_for_problem(True, 256, 128, 4, 2)
     with pytest.raises(RuntimeError, match="requires D256/G128/K4V4"):
-        _kvarn_dpas_layout_for_problem(True, 256, 128, 4, 2)
+        _kvarn_dpas_layout_for_problem(True, 256, 128, 4, 3)
 
 
 @pytest.mark.parametrize(
@@ -279,6 +280,49 @@ def test_batch_aware_policy_views_capacity_scratch_contiguously_for_every_batch(
         assert temp_output.data_ptr() == scratch[0].data_ptr()
         assert exp_sums.data_ptr() == scratch[1].data_ptr()
         assert max_logits.data_ptr() == scratch[2].data_ptr()
+
+
+@pytest.mark.parametrize("context", [4095, 4096, 8192, 8193, 16_384, 65_024, 262_144])
+def test_k4v2_split_policy_keeps_scratch_bounds_and_other_batch_choices(context):
+    policy = "b70_k4v2_short_q6_id18_v1"
+    variant = kvarn_decode.KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR
+    assert kvarn_native_split_policy_requested(policy) == (policy, 32)
+    assert kvarn_native_split_scratch_count(context, 32, policy, variant) == 32
+    scratch = (
+        torch.empty((12, 24 * 32, 256), dtype=torch.float16),
+        torch.empty((12, 24, 32), dtype=torch.float32),
+        torch.empty((12, 24, 32), dtype=torch.float32),
+    )
+    for batch in range(1, 13):
+        old = kvarn_native_split_count(
+            context,
+            32,
+            batch_size=batch,
+            split_policy="b70_q6_id18_v1",
+            kernel_variant=variant,
+        )
+        count = kvarn_native_split_count(
+            context,
+            32,
+            batch_size=batch,
+            split_policy=policy,
+            kernel_variant=variant,
+        )
+        assert count == (16 if batch == 3 and 4096 <= context <= 8192 else old)
+        views = _kvarn_native_scratch_views(scratch, batch, 24, count)
+        assert views[0].shape == (batch, 24 * count, 256)
+        assert views[1].shape == views[2].shape == (batch, 24, count)
+        assert all(view.is_contiguous() for view in views)
+        assert all(
+            view.data_ptr() == base.data_ptr() for view, base in zip(views, scratch)
+        )
+    with pytest.raises(ValueError, match="requires max_splits=32"):
+        kvarn_native_split_count(
+            context,
+            64,
+            split_policy=policy,
+            kernel_variant=variant,
+        )
 
 
 def test_native_output_hadamard_schema_detection_is_backward_compatible() -> None:
@@ -1038,3 +1082,45 @@ def test_xpu_forward_context_rejects_non_xe2_profile(
             num_tokens=1,
             cudagraph_runtime_mode=CUDAGraphMode.NONE,
         )
+
+
+@pytest.mark.parametrize(
+    "value_bits,record_bytes", [(2, 26880), (2, 32768), (4, 35072)]
+)
+def test_native_problem_accepts_declared_value_width(value_bits, record_bytes):
+    assert kvarn_native_problem_supported(
+        **_native_problem(value_bits=value_bits, record_bytes=record_bytes)
+    )
+    assert not kvarn_native_problem_supported(
+        **_native_problem(
+            value_bits=value_bits, record_bytes=18688 + 4096 * value_bits - 4
+        )
+    )
+
+
+@pytest.mark.parametrize("with_scratch", [False, True])
+def test_k4v2_requires_explicit_value_width_schema(monkeypatch, with_scratch):
+    arguments = [
+        SimpleNamespace(name=n)
+        for n in ("dpas_layout", "num_kv_splits", "kernel_variant")
+    ]
+    op = SimpleNamespace(
+        default=SimpleNamespace(_schema=SimpleNamespace(arguments=arguments))
+    )
+    monkeypatch.setattr(
+        kvarn_decode.torch.ops,
+        "_vllm_fa2_C",
+        SimpleNamespace(kvarn_decode=op, kvarn_decode_with_scratch=op),
+    )
+    kvarn_native_layout_abi_supported.cache_clear()
+    kvarn_native_decode_abi_supported.cache_clear()
+    assert kvarn_native_decode_abi_supported(with_scratch, 4)
+    assert not kvarn_native_decode_abi_supported(with_scratch, 2)
+    arguments.append(SimpleNamespace(name="value_bits"))
+    kvarn_native_layout_abi_supported.cache_clear()
+    kvarn_native_decode_abi_supported.cache_clear()
+    assert kvarn_native_decode_abi_supported(with_scratch, 2)
+    assert kvarn_decode.kvarn_native_value_bits_kwargs(2) == {"value_bits": 2}
+    assert kvarn_decode.kvarn_native_value_bits_kwargs(4) == {}
+    kvarn_native_layout_abi_supported.cache_clear()
+    kvarn_native_decode_abi_supported.cache_clear()

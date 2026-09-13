@@ -12,29 +12,30 @@ from vllm.v1.attention.backends.kvarn_attn import (
     _build_hadamard,
     _native_verify_view,
 )
-from vllm.v1.attention.ops.kvarn_store import _pack_dpas_k4, _pack_dpas_v4
+from vllm.v1.attention.ops.kvarn_store import _pack_dpas_k4, _pack_dpas_v
 
 
+@pytest.mark.parametrize("value_bits", [2, 4])
 @pytest.mark.parametrize("seq_len", [383, 384, 385])
 @pytest.mark.parametrize("query_len", [2, 3])
-@pytest.mark.parametrize("history_pages", [1, 1022])
+@pytest.mark.parametrize("history_pages", [1, 30, 62, 1022])
 @torch.inference_mode()
 def test_dpas_mtp_verify_masks_future_and_overwrites_rejected_tail(
-    seq_len, query_len, history_pages
+    seq_len, query_len, history_pages, value_bits
 ):
     if not torch.xpu.is_available():
         pytest.skip("requires real XPU")
-    cfg = KVarNConfig.from_cache_dtype("kvarn_k4v4_g128_compact", 256)
+    cfg = KVarNConfig.from_cache_dtype(f"kvarn_k4v{value_bits}_g128_compact", 256)
     torch.manual_seed(37)
     device = torch.device("xpu")
     seq_len += (history_pages - 1) * 128
     # Logical pages: resident sink, packed history, two resident tail pages.
     cache = torch.zeros((5, 4, cfg.record_bytes), dtype=torch.uint8)
     qk = torch.randint(0, 16, (4, 256, 128), dtype=torch.uint8)
-    qv = torch.randint(0, 16, (4, 128, 256), dtype=torch.uint8)
+    qv = torch.randint(0, 1 << value_bits, (4, 128, 256), dtype=torch.uint8)
     cache[1, :, : cfg.k_packed_bytes] = _pack_dpas_k4(qk).reshape(4, -1)
     cache[1, :, cfg.v_packed_offset : cfg.v_packed_offset + cfg.v_packed_bytes] = (
-        _pack_dpas_v4(qv).reshape(4, -1)
+        _pack_dpas_v(qv, value_bits).reshape(4, -1)
     )
     for offset, length, value in (
         (cfg.k_s_col_offset, 256, 0.125),
@@ -68,7 +69,9 @@ def test_dpas_mtp_verify_masks_future_and_overwrites_rejected_tail(
     impl._H_fp16 = _build_hadamard(256, device).half()
     impl._kvarn_native_kernel_variant = 18
     impl._kvarn_native_max_splits = 32
-    impl._kvarn_native_split_policy = "b70_q6_id18_v1"
+    impl._kvarn_native_split_policy = (
+        "b70_k4v2_short_q6_id18_v1" if value_bits == 2 else "b70_q6_id18_v1"
+    )
     impl._q_rot_fp16_buf = torch.empty(
         (query_len * 24, 256), device=device, dtype=torch.float16
     )
