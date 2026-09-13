@@ -2668,6 +2668,20 @@ def reshape_and_cache_flash(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
+    # The XPU extension spells an unquantized, input-matching cache "auto".
+    # Preserve explicit FP16/BF16 at the engine/config layer ("auto" can pick
+    # checkpoint FP8), and translate only after verifying the tensor ABI.
+    if key.device.type == "xpu" and kv_cache_dtype in ("float16", "bfloat16"):
+        expected_dtype = getattr(torch, kv_cache_dtype)
+        if any(
+            tensor.dtype != expected_dtype
+            for tensor in (key, value, key_cache, value_cache)
+        ):
+            raise ValueError(
+                "XPU unquantized cache storage requires matching input and "
+                f"cache dtypes ({kv_cache_dtype})"
+            )
+        kv_cache_dtype = "auto"
     torch.ops._C_cache_ops.reshape_and_cache_flash(
         key,
         value,
