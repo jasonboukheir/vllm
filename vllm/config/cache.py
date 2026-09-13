@@ -54,6 +54,7 @@ CacheDType = Literal[
     "kvarn_k4v2_g128",
     "kvarn_k4v4_g128",
     "kvarn_k4v4_g128_compact",
+    "kvarn_k4v2_g128_compact",
     "kvarn_k4v2_g64",
     "kvarn_k4v4_g64",
     "int8_per_token_head",

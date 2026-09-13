@@ -87,7 +87,7 @@ def _check_kvarn_beta_unsupported_config(
         scheduler = vllm_config.scheduler_config
         parallel = vllm_config.parallel_config
         if not (
-            cache_dtype == "kvarn_k4v4_g128_compact"
+            cache_dtype in ("kvarn_k4v4_g128_compact", "kvarn_k4v2_g128_compact")
             and getattr(spec, "method", None) == "mtp"
             and getattr(spec, "num_speculative_tokens", None) in (1, 2)
             and getattr(spec, "kv_cache_dtype", None) in (None, cache_dtype)

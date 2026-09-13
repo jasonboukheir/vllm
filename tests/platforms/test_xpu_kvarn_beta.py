@@ -75,7 +75,7 @@ def _mtp_config():
         ("model_config", "dtype", torch.float16),
         ("parallel_config", "tensor_parallel_size", 2),
         ("parallel_config", "pipeline_parallel_size", 2),
-        ("cache_config", "cache_dtype", "kvarn_k4v2_g128_compact"),
+        ("cache_config", "cache_dtype", "kvarn_k4v2"),
     ],
 )
 def test_kvarn_mtp_rejects_unqualified_envelope(section, field, value):
@@ -85,10 +85,16 @@ def test_kvarn_mtp_rejects_unqualified_envelope(section, field, value):
         _check_kvarn_beta_unsupported_config(config, CUDAGraphMode.NONE)
 
 
+@pytest.mark.parametrize(
+    "cache_dtype", ["kvarn_k4v4_g128_compact", "kvarn_k4v2_g128_compact"]
+)
 @pytest.mark.parametrize("max_num_seqs", [1, 4, 16])
 @pytest.mark.parametrize("num_speculative_tokens", [1, 2])
-def test_kvarn_mtp_accepts_scheduler_concurrency(max_num_seqs, num_speculative_tokens):
+def test_kvarn_mtp_accepts_scheduler_concurrency(
+    cache_dtype, max_num_seqs, num_speculative_tokens
+):
     config = _mtp_config()
+    config.cache_config.cache_dtype = cache_dtype
     config.scheduler_config.max_num_seqs = max_num_seqs
     config.speculative_config.num_speculative_tokens = num_speculative_tokens
     _check_kvarn_beta_unsupported_config(config, CUDAGraphMode.NONE)

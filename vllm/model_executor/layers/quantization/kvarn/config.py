@@ -20,6 +20,12 @@ from dataclasses import dataclass
 # out by the softmax weights), so the shipped preset spends more bits on keys.
 KVARN_PRESETS: dict[str, dict] = {
     "kvarn_k4v2_g128": {"key_bits": 4, "value_bits": 2, "group": 128},
+    "kvarn_k4v2_g128_compact": {
+        "key_bits": 4,
+        "value_bits": 2,
+        "group": 128,
+        "compact_records": True,
+    },
     "kvarn_k4v4_g128": {"key_bits": 4, "value_bits": 4, "group": 128},
     "kvarn_k4v4_g128_compact": {
         "key_bits": 4,

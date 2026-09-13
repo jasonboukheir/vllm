@@ -33,9 +33,16 @@ _KVARN_NATIVE_RECORD_BYTES = 35_072
 _KVARN_NATIVE_MAX_BATCH = 12
 KVARN_NATIVE_SPLIT_POLICY_FIXED = "fixed"
 KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1 = "b70_q6_id18_v1"
-_KVARN_NATIVE_SPLIT_POLICIES = frozenset(
-    {KVARN_NATIVE_SPLIT_POLICY_FIXED, KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1}
+KVARN_NATIVE_SPLIT_POLICY_B70_K4V2_SHORT_Q6_ID18_V1 = "b70_k4v2_short_q6_id18_v1"
+_KVARN_NATIVE_BATCH_SPLIT_POLICIES = frozenset(
+    {
+        KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1,
+        KVARN_NATIVE_SPLIT_POLICY_B70_K4V2_SHORT_Q6_ID18_V1,
+    }
 )
+_KVARN_NATIVE_SPLIT_POLICIES = _KVARN_NATIVE_BATCH_SPLIT_POLICIES | {
+    KVARN_NATIVE_SPLIT_POLICY_FIXED
+}
 KVARN_CACHE_LAYOUT_NATURAL = "natural"
 KVARN_CACHE_LAYOUT_XE2_DPAS = "xe2_dpas"
 _KVARN_CACHE_LAYOUTS = frozenset(
@@ -134,9 +141,9 @@ def _kvarn_dpas_layout_for_problem(
     if not dpas_layout:
         return False
     actual = (head_dim, group, key_bits, value_bits)
-    if actual != (256, 128, 4, 4):
+    if actual not in ((256, 128, 4, 4), (256, 128, 4, 2)):
         raise RuntimeError(
-            "The xe2_dpas KVarN cache layout requires D256/G128/K4V4; "
+            "The xe2_dpas KVarN cache layout requires D256/G128/K4V4 or K4V2; "
             f"got D{actual[0]}/G{actual[1]}/K{actual[2]}V{actual[3]}"
         )
     return True
@@ -148,7 +155,7 @@ def kvarn_native_split_policy_requested(
     """Return the qualified split policy and its scratch capacity."""
     if default not in _KVARN_NATIVE_SPLIT_POLICIES:
         raise ValueError(f"unknown KVarN native split policy: {default}")
-    return default, 32 if default == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1 else 16
+    return default, 32 if default in _KVARN_NATIVE_BATCH_SPLIT_POLICIES else 16
 
 
 def kvarn_native_kernel_variant_requested(default: str = "baseline") -> tuple[str, int]:
@@ -181,11 +188,11 @@ def validate_kvarn_native_factory_selection(
             f"cache layout {KVARN_CACHE_LAYOUT_XE2_DPAS!r}"
         )
     if (
-        split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1
+        split_policy in _KVARN_NATIVE_BATCH_SPLIT_POLICIES
         and kernel_variant != KVARN_NATIVE_KERNEL_Q6_PREFETCH_RECORD_CURSOR
     ):
         raise ValueError(
-            "KVarN split policy 'b70_q6_id18_v1' requires kernel variant "
+            f"KVarN split policy {split_policy!r} requires kernel variant "
             "'q6_prefetch_record_cursor'(18)"
         )
 
@@ -199,7 +206,7 @@ def _kvarn_native_split_count_cached(
     kernel_variant: int,
 ) -> int:
     splits = max_splits
-    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1:
+    if split_policy in _KVARN_NATIVE_BATCH_SPLIT_POLICIES:
         if not 1 <= batch_size <= _KVARN_NATIVE_MAX_BATCH:
             raise ValueError(
                 f"{split_policy} split policy supports batch sizes 1 through 12"
@@ -216,6 +223,14 @@ def _kvarn_native_split_count_cached(
             splits = 4
         else:
             splits = 2
+        if (
+            split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_K4V2_SHORT_Q6_ID18_V1
+            and batch_size == 3
+            and 4096 <= max_seq_len <= 8192
+        ):
+            # Short three-row launches benefit from more splits with K4V2
+            # FP16 history, including the virtual rows used by MTP2.
+            splits = 16
 
     # Mirror the C++ wrapper's variant-specific work-unit rule exactly. The
     # paired-page kernel schedules K128 pages; every other current native
@@ -249,7 +264,7 @@ def kvarn_native_split_count(
         split_policy = KVARN_NATIVE_SPLIT_POLICY_FIXED
     if split_policy not in _KVARN_NATIVE_SPLIT_POLICIES:
         raise ValueError(f"unknown KVarN native split policy: {split_policy}")
-    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1 and max_splits != 32:
+    if split_policy in _KVARN_NATIVE_BATCH_SPLIT_POLICIES and max_splits != 32:
         raise ValueError(f"{split_policy} split policy requires max_splits=32")
     return _kvarn_native_split_count_cached(
         max_seq_len, max_splits, batch_size, split_policy, kernel_variant
@@ -264,7 +279,7 @@ def kvarn_native_split_scratch_count(
 ) -> int:
     """Return persistent scratch capacity for the engine-lifetime policy."""
     _kvarn_native_work_unit_tokens(kernel_variant)
-    if split_policy == KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1:
+    if split_policy in _KVARN_NATIVE_BATCH_SPLIT_POLICIES:
         if max_splits != 32:
             raise ValueError(f"{split_policy} split policy requires max_splits=32")
         return max_splits
@@ -315,21 +330,31 @@ def _kvarn_op_supports_argument(op: object, argument: str) -> bool:
     return any(schema_arg.name == argument for schema_arg in arguments)
 
 
-@functools.lru_cache(maxsize=8)
-def kvarn_native_layout_abi_supported(op_name: str) -> bool:
+@functools.lru_cache(maxsize=16)
+def kvarn_native_layout_abi_supported(op_name: str, value_bits: int = 4) -> bool:
     """Require the immutable-layout ABI before selecting a native cache op."""
     if not hasattr(torch.ops._vllm_fa2_C, op_name):
         return False
-    return _kvarn_op_supports_argument(
-        getattr(torch.ops._vllm_fa2_C, op_name), "dpas_layout"
+    op = getattr(torch.ops._vllm_fa2_C, op_name)
+    return _kvarn_op_supports_argument(op, "dpas_layout") and (
+        value_bits == 4
+        or (value_bits == 2 and _kvarn_op_supports_argument(op, "value_bits"))
     )
 
 
 @functools.lru_cache(maxsize=2)
-def kvarn_native_decode_abi_supported(with_scratch: bool) -> bool:
+def kvarn_native_value_bits_kwargs(value_bits: int) -> dict[str, int]:
+    """Keep the existing K4V4 ABI compatible; K4V2 requires explicit width."""
+    if value_bits not in (2, 4):
+        raise ValueError(f"Unsupported native KVarN value width: {value_bits}")
+    return {"value_bits": 2} if value_bits == 2 else {}
+
+
+@functools.lru_cache(maxsize=4)
+def kvarn_native_decode_abi_supported(with_scratch: bool, value_bits: int = 4) -> bool:
     """Require explicit layout and split-count decode provenance."""
     op_name = "kvarn_decode_with_scratch" if with_scratch else "kvarn_decode"
-    if not kvarn_native_layout_abi_supported(op_name):
+    if not kvarn_native_layout_abi_supported(op_name, value_bits):
         return False
     op = getattr(torch.ops._vllm_fa2_C, op_name)
     return _kvarn_op_supports_argument(
@@ -388,8 +413,8 @@ def kvarn_native_problem_supported(
         and head_dim == 256
         and group == 128
         and key_bits == 4
-        and value_bits == 4
-        and record_bytes >= _KVARN_NATIVE_RECORD_BYTES
+        and value_bits in (2, 4)
+        and record_bytes >= 18_688 + 4_096 * value_bits
         and record_bytes % 4 == 0
         and sliding_window == 0
         and has_lookup
@@ -476,8 +501,8 @@ def kvarn_native_prefill_store_supported(
         and head_dim == 256
         and group == 128
         and key_bits == 4
-        and value_bits == 4
-        and record_bytes >= _KVARN_NATIVE_RECORD_BYTES
+        and value_bits in (2, 4)
+        and record_bytes >= 18_688 + 4_096 * value_bits
         and record_bytes % 4 == 0
         and sliding_window == 0
         and key_dtype in (torch.float16, torch.bfloat16)
@@ -520,6 +545,7 @@ class KVarNBoundNativeDecodePlanV2:
     max_splits: int
     split_policy: str
     kernel_variant: int
+    value_bits: int = 4
 
 
 def build_kvarn_trusted_native_decode_plan(
@@ -598,7 +624,7 @@ def build_kvarn_trusted_native_decode_plan(
         and q_rot.is_contiguous()
         and fused_out.is_contiguous()
         and int(md.max_seq_len) >= 1
-        and kvarn_native_decode_abi_supported(False)
+        and kvarn_native_decode_abi_supported(False, cfg.value_bits)
         and query.dtype in (torch.float16, torch.bfloat16)
         and query.reshape(batch_size * num_query_heads, head_dim).stride(1) == 1
     )
@@ -626,7 +652,7 @@ def build_kvarn_trusted_native_decode_plan(
         and native_scratch[1].shape[2] >= impl._kvarn_native_max_splits
         and native_scratch[2].shape[0] >= max_batch
         and native_scratch[2].shape[2] >= impl._kvarn_native_max_splits
-        and kvarn_native_decode_abi_supported(True)
+        and kvarn_native_decode_abi_supported(True, cfg.value_bits)
     )
     if use_scratch_op:
         max_batch = min(max_batch, *(tensor.shape[0] for tensor in native_scratch))
@@ -768,8 +794,8 @@ def _kvarn_scatter_store_kernel(
 # Stage α-2 capture-correct: ONE block_table-driven build-packed-KV kernel.
 # Reads vLLM's persistent block_table + seq_lens directly (so a captured CUDA
 # graph sees fresh data each replay), and writes the packed varlen fp16 K/V
-# that flash_attn_varlen consumes. Fixed grid (B * MAX_BLOCKS_PER_REQ, Hk) so
-# the launch dims are constant per captured batch size. Per (block, head):
+# that flash_attn_varlen consumes. Grid (max_blocks, B, Hk) keeps page-count
+# changes out of the compilation key. Per (request, block, head):
 #   - pool_slot >= 0  → fp16 already-rotated tokens copied from the tail pool
 #                       (sink at k==0; in-progress tail at k==n_full).
 #   - pool_slot <  0  → block lives in the int4 cache; dequant it in-place.
@@ -797,7 +823,6 @@ def _kvarn_build_packed_kv_kernel(
     stride_out_t,
     stride_out_h,
     # constexprs
-    MAX_BLOCKS_PER_REQ: tl.constexpr,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     K_BITS: tl.constexpr,
@@ -813,14 +838,10 @@ def _kvarn_build_packed_kv_kernel(
     V_ZP_OFFSET: tl.constexpr,
     DPAS_LAYOUT: tl.constexpr = False,
 ):
-    """Grid: (B * MAX_BLOCKS_PER_REQ, Hk). One (request-block, head) per program.
-    b is always < B by construction (grid dim 0 == B*MAX_BLOCKS_PER_REQ), so no
-    runtime-B guard is needed — avoiding it keeps the kernel free of a
-    non-constexpr early-return that Triton's type inference mishandles."""
-    bk = tl.program_id(0)
-    hk = tl.program_id(1)
-    b = bk // MAX_BLOCKS_PER_REQ
-    k = bk % MAX_BLOCKS_PER_REQ
+    """One (page, request, head) per program; page count is a grid dimension."""
+    k = tl.program_id(0)
+    b = tl.program_id(1)
+    hk = tl.program_id(2)
 
     seq_len = tl.load(Seq_lens_ptr + b)
     # tokens this block contributes = clamp(seq_len - k*GROUP, 0, GROUP).
@@ -953,23 +974,21 @@ def _kvarn_build_packed_kv_kernel(
             v_local_token = g_offs % 64
             v_local_dim = d_offs % 32
             v_lane = 2 * (v_local_dim[None, :] % 8) + v_local_token[:, None] % 2
+            v_slot = (
+                16 * (v_local_dim[None, :] // 16)
+                + 2 * ((v_local_token[:, None] % 16) // 2)
+                + (v_local_dim[None, :] % 16) // 8
+            )
             v_byte = (
                 (
-                    (
-                        (
-                            (g_offs[:, None] // 64 * 8 + d_offs[None, :] // 32) * 4
-                            + v_local_token[:, None] // 16
-                        )
-                        * 16
-                        + v_lane
-                    )
-                    * 16
+                    (g_offs[:, None] // 64 * 8 + d_offs[None, :] // 32) * 4
+                    + v_local_token[:, None] // 16
                 )
-                + 8 * (v_local_dim[None, :] // 16)
-                + (v_local_token[:, None] % 16) // 2
-            )
+                * 16
+                + v_lane
+            ) * (4 * V_BITS) + v_slot // PACK_V
             v_addrs = tile_base + V_PACKED_OFFSET + v_byte
-            d_shift_v = ((v_local_dim % 16) // 8) * 4
+            v_shift = (v_slot % PACK_V) * V_BITS
         else:
             v_addrs = (
                 tile_base
@@ -977,8 +996,9 @@ def _kvarn_build_packed_kv_kernel(
                 + g_offs[:, None] * (D // PACK_V)
                 + d_byte_v[None, :]
             )
+            v_shift = d_shift_v[None, :]
         v_bytes = tl.load(KV_cache_ptr + v_addrs).to(tl.int32)
-        q_V = ((v_bytes >> d_shift_v[None, :]) & MASK_V).to(tl.float32)
+        q_V = ((v_bytes >> v_shift) & MASK_V).to(tl.float32)
         V_rot = (q_V * s_row_V[:, None] + zp_V[:, None]) * s_col_V[
             None, :
         ]  # [GROUP, D]
@@ -1529,6 +1549,7 @@ def _kvarn_bound_native_decode_attention_v2(
             native_splits,
             plan.kernel_variant,
             plan.dpas_layout,
+            **kvarn_native_value_bits_kwargs(plan.value_bits),
         )
     else:
         torch.ops._vllm_fa2_C.kvarn_decode(
@@ -1547,6 +1568,7 @@ def _kvarn_bound_native_decode_attention_v2(
             native_splits,
             plan.kernel_variant,
             plan.dpas_layout,
+            **kvarn_native_value_bits_kwargs(plan.value_bits),
         )
     if fuse_output_hadamard:
         return output_rot
@@ -1663,7 +1685,7 @@ def kvarn_decode_attention(
             and impl._tail_V_pool.is_contiguous()
             and q_rot_fp16.is_contiguous()
             and int(md.max_seq_len) >= 1
-            and kvarn_native_decode_abi_supported(False)
+            and kvarn_native_decode_abi_supported(False, cfg.value_bits)
         )
     native_output = getattr(impl, "_native_output_fp16_buf", None)
     if trusted_native_plan is not None:
@@ -1714,7 +1736,9 @@ def kvarn_decode_attention(
                 and native_scratch[2].shape[0] >= B
                 and native_scratch[2].shape[2] >= native_splits
             )
-            use_scratch_op = scratch_fits and kvarn_native_decode_abi_supported(True)
+            use_scratch_op = scratch_fits and kvarn_native_decode_abi_supported(
+                True, cfg.value_bits
+            )
             fuse_output_hadamard = _kvarn_native_output_hadamard_enabled(
                 native_splits, use_scratch_op
             )
@@ -1773,6 +1797,7 @@ def kvarn_decode_attention(
                     native_splits,
                     impl._kvarn_native_kernel_variant,
                     dpas_layout,
+                    **kvarn_native_value_bits_kwargs(cfg.value_bits),
                 )
             else:
                 # This wrapper owns temporary scratch internally. Its C++
@@ -1798,6 +1823,7 @@ def kvarn_decode_attention(
                     native_splits,
                     impl._kvarn_native_kernel_variant,
                     dpas_layout,
+                    **kvarn_native_value_bits_kwargs(cfg.value_bits),
                 )
         if fuse_output_hadamard:
             return output_rot
@@ -1971,8 +1997,8 @@ def kvarn_decode_attention(
                 and D == 256
                 and group == 128
                 and cfg.key_bits == 4
-                and cfg.value_bits == 4
-                and cfg.record_bytes >= _KVARN_NATIVE_RECORD_BYTES
+                and cfg.value_bits in (2, 4)
+                and cfg.record_bytes >= 18_688 + 4_096 * cfg.value_bits
                 and cfg.record_bytes % 4 == 0
                 and kv_cache.shape[-1] == cfg.record_bytes
                 and kv_cache.is_contiguous()
@@ -1985,7 +2011,9 @@ def kvarn_decode_attention(
                 and K_packed.is_contiguous()
                 and V_packed.is_contiguous()
                 and int(md.max_seq_len) >= 1
-                and kvarn_native_layout_abi_supported("kvarn_materialize_packed_kv")
+                and kvarn_native_layout_abi_supported(
+                    "kvarn_materialize_packed_kv", cfg.value_bits
+                )
             )
             _require_kvarn_dpas_reader(
                 dpas_layout,
@@ -2006,9 +2034,10 @@ def kvarn_decode_attention(
                     V_packed,
                     int(md.max_seq_len),
                     dpas_layout,
+                    **kvarn_native_value_bits_kwargs(cfg.value_bits),
                 )
             else:
-                _kvarn_build_packed_kv_kernel[(B * max_blocks_per_req, Hk)](
+                _kvarn_build_packed_kv_kernel[(max_blocks_per_req, B, Hk)](
                     md.block_table,
                     md.seq_lens,
                     fa_cu_seqlens_k,
@@ -2026,7 +2055,6 @@ def kvarn_decode_attention(
                     impl._tail_K_pool.stride(2),
                     K_packed.stride(0),
                     K_packed.stride(1),
-                    MAX_BLOCKS_PER_REQ=max_blocks_per_req,
                     D=D,
                     GROUP=group,
                     K_BITS=cfg.key_bits,

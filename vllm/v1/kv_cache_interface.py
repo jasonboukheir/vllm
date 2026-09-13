@@ -62,6 +62,7 @@ class KVQuantMode(IntEnum):
     KVARN_K4V2_G64 = 102
     KVARN_K4V4_G64 = 103
     KVARN_K4V4_G128_COMPACT = 104
+    KVARN_K4V2_G128_COMPACT = 105
 
     @property
     def is_per_token_head(self) -> bool:
@@ -96,6 +97,7 @@ class KVQuantMode(IntEnum):
             KVQuantMode.KVARN_K4V2_G64,
             KVQuantMode.KVARN_K4V4_G64,
             KVQuantMode.KVARN_K4V4_G128_COMPACT,
+            KVQuantMode.KVARN_K4V2_G128_COMPACT,
         )
 
 

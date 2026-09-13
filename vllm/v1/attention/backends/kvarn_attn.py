@@ -83,6 +83,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     KVARN_CACHE_LAYOUT_XE2_DPAS,
     KVARN_FRONTEND_QKV_SCATTER_INLINE_CURRENT_STREAM,
     KVARN_FRONTEND_REFERENCE,
+    KVARN_NATIVE_SPLIT_POLICY_B70_K4V2_SHORT_Q6_ID18_V1,
     KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1,
     KVARN_NATIVE_SPLIT_POLICY_FIXED,
     KVARN_PREFILL_STORE_HADAMARD_SCATTER,
@@ -104,6 +105,7 @@ from vllm.v1.attention.ops.triton_kvarn_decode import (
     kvarn_native_split_policy_requested,
     kvarn_native_split_scratch_count,
     kvarn_native_store_supported,
+    kvarn_native_value_bits_kwargs,
     kvarn_prefill_store_variant_requested,
     validate_kvarn_native_factory_selection,
 )
@@ -131,8 +133,12 @@ _KVARN_QLEN1_INLINE_PLAN_BOUND_NATIVE_V2 = "bound_native_v2"
 _KVARN_CACHED_PREFILL_MATERIALIZER_REFERENCE = "reference"
 _KVARN_CACHED_PREFILL_MATERIALIZER_NATIVE_XE2 = "native_xe2"
 _KVARN_METADATA_LIFECYCLE_REFERENCE = "reference"
-_KVARN_XPU_BETA_CACHE_DTYPE = "kvarn_k4v4_g128_compact"
+_KVARN_XPU_BETA_CACHE_DTYPES = frozenset(
+    {"kvarn_k4v4_g128_compact", "kvarn_k4v2_g128_compact"}
+)
 _KVARN_XPU_BETA_DECODE_WINDOW = 4
+_KVARN_XPU_K4V2_DECODE_WINDOW = 16
+_KVARN_XPU_K4V2_DECODE_LOW_WATER = 8
 _KVARN_FLUSH_INDEX_COUNTER_KEYS = (
     "flush_calls",
     "layer_batches",
@@ -307,7 +313,7 @@ def _build_hadamard(d: int, device: torch.device) -> torch.Tensor:
 
 def _kvarn_xpu_beta_profile_enabled(cache_dtype: str) -> bool:
     """Use the qualified B70 profile for the compact beta dtype on XPU."""
-    return current_platform.is_xpu() and cache_dtype == _KVARN_XPU_BETA_CACHE_DTYPE
+    return current_platform.is_xpu() and cache_dtype in _KVARN_XPU_BETA_CACHE_DTYPES
 
 
 def _resolve_kvarn_cache_layout(cfg, *, beta_profile: bool = False) -> str:
@@ -320,9 +326,9 @@ def _resolve_kvarn_cache_layout(cfg, *, beta_profile: bool = False) -> str:
     if layout != KVARN_CACHE_LAYOUT_XE2_DPAS:
         raise RuntimeError(f"Unsupported KVarN cache layout: {layout}")
     actual = (cfg.head_dim, cfg.group, cfg.key_bits, cfg.value_bits)
-    if actual != (256, 128, 4, 4):
+    if actual not in ((256, 128, 4, 4), (256, 128, 4, 2)):
         raise RuntimeError(
-            "The xe2_dpas KVarN cache layout requires D256/G128/K4V4; "
+            "The xe2_dpas KVarN cache layout requires D256/G128/K4V4 or K4V2; "
             f"got D{actual[0]}/G{actual[1]}/K{actual[2]}V{actual[3]}"
         )
     return layout
@@ -434,9 +440,9 @@ def _kvarn_native_balanced_writer_supported(
         and head_dim == 256
         and group == 128
         and key_bits == 4
-        and value_bits == 4
+        and value_bits in (2, 4)
         and num_kv_heads == 4
-        and record_bytes >= 35_072
+        and record_bytes >= 18_688 + 4_096 * value_bits
         and record_bytes % 4 == 0
         and rtn_quantile == 0.0
         and op_available
@@ -447,6 +453,7 @@ def _launch_kvarn_native_balanced_writer(
     balanced: tuple[torch.Tensor, ...],
     block_ids: torch.Tensor,
     packed_cache: torch.Tensor,
+    value_bits: int = 4,
 ) -> None:
     """Write balanced full pages directly into xe2_dpas cache records.
 
@@ -460,6 +467,7 @@ def _launch_kvarn_native_balanced_writer(
         block_ids,
         packed_cache,
         True,
+        **kvarn_native_value_bits_kwargs(value_bits),
     )
 
 
@@ -802,6 +810,7 @@ class KVarNAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "kvarn_k4v4_g128",
         "kvarn_k4v4_g128_compact",
+        "kvarn_k4v2_g128_compact",
         "kvarn_k4v2_g128",
         "kvarn_k4v4_g64",
         "kvarn_k4v2_g64",
@@ -1077,6 +1086,9 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         self._kvarn_xpu_beta_profile = _kvarn_xpu_beta_profile_enabled(
             vllm_config.cache_config.cache_dtype
         )
+        self._kvarn_xpu_k4v2_profile = self._kvarn_xpu_beta_profile and (
+            vllm_config.cache_config.cache_dtype == "kvarn_k4v2_g128_compact"
+        )
 
         # Persistent cu_seqlens buffers (allocated lazily in build()).
         self._cu_seqlens_q_buf: torch.Tensor = None  # type: ignore[assignment]
@@ -1112,11 +1124,21 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
     def _lifecycle_policy(self) -> tuple[int, int, int, str]:
         prefill_window = _kvarn_prefill_fp16_window_blocks()
         beta_profile = getattr(self, "_kvarn_xpu_beta_profile", False)
+        k4v2_profile = getattr(self, "_kvarn_xpu_k4v2_profile", False)
+        # Keep a recent FP16 floor for two-bit values. The prefill window
+        # already covers this decode high-water mark.
+        window_default = (
+            _KVARN_XPU_K4V2_DECODE_WINDOW
+            if k4v2_profile
+            else _KVARN_XPU_BETA_DECODE_WINDOW
+        )
         decode_window = _kvarn_decode_fp16_window_blocks(
-            _KVARN_XPU_BETA_DECODE_WINDOW if beta_profile else 0
+            window_default if beta_profile else 0
         )
         decode_low_water = (
-            _kvarn_decode_fp16_low_water_blocks(decode_window, 0)
+            _kvarn_decode_fp16_low_water_blocks(
+                decode_window, _KVARN_XPU_K4V2_DECODE_LOW_WATER if k4v2_profile else 0
+            )
             if decode_window
             else 0
         )
@@ -2233,14 +2255,17 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         self._bound_qlen1_inline_v2_execution_logged = False
         self._bound_qlen1_inline_v2_binding_epoch = 0
         self._bound_qlen1_inline_v2_plan: _KVarNBoundQlen1InlinePlanV2 | None = None
+        native_split_policy = KVARN_NATIVE_SPLIT_POLICY_FIXED
+        if self._kvarn_xpu_beta_profile:
+            native_split_policy = (
+                KVARN_NATIVE_SPLIT_POLICY_B70_K4V2_SHORT_Q6_ID18_V1
+                if self.kvarn_config.value_bits == 2
+                else KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1
+            )
         (
             self._kvarn_native_split_policy,
             self._kvarn_native_max_splits,
-        ) = kvarn_native_split_policy_requested(
-            KVARN_NATIVE_SPLIT_POLICY_B70_Q6_ID18_V1
-            if self._kvarn_xpu_beta_profile
-            else KVARN_NATIVE_SPLIT_POLICY_FIXED
-        )
+        ) = kvarn_native_split_policy_requested(native_split_policy)
         (
             self._kvarn_native_kernel_variant_name,
             self._kvarn_native_kernel_variant,
@@ -2308,14 +2333,14 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 num_kv_heads=self.num_kv_heads,
                 record_bytes=self.kvarn_config.record_bytes,
                 op_available=kvarn_native_layout_abi_supported(
-                    "kvarn_pack_balanced_kv"
+                    "kvarn_pack_balanced_kv", self.kvarn_config.value_bits
                 ),
                 rtn_quantile=0.0,
             )
             if not supported:
                 raise RuntimeError(
                     "KVARN_FLUSH_WRITER=native_xe2 requires the xe2_dpas "
-                    "D256/G128/K4V4/Hkv4 cache ABI and a matching "
+                    "D256/G128/K4V4 or K4V2/Hkv4 cache ABI and a matching "
                     "kvarn_pack_balanced_kv extension; percentile RTN is "
                     "not supported"
                 )
@@ -2820,7 +2845,10 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 )
                 dummy_blocks = torch.zeros(1, dtype=torch.long, device=device)
                 _launch_kvarn_native_balanced_writer(
-                    balanced, dummy_blocks, dummy_cache
+                    balanced,
+                    dummy_blocks,
+                    dummy_cache,
+                    **kvarn_native_value_bits_kwargs(cfg.value_bits),
                 )
             else:
                 k_dummy = torch.zeros(
@@ -2942,11 +2970,11 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             and Hk == 4
             and cfg.group == 128
             and cfg.key_bits == 4
-            and cfg.value_bits == 4
-            and cfg.record_bytes >= 35_072
+            and cfg.value_bits in (2, 4)
+            and cfg.record_bytes >= 18_688 + 4_096 * cfg.value_bits
             and cfg.record_bytes % 4 == 0
             and int(getattr(self, "sliding_window", 0) or 0) == 0
-            and kvarn_native_decode_abi_supported(True)
+            and kvarn_native_decode_abi_supported(True, cfg.value_bits)
         )
         native_key = None
         if use_native_scratch:
@@ -3237,7 +3265,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         kp = torch.zeros(B * n_blocks * G, Hk, D, dtype=torch.float16, device=device)
         vp = torch.zeros_like(kp)
         cu_k = torch.arange(B + 1, dtype=torch.int32, device=device) * (n_blocks * G)
-        _kvarn_build_packed_kv_kernel[(B * n_blocks, Hk)](
+        _kvarn_build_packed_kv_kernel[(n_blocks, B, Hk)](
             bt,
             sl,
             cu_k,
@@ -3255,7 +3283,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             pool_k.stride(2),
             kp.stride(0),
             kp.stride(1),
-            MAX_BLOCKS_PER_REQ=n_blocks,
             D=D,
             GROUP=G,
             K_BITS=cfg.key_bits,
@@ -3609,7 +3636,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                         slot_t,
                         cfg,
                     )
-                    _launch_kvarn_native_balanced_writer(balanced, bid_t, kvc)
+                    _launch_kvarn_native_balanced_writer(
+                        balanced,
+                        bid_t,
+                        kvc,
+                        **kvarn_native_value_bits_kwargs(cfg.value_bits),
+                    )
                     continue
                 # One gather per chunk (was nB tiny .float() ops).
                 K_rot = impl._tail_K_pool.index_select(0, slot_t).float()  # [nB,G,Hk,D]
@@ -3619,7 +3651,12 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 V_tiles = V_rot.permute(0, 2, 1, 3).reshape(nB * Hk, G, D)
                 if writer == _KVARN_FLUSH_WRITER_NATIVE_XE2:
                     balanced = _sinkhorn_balance_kv(K_tiles, V_tiles, cfg)
-                    _launch_kvarn_native_balanced_writer(balanced, bid_t, kvc)
+                    _launch_kvarn_native_balanced_writer(
+                        balanced,
+                        bid_t,
+                        kvc,
+                        **kvarn_native_value_bits_kwargs(cfg.value_bits),
+                    )
                     continue
                 K_out, V_out = _sinkhorn_pack_kv(
                     K_tiles,
@@ -3790,7 +3827,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 is_capturing=is_capturing,
                 op_available=(
                     self._kvarn_qkv_scatter_op is not None
-                    and kvarn_native_decode_abi_supported(False)
+                    and kvarn_native_decode_abi_supported(
+                        False, self.kvarn_config.value_bits
+                    )
                     and kvarn_native_layout_abi_supported(
                         self._kvarn_qkv_scatter_op_name
                     )
@@ -3946,6 +3985,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         bound_native_decode = KVarNBoundNativeDecodePlanV2(
             max_batch=qualified_batch_limit,
             dpas_layout=self._kvarn_dpas_layout,
+            value_bits=self.kvarn_config.value_bits,
             q_rot_fp16=self._q_rot_fp16_buf,
             fused_out=self._fused_out_buf,
             native_output_fp16=self._native_output_fp16_buf,
@@ -4289,7 +4329,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 ),
                 is_capturing=is_capturing,
                 op_available=(
-                    kvarn_native_decode_abi_supported(False)
+                    kvarn_native_decode_abi_supported(
+                        False, self.kvarn_config.value_bits
+                    )
                     and kvarn_native_layout_abi_supported("kvarn_hadamard_scatter")
                 ),
             )
@@ -4909,12 +4951,14 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             or self.num_kv_heads != 4
             or cfg.group != 128
             or cfg.key_bits != 4
-            or cfg.value_bits != 4
-            or cfg.record_bytes < 35_072
+            or cfg.value_bits not in (2, 4)
+            or cfg.record_bytes < 18_688 + 4_096 * cfg.value_bits
             or cfg.record_bytes % 4 != 0
         ):
             return False, "unsupported_cache_abi"
-        if not kvarn_native_layout_abi_supported("kvarn_materialize_packed_kv"):
+        if not kvarn_native_layout_abi_supported(
+            "kvarn_materialize_packed_kv", cfg.value_bits
+        ):
             return False, "native_op_unavailable"
         if kv_cache.device.type != "xpu":
             return False, "not_xpu"
@@ -4986,6 +5030,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             value_output,
             max_seq_len,
             self._kvarn_dpas_layout,
+            **kvarn_native_value_bits_kwargs(self.kvarn_config.value_bits),
         )
 
     def _launch_reference_cached_prefill_materializer(
@@ -5006,7 +5051,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             _kvarn_build_packed_kv_kernel,
         )
 
-        grid = (seq_lens.shape[0] * max_blocks, self.num_kv_heads)
+        grid = (max_blocks, seq_lens.shape[0], self.num_kv_heads)
         _kvarn_build_packed_kv_kernel[grid](
             block_table,
             seq_lens,
@@ -5025,7 +5070,6 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
             self._tail_K_pool.stride(2),
             key_output.stride(0),
             key_output.stride(1),
-            MAX_BLOCKS_PER_REQ=max_blocks,
             D=self.head_size,
             GROUP=group,
             K_BITS=cfg.key_bits,
