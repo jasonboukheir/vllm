@@ -1125,13 +1125,20 @@ def _physical_blocks_per_request(
     return cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
 
 
-def _independent_pool_bytes_per_request(
-    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+def _independent_pool_bytes_for_requests(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    num_requests: int,
 ) -> int:
+    """Size attention capacity while retaining every recurrent scheduler slot."""
+    max_num_seqs = getattr(
+        getattr(vllm_config, "scheduler_config", None), "max_num_seqs", 1
+    )
     return sum(
         len(group.layer_names)
         * group.kv_cache_spec.page_size_bytes
         * _physical_blocks_per_request(vllm_config, group)
+        * (max_num_seqs if isinstance(group.kv_cache_spec, MambaSpec) else num_requests)
         for group in kv_cache_groups
     )
 
@@ -2871,22 +2878,22 @@ def get_kv_cache_configs(
                 adjusted_memory.append(avail_mem)
                 continue
             if _uses_independent_kvarn_pools(vllm_config, groups):
-                bytes_per_unit = _independent_pool_bytes_per_request(
-                    vllm_config, groups
+                adjusted_memory.append(
+                    _independent_pool_bytes_for_requests(vllm_config, groups, override)
+                    + _null_block_bytes(vllm_config, groups)
                 )
-                unit_name = "resident requests"
-                null_bytes = _null_block_bytes(vllm_config, groups)
-            else:
-                bytes_per_unit = _pool_bytes_per_block(groups)
-                unit_name = "blocks"
-                null_bytes = 0
+                logger.info(
+                    "Overriding attention KV cache capacity to %d resident requests",
+                    override,
+                )
+                continue
+            bytes_per_unit = _pool_bytes_per_block(groups)
             logger.info(
-                "Overriding KV cache capacity from %d to %d %s",
+                "Overriding KV cache capacity from %d to %d blocks",
                 avail_mem // bytes_per_unit,
                 override,
-                unit_name,
             )
-            adjusted_memory.append(override * bytes_per_unit + null_bytes)
+            adjusted_memory.append(override * bytes_per_unit)
         available_memory = adjusted_memory
 
     # Reserve the null block BlockPool permanently holds back, so auto-fit and
