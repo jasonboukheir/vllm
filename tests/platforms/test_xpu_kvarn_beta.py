@@ -106,7 +106,14 @@ def test_kvarn_beta_accepts_supported_eager_text_configuration() -> None:
 
 @pytest.mark.parametrize(
     "draft_dtype",
-    [None, "kvarn_k4v2_g128_compact", "kvarn_k4v4_g128_compact", "auto", "bf16"],
+    [
+        None,
+        "kvarn_k4v2_g128_compact",
+        "kvarn_k4v4_g128_compact",
+        "bfloat16",
+        "auto",
+        "bf16",
+    ],
 )
 def test_k4v2_mtp_draft_cache_contract(draft_dtype):
     config = _mtp_config()
@@ -119,9 +126,10 @@ def test_k4v2_mtp_draft_cache_contract(draft_dtype):
         _check_kvarn_beta_unsupported_config(config, CUDAGraphMode.NONE)
 
 
-def test_k4v4_mtp_rejects_lower_precision_draft_cache():
+@pytest.mark.parametrize("draft_dtype", ["kvarn_k4v2_g128_compact", "bfloat16"])
+def test_k4v4_mtp_rejects_unqualified_draft_cache(draft_dtype):
     config = _mtp_config()
-    config.speculative_config.kv_cache_dtype = "kvarn_k4v2_g128_compact"
+    config.speculative_config.kv_cache_dtype = draft_dtype
     with pytest.raises(ValueError, match="speculative decoding/MTP"):
         _check_kvarn_beta_unsupported_config(config, CUDAGraphMode.NONE)
 

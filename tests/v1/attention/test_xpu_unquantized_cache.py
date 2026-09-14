@@ -37,3 +37,117 @@ def test_explicit_unquantized_cache_preserves_values_and_sparse_slots(dtype_name
         ops.reshape_and_cache_flash(
             key, value, cache_k, wrong, slots, dtype_name, scale, scale
         )
+
+
+@pytest.mark.parametrize("padding", [0.0, 123.0])
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("query_len", [1, 3, 129])
+@torch.inference_mode()
+def test_bf16_draft_paged_attention_matches_independent_causal_reference(
+    batch_size, query_len, padding
+):
+    """MTP and cached prefill must respect sparse pages and rejected future rows."""
+    if not torch.xpu.is_available():
+        pytest.skip("requires XPU")
+    import torch.nn.functional as F
+
+    from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+    torch.manual_seed(43)
+    device, dtype = "xpu", torch.bfloat16
+    block_size, heads, kv_heads, dim = 128, 24, 4, 256
+    lengths = [257 + i * 128 for i in range(batch_size)]
+    max_blocks = (max(lengths) + block_size - 1) // block_size
+    pages = torch.randperm(batch_size * max_blocks).reshape(batch_size, max_blocks)
+    # Serving starts with zeroed pools; reused slots contain finite past K/V.
+    cache_k = torch.full(
+        (batch_size * max_blocks, block_size, kv_heads, dim),
+        padding,
+        device=device,
+        dtype=dtype,
+    )
+    cache_v = torch.full_like(cache_k, -padding)
+    keys, values = [], []
+    for i, length in enumerate(lengths):
+        key = torch.randn((length, kv_heads, dim), device=device, dtype=dtype)
+        value = torch.randn_like(key)
+        keys.append(key)
+        values.append(value)
+        slots = (
+            pages[i, torch.arange(length) // block_size] * block_size
+            + torch.arange(length) % block_size
+        ).to(device)
+        scale = torch.ones(1, device=device)
+        ops.reshape_and_cache_flash(
+            key, value, cache_k, cache_v, slots, "bfloat16", scale, scale
+        )
+
+    query = torch.randn(
+        (batch_size * query_len, heads, dim), device=device, dtype=dtype
+    )
+    output = torch.full_like(query, float("nan"))
+    block_table = pages.to(device=device, dtype=torch.int32)
+    cu_query = (
+        torch.arange(batch_size + 1, device=device, dtype=torch.int32) * query_len
+    )
+    seq_lens = torch.tensor(lengths, device=device, dtype=torch.int32)
+
+    def execute():
+        flash_attn_varlen_func(
+            q=query,
+            k=cache_k,
+            v=cache_v,
+            out=output,
+            cu_seqlens_q=cu_query,
+            seqused_k=seq_lens,
+            max_seqlen_q=query_len,
+            max_seqlen_k=max(lengths),
+            softmax_scale=dim**-0.5,
+            causal=True,
+            block_table=block_table,
+        )
+        assert torch.isfinite(output).all()
+        return output.clone()
+
+    expected = []
+    for i, length in enumerate(lengths):
+        causal = torch.arange(length, device=device)[None, :] <= (
+            torch.arange(query_len, device=device)[:, None] + length - query_len
+        )
+        expected.append(
+            F.scaled_dot_product_attention(
+                query[i * query_len : (i + 1) * query_len]
+                .float()
+                .transpose(0, 1)[None],
+                keys[i].float().transpose(0, 1)[None],
+                values[i].float().transpose(0, 1)[None],
+                attn_mask=causal,
+                enable_gqa=True,
+                scale=dim**-0.5,
+            )[0].transpose(0, 1)
+        )
+    original = execute()
+    torch.testing.assert_close(
+        original.float(), torch.cat(expected), atol=0.01, rtol=0.02
+    )
+    if query_len > 1:
+        saved = []
+        for i, length in enumerate(lengths):
+            page, offset = (
+                pages[i, (length - 1) // block_size].item(),
+                (length - 1) % block_size,
+            )
+            saved.append(cache_v[page, offset].clone())
+            cache_v[page, offset].fill_(64)
+        poisoned = execute().view(batch_size, query_len, heads, dim)
+        torch.testing.assert_close(
+            poisoned[:, :-1], original.view_as(poisoned)[:, :-1], atol=0, rtol=0
+        )
+        assert (poisoned[:, -1] - original.view_as(poisoned)[:, -1]).abs().max() > 0.01
+        for i, length in enumerate(lengths):
+            page, offset = (
+                pages[i, (length - 1) // block_size].item(),
+                (length - 1) % block_size,
+            )
+            cache_v[page, offset].copy_(saved[i])
+    torch.testing.assert_close(execute(), original, atol=0, rtol=0)

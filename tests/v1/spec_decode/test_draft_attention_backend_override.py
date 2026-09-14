@@ -7,6 +7,7 @@ assert on the config ``load_eagle_model`` hands to ``get_model``.
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -88,3 +89,43 @@ def test_override_does_not_mutate_the_target_config():
     cfg = _config("FLASHINFER", "TRITON_ATTN")
     _capture_draft_config(cfg)
     assert cfg.attention_config.backend == "FLASHINFER"
+
+
+@pytest.mark.parametrize(
+    "draft_dtype",
+    ["kvarn_k4v2_g128_compact", "kvarn_k4v4_g128_compact", "bfloat16"],
+)
+def test_v1_mtp_draft_precision_keeps_target_config_and_selects_own_backend(
+    draft_dtype,
+):
+    """A BF16 draft must not inherit the target's packed KVarN reader."""
+    import torch
+
+    from vllm.platforms.xpu import XPUPlatform
+    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+
+    cfg = _config("KVARN", None)
+    cfg.cache_config.cache_dtype = "kvarn_k4v2_g128_compact"
+    cfg.speculative_config.kv_cache_dtype = draft_dtype
+    proposer = SimpleNamespace(
+        vllm_config=cfg, speculative_config=cfg.speculative_config
+    )
+    used = SpecDecodeBaseProposer._create_draft_vllm_config(proposer)
+    assert cfg.cache_config.cache_dtype == "kvarn_k4v2_g128_compact"
+    assert cfg.attention_config.backend == "KVARN"
+    assert used.cache_config.cache_dtype == draft_dtype
+    assert used.attention_config.backend is None
+    selector = SimpleNamespace(
+        kv_cache_dtype=used.cache_config.cache_dtype,
+        dtype=torch.bfloat16,
+        use_mla=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+    )
+    backend = XPUPlatform.get_attn_backend_cls(None, selector)
+    expected = (
+        "FlashAttentionBackend"
+        if draft_dtype == "bfloat16"
+        else "KVarNAttentionBackend"
+    )
+    assert backend.rsplit(".", 1)[-1] == expected
