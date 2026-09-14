@@ -3,8 +3,14 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from vllm.model_executor.layers.quantization.kvarn.config import KVarNConfig
+from vllm.v1.attention.backends.kvarn_attn import (
+    KVarNAttentionImpl,
+    KVarNMetadata,
+    _build_hadamard,
+)
 from vllm.v1.attention.ops.kvarn_store import _pack_dpas_k4, _pack_dpas_v
 from vllm.v1.attention.ops.triton_kvarn_decode import _kvarn_build_packed_kv_kernel
 
@@ -102,3 +108,75 @@ def test_materializer_ragged_packed_and_resident_pages(value_bits, dpas):
         assert torch.equal(cache, before)
         compiled_hashes.add(compiled.hash)
     assert len(compiled_hashes) == 1
+
+    if dpas:
+        # Actual MTP verification must consume both independent requests even
+        # when their combined history exceeds the shared materialization area.
+        impl = object.__new__(KVarNAttentionImpl)
+        impl.kvarn_config = cfg
+        impl.num_heads, impl.num_kv_heads, impl.head_size = 24, 4, 256
+        impl.scale, impl.fa_version = 256**-0.5, None
+        impl._kvarn_dpas_layout = True
+        impl._kvarn_cache_layout = "xe2_dpas"
+        impl._kvarn_cached_prefill_materializer = "native_xe2"
+        impl._block_lookup_size = 3
+        impl._block_to_slot_t = lookup
+        impl._tail_K_pool, impl._tail_V_pool = kp, vp
+        impl._H_fp16 = _build_hadamard(256, torch.device("xpu")).half()
+        md = KVarNMetadata(
+            seq_lens=lengths,
+            seq_lens_cpu=[257, 128],
+            slot_mapping=torch.zeros(5, dtype=torch.int64, device="xpu"),
+            block_table=bt,
+            query_start_loc=torch.tensor([0, 3, 5], dtype=torch.int32, device="xpu"),
+            num_actual_tokens=5,
+            max_query_len=3,
+            max_seq_len=257,
+            is_prefill=True,
+            num_decodes=2,
+            num_decode_tokens=5,
+            has_cached_multiquery=True,
+        )
+        query = torch.randn(5, 24, 256, dtype=torch.float16, device="xpu")
+        rotated = (query.reshape(-1, 256) @ impl._H_fp16).reshape_as(query).float()
+        expected = []
+        for qs, qe, ks, ke in [(0, 3, 0, 257), (3, 5, 257, 385)]:
+            mask = torch.arange(ke - ks, device="xpu")[None, :] <= (
+                torch.arange(qe - qs, device="xpu")[:, None] + ke - ks - qe + qs
+            )
+            expected.append(
+                F.scaled_dot_product_attention(
+                    rotated[qs:qe].transpose(0, 1)[None],
+                    expected_k[ks:ke].to("xpu").float().transpose(0, 1)[None],
+                    expected_v[ks:ke].to("xpu").float().transpose(0, 1)[None],
+                    attn_mask=mask,
+                    scale=impl.scale,
+                    enable_gqa=True,
+                )[0].transpose(0, 1)
+            )
+        expected = torch.cat(expected)
+        expected = (expected.reshape(-1, 256) @ impl._H_fp16.float()).reshape_as(query)
+        for capacity in (385, 260):
+            key_storage = torch.full(
+                (capacity + 7, 4, 256), 37, dtype=torch.float16, device="xpu"
+            )
+            value_storage = torch.full_like(key_storage, -37)
+            impl._fa_K_buf, impl._fa_V_buf = (
+                key_storage[:capacity],
+                value_storage[:capacity],
+            )
+            pointers = (impl._fa_K_buf.data_ptr(), impl._fa_V_buf.data_ptr())
+            for _ in range(2):
+                result = impl._verify_decode_path(query, cache, md)
+                assert torch.isfinite(result).all()
+                torch.testing.assert_close(
+                    result.float(), expected, atol=0.01, rtol=0.02
+                )
+                assert (key_storage[capacity:] == 37).all()
+                assert (value_storage[capacity:] == -37).all()
+                assert (
+                    impl._fa_K_buf.data_ptr(),
+                    impl._fa_V_buf.data_ptr(),
+                ) == pointers
+                assert torch.equal(cache, before)
+        torch.xpu.synchronize()
