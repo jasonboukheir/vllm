@@ -1629,6 +1629,72 @@ def test_kvarn_independent_pools_keep_compatible_layers_together(
     )
 
 
+@pytest.mark.parametrize("target_bits,draft_bits", [(4, 4), (2, 2), (2, 4)])
+@pytest.mark.parametrize("max_num_seqs", [1, 4])
+@pytest.mark.parametrize("override", [None, 1, 2])
+def test_kvarn_capacity_override_preserves_all_recurrent_slots(
+    target_bits, draft_bits, max_num_seqs, override
+):
+    """An attention-capacity override must still fund every scheduler slot."""
+    from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionBackend
+    from vllm.v1.kv_cache_interface import get_kv_quant_mode
+
+    def attention(bits):
+        return KVarNAttentionBackend.customize_spec(
+            new_kv_cache_spec(
+                block_size=128,
+                num_kv_heads=4,
+                head_size=256,
+                dtype=torch.uint8,
+                kv_quant_mode=get_kv_quant_mode(f"kvarn_k4v{bits}_g128_compact"),
+            )
+        )
+
+    target, draft = attention(target_bits), attention(draft_bits)
+    mamba = new_mamba_spec(
+        block_size=262144,
+        shapes=((1_624_064,),),
+        dtypes=(torch.bfloat16,),
+        num_speculative_blocks=2,
+    )
+    specs = {f"target.{i}": target for i in range(16)}
+    specs["draft"] = draft
+    specs.update({f"mamba.{i}": mamba for i in range(48)})
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=262144, original_max_model_len=262144
+        ),
+        cache_config=SimpleNamespace(
+            cache_dtype=f"kvarn_k4v{target_bits}_g128_compact",
+            mamba_cache_mode="none",
+            num_gpu_blocks_override=override,
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs, disable_hybrid_kv_cache_manager=False
+        ),
+        speculative_config=None,
+        kv_transfer_config=None,
+    )
+    attention_page_bytes = 16 * target.page_size_bytes + draft.page_size_bytes
+    recurrent_bytes = (max_num_seqs * 3 + 1) * 48 * mamba.page_size_bytes
+    available = (2 * 2048 + 1) * attention_page_bytes + recurrent_bytes
+    allocation = get_kv_cache_configs(config, [specs], [available])[0]
+    attention_blocks = (2 if override is None else override) * 2048 + 1
+    for group_id, group in enumerate(allocation.kv_cache_groups):
+        expected = (
+            max_num_seqs * 3 + 1
+            if isinstance(group.kv_cache_spec, MambaSpec)
+            else attention_blocks
+        )
+        assert allocation.num_blocks_for_group(group_id) == expected
+    assert sum(tensor.size for tensor in allocation.kv_cache_tensors) == (
+        attention_blocks * attention_page_bytes + recurrent_bytes
+    )
+
+
 def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
     """KVarN tiles and Mamba states retain their natural page geometry."""
     groups = [
