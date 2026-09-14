@@ -349,6 +349,98 @@ def _cached_prefill_impl() -> KVarNAttentionImpl:
     return impl
 
 
+@pytest.mark.parametrize(
+    ("lengths", "query_lengths", "capacity"),
+    [([5, 7], [2, 3], 12), ([5, 7], [2, 3], 7), ([5, 6, 7, 8], [1, 2, 3, 2], 8)],
+)
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("cpu_lengths", [True, False])
+def test_cached_multiquery_reuses_bounded_scratch_without_cross_request_history(
+    monkeypatch, lengths, query_lengths, capacity, causal, cpu_lengths
+):
+    """Uniform attention exposes wrong causal offsets and shared-buffer reuse."""
+    from vllm.v1.attention.backends import kvarn_attn
+
+    impl = _cached_prefill_impl()
+    impl.num_heads = 24
+    impl._H_fp16 = torch.eye(256, dtype=torch.float16)
+    impl._fa_K_buf = torch.empty(capacity, 4, 256, dtype=torch.float16)
+    impl._fa_V_buf = torch.empty_like(impl._fa_K_buf)
+    buffers = (impl._fa_K_buf.data_ptr(), impl._fa_V_buf.data_ptr())
+    starts = [0]
+    for length in query_lengths:
+        starts.append(starts[-1] + length)
+    blocks = [4, 1, 3, 2][: len(lengths)]
+    md = KVarNMetadata(
+        seq_lens=torch.tensor(lengths, dtype=torch.int32),
+        seq_lens_cpu=lengths if cpu_lengths else None,
+        slot_mapping=torch.arange(starts[-1]),
+        block_table=torch.tensor(blocks, dtype=torch.int32)[:, None],
+        query_start_loc=torch.tensor(starts, dtype=torch.int32),
+        num_actual_tokens=starts[-1],
+        max_query_len=max(query_lengths),
+        max_seq_len=max(lengths),
+        num_decodes=len(lengths),
+        num_decode_tokens=starts[-1],
+        is_prefill=True,
+        has_cached_multiquery=True,
+        causal=causal,
+    )
+    launches = []
+
+    def materialize(cache, table, seq, cu, key, value, max_seq):
+        assert (key.data_ptr(), value.data_ptr()) == buffers
+        assert cu.tolist()[0] == 0 and int(cu[-1]) <= capacity
+        key.zero_()
+        value.fill_(float("nan"))
+        for row, length in enumerate(seq.tolist()):
+            start, end = cu[row : row + 2].tolist()
+            assert end - start == length <= max_seq
+            value[start:end] = (
+                32 * int(table[row, 0]) + torch.arange(length)[:, None, None]
+            )
+        launches.append(seq.tolist())
+
+    def flash(query, key, value, *, cu_q, cu_k, max_q, max_k, causal):
+        rows = []
+        for row in range(len(cu_q) - 1):
+            qs, qe = cu_q[row : row + 2].tolist()
+            ks, ke = cu_k[row : row + 2].tolist()
+            assert qe - qs <= max_q and ke - ks <= max_k
+            for index in range(qe - qs):
+                limit = ke - ks - (qe - qs) + index + 1 if causal else ke - ks
+                rows.append(value[ks : ks + limit].mean(0).repeat_interleave(6, 0))
+        return torch.stack(rows)
+
+    monkeypatch.setattr(kvarn_attn, "_HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(
+        impl,
+        "_native_cached_prefill_materializer_eligibility",
+        lambda *a, **kw: (False, "CPU oracle"),
+    )
+    monkeypatch.setattr(
+        impl, "_launch_reference_cached_prefill_materializer", materialize
+    )
+    monkeypatch.setattr(impl, "_flash_varlen", flash)
+    query = torch.zeros(starts[-1], 24, 256, dtype=torch.float16)
+    cache = torch.empty(5, 4, impl.kvarn_config.record_bytes, dtype=torch.uint8)
+    result = impl._cached_multiquery_path(query, cache, md)
+    expected = []
+    for block, length, queries in zip(blocks, lengths, query_lengths):
+        for index in range(queries):
+            last_position = length - queries + index if causal else length - 1
+            expected.append(32 * block + last_position / 2)
+    torch.testing.assert_close(
+        result[:, 0, 0], torch.tensor(expected).half(), atol=0, rtol=0
+    )
+    assert torch.equal(result, result[:, :1, :1].expand_as(result))
+    assert launches == (
+        [lengths] if sum(lengths) <= capacity else [[n] for n in lengths]
+    )
+    assert (impl._fa_K_buf.data_ptr(), impl._fa_V_buf.data_ptr()) == buffers
+    assert md.query_start_loc.tolist() == starts and md.seq_lens.tolist() == lengths
+
+
 @pytest.mark.parametrize("count", [2, 3, 4])
 def test_native_verify_view_preserves_physical_pages_and_causal_prefixes(count):
     from vllm.v1.attention.backends.kvarn_attn import _native_verify_view

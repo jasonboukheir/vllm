@@ -5219,6 +5219,69 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         )
         return key_output, value_output, cu_seqlens_k, total_k, max_seq_len
 
+    def _cached_multiquery_overflow(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        md: KVarNMetadata,
+    ) -> torch.Tensor | None:
+        """Reuse bounded scratch per request when a DPAS batch cannot fit."""
+        batch_size = md.block_table.shape[0]
+        if not self._kvarn_dpas_layout or batch_size <= 1:
+            return None
+        if md.seq_lens_cpu is not None and len(md.seq_lens_cpu) >= batch_size:
+            lengths = md.seq_lens_cpu[:batch_size]
+        else:
+            lengths = md.seq_lens[:batch_size].tolist()
+        capacity = self._fa_K_buf.shape[0]
+        if sum(lengths) <= capacity or any(
+            length <= 0 or length > min(capacity, md.max_seq_len) for length in lengths
+        ):
+            return None
+        # Only the failed aggregate-materialization route needs this host read.
+        # Normal decode and batches fitting scratch retain their existing path.
+        query_starts = md.query_start_loc[: batch_size + 1].tolist()
+        if (
+            len(query_starts) != batch_size + 1
+            or query_starts[0] != 0
+            or query_starts[-1] != q.shape[0]
+            or any(
+                not 0 <= end - start <= length
+                for start, end, length in zip(query_starts, query_starts[1:], lengths)
+            )
+        ):
+            raise ValueError("invalid cached multi-query request bounds")
+        out = torch.empty_like(q)
+        for row, length in enumerate(lengths):
+            start, end = query_starts[row : row + 2]
+            if start == end:
+                continue
+            cu_q = md.query_start_loc[row : row + 2] - start
+            request_md = replace(
+                md,
+                seq_lens=md.seq_lens[row : row + 1],
+                seq_lens_cpu=[length],
+                block_table=md.block_table[row : row + 1],
+                slot_mapping=md.slot_mapping[start:end],
+                query_start_loc=cu_q,
+                num_actual_tokens=end - start,
+                max_query_len=end - start,
+                max_seq_len=length,
+                num_decodes=int(row < md.num_decodes),
+                num_decode_tokens=end - start if row < md.num_decodes else 0,
+                fa_cu_seqlens_q=cu_q,
+                fa_cu_seqlens_k=None,
+                prefill_fa_cu_seqlens_k=None,
+                native_verify_metadata=None,
+                vq_req=None,
+                vq_seqlen=None,
+                vq_qlen=0,
+            )
+            out[start:end] = self._cached_multiquery_path(
+                q[start:end], kv_cache, request_md
+            )
+        return out
+
     def _cached_multiquery_path(
         self,
         q: torch.Tensor,
@@ -5240,8 +5303,8 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         layer, per step) made MTP decode unusably slow (< 5 tok/s) and its
         transient fp32 materializations inflated the CUDA-graph memory
         estimate by GiBs, collapsing the derived KV-cache capacity. The slow
-        path remains the fallback for head_dim > 256 (FA's cap) or a batch
-        whose total KV exceeds the shared materialize scratch.
+        path remains the fallback for head_dim > 256 (FA's cap). DPAS batches
+        exceeding shared materialize scratch reuse it one request at a time.
         """
         md = attn_metadata
         B = md.block_table.shape[0]
@@ -5288,6 +5351,9 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 self._materialize_cached_prefill_kv(q, kv_cache, md)
             )
         except ValueError:
+            overflow_output = self._cached_multiquery_overflow(q, kv_cache, md)
+            if overflow_output is not None:
+                return overflow_output
             _require_kvarn_dpas_reader(dpas_layout, False, "slow multi-query decode")
             return self._decode_path_slow(q, kv_cache, md)
 
