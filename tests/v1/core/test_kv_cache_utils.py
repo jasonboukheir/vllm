@@ -1574,7 +1574,7 @@ def test_independent_kv_cache_pools_reject_kv_connectors(connector):
         kv_cache_utils._validate_kv_transfer_pool_compat(vllm_config, [config])
 
 
-@pytest.mark.parametrize("target_bits,draft_bits", [(4, 4), (2, 2), (2, 4)])
+@pytest.mark.parametrize("target_bits,draft_bits", [(4, 4), (2, 2), (2, 4), (2, 16)])
 def test_kvarn_independent_pools_keep_compatible_layers_together(
     target_bits, draft_bits
 ):
@@ -1583,6 +1583,10 @@ def test_kvarn_independent_pools_keep_compatible_layers_together(
     from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
     def attention(bits):
+        if bits == 16:
+            return new_kv_cache_spec(
+                block_size=128, num_kv_heads=4, head_size=256, dtype=torch.bfloat16
+            )
         return KVarNAttentionBackend.customize_spec(
             new_kv_cache_spec(
                 block_size=128,
@@ -1629,7 +1633,7 @@ def test_kvarn_independent_pools_keep_compatible_layers_together(
     )
 
 
-@pytest.mark.parametrize("target_bits,draft_bits", [(4, 4), (2, 2), (2, 4)])
+@pytest.mark.parametrize("target_bits,draft_bits", [(4, 4), (2, 2), (2, 4), (2, 16)])
 @pytest.mark.parametrize("max_num_seqs", [1, 4])
 @pytest.mark.parametrize("override", [None, 1, 2])
 def test_kvarn_capacity_override_preserves_all_recurrent_slots(
@@ -1640,6 +1644,10 @@ def test_kvarn_capacity_override_preserves_all_recurrent_slots(
     from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
     def attention(bits):
+        if bits == 16:
+            return new_kv_cache_spec(
+                block_size=128, num_kv_heads=4, head_size=256, dtype=torch.bfloat16
+            )
         return KVarNAttentionBackend.customize_spec(
             new_kv_cache_spec(
                 block_size=128,

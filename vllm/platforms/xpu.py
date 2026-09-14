@@ -90,8 +90,14 @@ def _check_kvarn_beta_unsupported_config(
             cache_dtype in ("kvarn_k4v4_g128_compact", "kvarn_k4v2_g128_compact")
             and getattr(spec, "method", None) == "mtp"
             and getattr(spec, "num_speculative_tokens", None) in (1, 2)
-            and getattr(spec, "kv_cache_dtype", None)
-            in (None, cache_dtype, "kvarn_k4v4_g128_compact")
+            and (
+                getattr(spec, "kv_cache_dtype", None)
+                in (None, cache_dtype, "kvarn_k4v4_g128_compact")
+                or (
+                    cache_dtype == "kvarn_k4v2_g128_compact"
+                    and spec.kv_cache_dtype == "bfloat16"
+                )
+            )
             and getattr(model.hf_config, "model_type", None) == "qwen3_5"
             and model.dtype == torch.bfloat16
             and scheduler.max_num_batched_tokens <= 2048
@@ -101,7 +107,8 @@ def _check_kvarn_beta_unsupported_config(
             raise ValueError(
                 "XPU KVarN speculative decoding/MTP is limited to one or two bundled "
                 "Qwen3.5 MTP tokens, compact K4V4/K4V2 with matching or "
-                "compact K4V4 draft cache, BF16, TP1/PP1, "
+                "compact K4V4 draft cache (or BF16 draft for compact K4V2), "
+                "BF16 compute, TP1/PP1, "
                 "max-num-batched-tokens<=2048; "
                 "disable speculation or use --kv-cache-dtype=auto"
             )
