@@ -817,12 +817,19 @@ class SpecDecodeBaseProposer:
             self.max_model_len,
         )
 
+        # CPU shadows can alias each other and the target runner's buffers.
+        # Advance each independently so one draft step cannot increment an
+        # aliased sequence length twice or mutate target-owned metadata.
         if common_attn_metadata._seq_lens_cpu is not None:
-            common_attn_metadata._seq_lens_cpu += 1
+            common_attn_metadata._seq_lens_cpu = common_attn_metadata._seq_lens_cpu + 1
         if common_attn_metadata._num_computed_tokens_cpu is not None:
-            common_attn_metadata._num_computed_tokens_cpu += 1
+            common_attn_metadata._num_computed_tokens_cpu = (
+                common_attn_metadata._num_computed_tokens_cpu + 1
+            )
         if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
-            common_attn_metadata.seq_lens_cpu_upper_bound += 1
+            common_attn_metadata.seq_lens_cpu_upper_bound = (
+                common_attn_metadata.seq_lens_cpu_upper_bound + 1
+            )
 
         return positions
 

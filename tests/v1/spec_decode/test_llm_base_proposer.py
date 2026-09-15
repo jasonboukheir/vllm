@@ -14,6 +14,7 @@ processes, so anything derived from iteration order must not leak into
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -110,3 +111,60 @@ def test_draft_layer_iteration_is_deterministic(monkeypatch: pytest.MonkeyPatch)
         assert len(proposer.draft_attn_groups) == 1
         assert proposer.draft_attn_groups[0].layer_names == expected_order
         assert proposer.block_size == KERNEL_BLOCK_SIZE
+
+
+@pytest.mark.parametrize("cpu_alias", ["same", "view", "separate", "missing"])
+@pytest.mark.parametrize("uses_mrope", [False, True])
+def test_draft_step_advances_cpu_lengths_once_without_mutating_target(
+    monkeypatch: pytest.MonkeyPatch, cpu_alias: str, uses_mrope: bool
+):
+    """Aliased CPU shadows must not flush a partly committed KV tile early."""
+    target_lengths = torch.tensor([61951, 127], dtype=torch.int32)
+    target_computed = target_lengths - 1
+    exact = {
+        "same": target_lengths,
+        "view": target_lengths[:],
+        "separate": target_lengths.clone(),
+        "missing": None,
+    }[cpu_alias]
+    metadata = SimpleNamespace(
+        seq_lens=target_lengths.clone(),
+        _seq_lens_cpu=exact,
+        _num_computed_tokens_cpu=(target_computed if cpu_alias != "missing" else None),
+        seq_lens_cpu_upper_bound=target_lengths,
+        max_seq_len=61951,
+        block_table_tensor=torch.zeros(2, 512, dtype=torch.int32),
+    )
+    proposer = EagleProposer.__new__(EagleProposer)
+    proposer.uses_mrope = uses_mrope
+    proposer.uses_xdrope_dim = 0
+    proposer.max_model_len = 262144
+    proposer.positions = target_computed.to(torch.int64)
+    proposer.mrope_positions = proposer.positions.repeat(3, 1)
+    proposer._slot_mapping_buffer = torch.zeros(2, dtype=torch.int64)
+
+    def advance_device(**kwargs):
+        # The device kernel advances once. This CPU test exercises the real
+        # proposer's independently maintained host shadows and their ownership.
+        kwargs["out_clamped_positions"].copy_(kwargs["positions_1d"] + 1)
+        kwargs["seq_lens"].add_(1)
+
+    monkeypatch.setattr(
+        llm_base_proposer, "eagle_step_update_slot_mapping_and_metadata", advance_device
+    )
+    positions = proposer.mrope_positions if uses_mrope else proposer.positions
+    for step in (1, 2):
+        positions = proposer._update_positions_dependent_metadata(
+            positions, metadata, batch_size=2, input_batch_size=2, block_size=128
+        )
+        expected = torch.tensor([61951 + step, 127 + step], dtype=torch.int32)
+        assert torch.equal(metadata.seq_lens, expected)
+        assert torch.equal(metadata.seq_lens_cpu_upper_bound, expected)
+        if exact is not None:
+            assert torch.equal(metadata._seq_lens_cpu, expected)
+            assert torch.equal(metadata._num_computed_tokens_cpu, expected - 1)
+        else:
+            assert metadata._seq_lens_cpu is None
+            assert metadata._num_computed_tokens_cpu is None
+        assert target_lengths.tolist() == [61951, 127]
+        assert target_computed.tolist() == [61950, 126]
