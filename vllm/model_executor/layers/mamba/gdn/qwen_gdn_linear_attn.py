@@ -84,6 +84,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     FLASHINFER_GDN_CHECKPOINT_ALIGNMENT,
     GDNAttentionMetadata,
 )
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -542,6 +543,12 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+    @property
+    def mamba_type(self) -> MambaAttentionBackendEnum:
+        if current_platform.is_xpu():
+            return MambaAttentionBackendEnum.QWEN_GDN_ATTN
+        return super().mamba_type
+
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:

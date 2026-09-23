@@ -8,6 +8,10 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.linear.minimax_linear_attn import (
     MiniMaxText01LinearAttention,
 )
@@ -18,6 +22,7 @@ from vllm.model_executor.layers.mamba.short_conv import ShortConv
 from vllm.model_executor.models.falcon_h1 import FalconH1ForCausalLM
 from vllm.model_executor.models.granitemoehybrid import GraniteMoeHybridForCausalLM
 from vllm.model_executor.models.zamba2 import Zamba2ForCausalLM
+from vllm.v1.attention.backends.gdn_attn import QwenGDNAttentionBackend
 from vllm.v1.attention.backends.linear_attn import LinearAttentionBackend
 from vllm.v1.attention.backends.mamba1_attn import Mamba1AttentionBackend
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionBackend
@@ -195,3 +200,19 @@ def test_mamba_layers_have_unified_interface(
     assert hasattr(layer_class, "mamba_type"), (
         f"{layer_class.__name__} should have mamba_type property"
     )
+
+
+@pytest.mark.parametrize("is_xpu", [True, False])
+def test_qwen_gdn_uses_distinct_backend_only_on_xpu(monkeypatch, is_xpu) -> None:
+    monkeypatch.setattr(
+        qwen_gdn_linear_attn, "current_platform", SimpleNamespace(is_xpu=lambda: is_xpu)
+    )
+    layer = QwenGatedDeltaNetAttention.__new__(QwenGatedDeltaNetAttention)
+    expected = (
+        MambaAttentionBackendEnum.QWEN_GDN_ATTN
+        if is_xpu
+        else MambaAttentionBackendEnum.GDN_ATTN
+    )
+    assert layer.mamba_type is expected
+    assert QwenGDNAttentionBackend.get_name() == "QWEN_GDN_ATTN"
+    assert QwenGDNAttentionBackend.get_required_prefill_chunk_size() == 64
