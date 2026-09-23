@@ -38,6 +38,20 @@ class GDNAttentionBackend(AttentionBackend):
         return True
 
 
+class QwenGDNAttentionBackend(GDNAttentionBackend):
+    """GDN backend for Qwen-specific execution constraints."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "QWEN_GDN_ATTN"
+
+    @classmethod
+    def get_required_prefill_chunk_size(cls) -> int:
+        from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+
+        return FLA_CHUNK_SIZE
+
+
 @dataclass
 class GDNAttentionMetadata:
     num_prefills: int
