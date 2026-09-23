@@ -569,3 +569,82 @@ if __name__ == "__main__":
         print("✓ Smoke test passed!")
     else:
         print("✗ Smoke test failed - differences too large")
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="requires XPU")
+@pytest.mark.parametrize("hidden_size", [512, 4096])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("weight_mode", ["none", "same_dtype", "fp32_strided"])
+@pytest.mark.parametrize("strided", [False, True])
+def test_xpu_residual_rms_norm_is_functional_and_batch_invariant(
+    hidden_size, dtype, weight_mode, strided
+):
+    """Retain FP32-add semantics across the native launch's 256-row boundary."""
+    torch.manual_seed(704)
+    probe = torch.randn(hidden_size, dtype=dtype, device="xpu")
+    residual_probe = torch.randn_like(probe)
+    weight = None
+    if weight_mode == "same_dtype":
+        weight = torch.randn_like(probe)
+    elif weight_mode == "fp32_strided":
+        weight = torch.randn(hidden_size * 2, device="xpu")[::2] + 1.0
+        # Preserve a noncontiguous weight after the Gemma-style FP32 offset.
+        backing = torch.empty(hidden_size * 2, device="xpu")
+        backing[::2] = weight
+        weight = backing[::2]
+    weight_before = None if weight is None else weight.clone()
+    merged = probe.float() + residual_probe.float()
+    reference = merged * torch.rsqrt(merged.square().mean() + 1e-6)
+    if weight is not None:
+        reference *= weight.float()
+    reference = reference.to(dtype)
+    first = None
+    for rows in (1, 4, 255, 256, 257, 300):
+        shape = (1, rows, hidden_size * (2 if strided else 1))
+        x = torch.randn(shape, dtype=dtype, device="xpu")
+        residual = torch.randn_like(x)
+        if strided:
+            x, residual = x[..., ::2], residual[..., ::2]
+        index = rows // 2
+        x[0, index] = probe
+        residual[0, index] = residual_probe
+        x_before, residual_before = x.clone(), residual.clone()
+        out, residual_out = rms_norm_batch_invariant(x, weight, 1e-6, residual)
+        assert out.shape == residual_out.shape == x.shape
+        for result in (out, residual_out):
+            assert result.data_ptr() not in (x.data_ptr(), residual.data_ptr())
+        assert out.data_ptr() != residual_out.data_ptr()
+        torch.testing.assert_close(x, x_before, rtol=0, atol=0)
+        torch.testing.assert_close(residual, residual_before, rtol=0, atol=0)
+        if weight is not None:
+            torch.testing.assert_close(weight, weight_before, rtol=0, atol=0)
+        torch.testing.assert_close(
+            residual_out[0, index], merged.to(dtype), rtol=0, atol=0
+        )
+        torch.testing.assert_close(out[0, index], reference, rtol=0.01, atol=0.002)
+        observed = (out[0, index], residual_out[0, index])
+        if first is None:
+            first = tuple(t.clone() for t in observed)
+        else:
+            for actual, expected in zip(observed, first):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_non_xpu_residual_rms_norm_preserves_native_dispatch(monkeypatch):
+    """XPU's functional contract must not replace the existing native path."""
+    from types import SimpleNamespace
+
+    import vllm._custom_ops as ops
+    from vllm.model_executor.determinism import batch_invariant
+
+    calls = []
+    monkeypatch.setattr(
+        batch_invariant, "current_platform", SimpleNamespace(is_xpu=lambda: False)
+    )
+    monkeypatch.setattr(ops, "fused_add_rms_norm", lambda *args: calls.append(args))
+    x, residual, weight = torch.zeros(1, 4), torch.ones(1, 4), torch.ones(4)
+    out, residual_out = rms_norm_batch_invariant(x, weight, 1e-6, residual)
+    assert out is x and residual_out is residual
+    assert len(calls) == 1
+    assert calls[0][0] is x and calls[0][1] is residual
+    assert calls[0][2] is weight and calls[0][3] == 1e-6
