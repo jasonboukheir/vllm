@@ -8,6 +8,9 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.linear.minimax_linear_attn import (
     MiniMaxText01LinearAttention,
 )
@@ -18,6 +21,7 @@ from vllm.model_executor.layers.mamba.short_conv import ShortConv
 from vllm.model_executor.models.falcon_h1 import FalconH1ForCausalLM
 from vllm.model_executor.models.granitemoehybrid import GraniteMoeHybridForCausalLM
 from vllm.model_executor.models.zamba2 import Zamba2ForCausalLM
+from vllm.v1.attention.backends.gdn_attn import QwenGDNAttentionBackend
 from vllm.v1.attention.backends.linear_attn import LinearAttentionBackend
 from vllm.v1.attention.backends.mamba1_attn import Mamba1AttentionBackend
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionBackend
@@ -193,3 +197,12 @@ def test_mamba_layers_have_unified_interface(
     assert hasattr(layer_class, "mamba_type"), (
         f"{layer_class.__name__} should have mamba_type property"
     )
+
+
+def test_qwen_gdn_uses_distinct_backend() -> None:
+    mamba_type = QwenGatedDeltaNetAttention.mamba_type.__get__(object())
+
+    assert mamba_type is MambaAttentionBackendEnum.QWEN_GDN_ATTN
+    assert mamba_type.get_class() is QwenGDNAttentionBackend
+    assert QwenGDNAttentionBackend.get_name() == "QWEN_GDN_ATTN"
+    assert QwenGDNAttentionBackend.get_required_prefill_chunk_size() == 64
