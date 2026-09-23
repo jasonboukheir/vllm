@@ -32,6 +32,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.platforms.interface import Platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
 from vllm.utils.mem_constants import GiB_bytes
@@ -69,6 +70,7 @@ from vllm.v1.kv_cache_interface import (
     KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCachePoolSpec,
     KVCacheSpec,
     KVCacheSpecKind,
     KVCacheTensor,
@@ -1484,7 +1486,11 @@ def test_project_kv_cache_groups_to_worker():
     spec_b = new_kv_cache_spec(num_kv_heads=4)
 
     global_groups = [
-        KVCacheGroupSpec(["layer1", "layer2", "layer3"], spec_a),
+        KVCacheGroupSpec(
+            ["layer1", "layer2", "layer3"],
+            spec_a,
+            enable_kv_transfer=False,
+        ),
     ]
     worker_spec = {"layer1": spec_a, "layer2": spec_a}
     projected = kv_cache_utils._project_kv_cache_groups_to_worker(
@@ -1493,6 +1499,7 @@ def test_project_kv_cache_groups_to_worker():
     assert len(projected) == 1
     assert projected[0].layer_names == ["layer1", "layer2"]
     assert projected[0].kv_cache_spec is spec_a
+    assert not projected[0].enable_kv_transfer
 
     projected = kv_cache_utils._project_kv_cache_groups_to_worker(
         global_groups, {"layer4": spec_a}
@@ -1500,6 +1507,7 @@ def test_project_kv_cache_groups_to_worker():
     assert len(projected) == 1
     assert projected[0].layer_names == []
     assert projected[0].kv_cache_spec is spec_a
+    assert not projected[0].enable_kv_transfer
 
     uniform_spec = UniformTypeKVCacheSpecs(
         block_size=16,
@@ -1677,6 +1685,424 @@ if is_kv_cache_spec_uniform(specs):
         check=True,
         timeout=60,
     )
+
+
+def test_kv_cache_config_supports_independent_group_capacities():
+    """Physical cache pools may have different block counts."""
+    groups = [
+        KVCacheGroupSpec(["full"], new_kv_cache_spec(block_size=128)),
+        KVCacheGroupSpec(["mamba"], new_mamba_spec(block_size=1664)),
+    ]
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=130, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=10, group_ids=[1]),
+        ],
+    )
+
+    assert config.num_blocks_for_group(0) == 130
+    assert config.num_blocks_for_group(1) == 10
+    assert config.pool_id_for_group(0) == 0
+    assert config.pool_id_for_group(1) == 1
+    assert config.num_blocks == 10
+    assert config.max_num_blocks == 130
+    assert config.has_independent_kv_cache_pools
+    other_worker = copy.deepcopy(config)
+    other_worker.kv_cache_pools[0].num_blocks -= 1
+    with pytest.raises(AssertionError, match="physical pool topology"):
+        generate_scheduler_kv_cache_config([config, other_worker])
+
+
+def test_kv_cache_config_defaults_each_group_to_shared_capacity():
+    """Existing uniform-pool configurations retain their old behavior."""
+    groups = [
+        KVCacheGroupSpec(["full"], new_kv_cache_spec()),
+        KVCacheGroupSpec(["mamba"], new_mamba_spec()),
+    ]
+    config = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+    )
+
+    assert config.num_blocks_for_group(0) == 10
+    assert config.num_blocks_for_group(1) == 10
+    assert config.pool_id_for_group(0) == 0
+    assert config.pool_id_for_group(1) == 0
+    assert not config.has_independent_kv_cache_pools
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        "NixlConnector",
+        "MooncakeConnector",
+        "OffloadingConnector",
+        "SimpleCPUOffloadConnector",
+        "MultiConnector",
+    ],
+)
+def test_independent_kv_cache_pools_reject_kv_connectors(connector):
+    """Beta KVarN must fail closed until connectors carry physical pool IDs."""
+    groups = [
+        KVCacheGroupSpec(["full"], new_kv_cache_spec(block_size=128)),
+        KVCacheGroupSpec(["mamba"], new_mamba_spec(block_size=512)),
+    ]
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=5, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=3, group_ids=[1]),
+        ],
+    )
+    transfer = KVTransferConfig(kv_connector=connector, kv_role="kv_both")
+    vllm_config = SimpleNamespace(kv_transfer_config=transfer)
+
+    with pytest.raises(NotImplementedError, match="independent KV cache pools"):
+        kv_cache_utils._validate_kv_transfer_pool_compat(vllm_config, [config])
+
+
+@pytest.mark.parametrize("target_bits,draft_bits", [(4, 4), (2, 2), (2, 4), (2, 16)])
+def test_kvarn_independent_pools_keep_compatible_layers_together(
+    target_bits, draft_bits
+):
+    """A distinct draft precision must not fragment every target/recurrent layer."""
+    from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionBackend
+    from vllm.v1.kv_cache_interface import get_kv_quant_mode
+
+    def attention(bits):
+        if bits == 16:
+            return new_kv_cache_spec(
+                block_size=128, num_kv_heads=4, head_size=256, dtype=torch.bfloat16
+            )
+        return KVarNAttentionBackend.customize_spec(
+            new_kv_cache_spec(
+                block_size=128,
+                num_kv_heads=4,
+                head_size=256,
+                dtype=torch.uint8,
+                kv_quant_mode=get_kv_quant_mode(f"kvarn_k4v{bits}_g128_compact"),
+            )
+        )
+
+    specs = {f"target.{i}": attention(target_bits) for i in range(16)}
+    specs["draft"] = attention(draft_bits)
+    specs.update({f"mamba.{i}": new_mamba_spec(block_size=512) for i in range(48)})
+    original = specs.copy()
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
+        model_config=SimpleNamespace(max_model_len=512),
+        cache_config=SimpleNamespace(
+            cache_dtype=f"kvarn_k4v{target_bits}_g128_compact",
+            mamba_cache_mode="none",
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=3, disable_hybrid_kv_cache_manager=False
+        ),
+        speculative_config=None,
+    )
+    groups = get_kv_cache_groups(config, specs)
+    assert sorted(len(g.layer_names) for g in groups) == (
+        [17, 48] if target_bits == draft_bits else [1, 16, 48]
+    )
+    assert specs == original
+    old_groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(specs)
+    allocations = [
+        kv_cache_utils.get_kv_cache_config_from_groups(config, gs, 1 << 28)
+        for gs in (old_groups, groups)
+    ]
+    assert get_kv_cache_capacity(config, allocations[0]) == get_kv_cache_capacity(
+        config, allocations[1]
+    )
+    assert sum(t.size for t in allocations[0].kv_cache_tensors) == sum(
+        t.size for t in allocations[1].kv_cache_tensors
+    )
+
+
+@pytest.mark.parametrize("target_bits,draft_bits", [(4, 4), (2, 2), (2, 4), (2, 16)])
+@pytest.mark.parametrize("max_num_seqs", [1, 4])
+@pytest.mark.parametrize("override", [None, 1, 2])
+def test_kvarn_capacity_override_preserves_all_recurrent_slots(
+    target_bits, draft_bits, max_num_seqs, override
+):
+    """An attention-capacity override must still fund every scheduler slot."""
+    from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionBackend
+    from vllm.v1.kv_cache_interface import get_kv_quant_mode
+
+    def attention(bits):
+        if bits == 16:
+            return new_kv_cache_spec(
+                block_size=128, num_kv_heads=4, head_size=256, dtype=torch.bfloat16
+            )
+        return KVarNAttentionBackend.customize_spec(
+            new_kv_cache_spec(
+                block_size=128,
+                num_kv_heads=4,
+                head_size=256,
+                dtype=torch.uint8,
+                kv_quant_mode=get_kv_quant_mode(f"kvarn_k4v{bits}_g128_compact"),
+            )
+        )
+
+    target, draft = attention(target_bits), attention(draft_bits)
+    mamba = new_mamba_spec(
+        block_size=262144,
+        shapes=((1_624_064,),),
+        dtypes=(torch.bfloat16,),
+        num_speculative_blocks=2,
+    )
+    specs = {f"target.{i}": target for i in range(16)}
+    specs["draft"] = draft
+    specs.update({f"mamba.{i}": mamba for i in range(48)})
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
+        model_config=SimpleNamespace(
+            max_model_len=262144, original_max_model_len=262144
+        ),
+        cache_config=SimpleNamespace(
+            cache_dtype=f"kvarn_k4v{target_bits}_g128_compact",
+            mamba_cache_mode="none",
+            num_gpu_blocks_override=override,
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs, disable_hybrid_kv_cache_manager=False
+        ),
+        speculative_config=None,
+        kv_transfer_config=None,
+    )
+    attention_page_bytes = 16 * target.page_size_bytes + draft.page_size_bytes
+    recurrent_bytes = (max_num_seqs * 3 + 1) * 48 * mamba.page_size_bytes
+    available = (2 * 2048 + 1) * attention_page_bytes + recurrent_bytes
+    allocation = get_kv_cache_configs(config, [specs], [available])[0]
+    attention_blocks = (2 if override is None else override) * 2048 + 1
+    for group_id, group in enumerate(allocation.kv_cache_groups):
+        expected = (
+            max_num_seqs * 3 + 1
+            if isinstance(group.kv_cache_spec, MambaSpec)
+            else attention_blocks
+        )
+        assert allocation.num_blocks_for_group(group_id) == expected
+    assert sum(tensor.size for tensor in allocation.kv_cache_tensors) == (
+        attention_blocks * attention_page_bytes + recurrent_bytes
+    )
+
+
+def test_kvarn_hybrid_config_sizes_independent_pools_by_token_capacity():
+    """KVarN tiles and Mamba states retain their natural page geometry."""
+    groups = [
+        KVCacheGroupSpec(["full.0", "full.1"], new_kv_cache_spec(block_size=128)),
+        KVCacheGroupSpec(["mamba.0"], new_mamba_spec(block_size=512)),
+    ]
+    vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
+        model_config=SimpleNamespace(max_model_len=512),
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v4_g128",
+            mamba_cache_mode="none",
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=3),
+    )
+
+    blocks_per_request = [
+        group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+        // group.kv_cache_spec.page_size_bytes
+        for group in groups
+    ]
+    bytes_per_request = sum(
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes * blocks
+        for group, blocks in zip(groups, blocks_per_request)
+    )
+    null_bytes = sum(
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in groups
+    )
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=bytes_per_request * 3 + null_bytes,
+    )
+
+    expected_pool_blocks = [blocks * 3 + 1 for blocks in blocks_per_request]
+    assert [pool.num_blocks for pool in config.kv_cache_pools or []] == (
+        expected_pool_blocks
+    )
+    assert config.num_blocks == min(expected_pool_blocks)
+    assert [tensor.pool_id for tensor in config.kv_cache_tensors] == [0, 1]
+    assert [tensor.size for tensor in config.kv_cache_tensors] == [
+        len(groups[0].layer_names)
+        * groups[0].kv_cache_spec.page_size_bytes
+        * expected_pool_blocks[0],
+        len(groups[1].layer_names)
+        * groups[1].kv_cache_spec.page_size_bytes
+        * expected_pool_blocks[1],
+    ]
+    assert sum(tensor.size for tensor in config.kv_cache_tensors) == (
+        bytes_per_request * 3 + null_bytes
+    )
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+        == bytes_per_request
+        + 2 * groups[1].kv_cache_spec.page_size_bytes * blocks_per_request[1]
+    )
+
+
+@pytest.mark.parametrize("max_num_seqs", [1, 4])
+@pytest.mark.parametrize("cache_mode,state_blocks", [("none", 3), ("align", 4)])
+def test_kvarn_estimated_context_fits_concurrent_recurrent_reservation(
+    max_num_seqs, cache_mode, state_blocks
+):
+    """Auto-fit must leave the recurrent slots that allocation actually reserves."""
+    attention = new_kv_cache_spec(block_size=128)
+    mamba = new_mamba_spec(
+        block_size=8192,
+        shapes=((attention.page_size_bytes // 4,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode=cache_mode,
+    )
+    groups = [
+        KVCacheGroupSpec(["full"], attention),
+        KVCacheGroupSpec(["mamba"], mamba),
+    ]
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
+        model_config=SimpleNamespace(max_model_len=8192),
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v4_g128_compact",
+            mamba_cache_mode=cache_mode,
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+    )
+    # Eight usable attention pages, all recurrent slots, and one null per pool.
+    available = (8 + max_num_seqs * state_blocks + 2) * attention.page_size_bytes
+    null_bytes = attention.page_size_bytes + mamba.page_size_bytes
+    estimated = kv_cache_utils._estimate_max_model_len_from_groups(
+        config, groups, available - null_bytes
+    )
+    assert estimated == 1024
+    assert config.model_config.max_model_len == 8192
+    config.model_config.max_model_len = estimated
+    allocated = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, groups, available
+    )
+    assert allocated.num_blocks_for_group(0) == 9
+    assert allocated.num_blocks_for_group(1) == 1 + max_num_seqs * state_blocks
+    config.model_config.max_model_len += 128
+    with pytest.raises(ValueError, match="Insufficient attention KV cache"):
+        kv_cache_utils.get_kv_cache_config_from_groups(config, groups, available)
+
+
+@pytest.mark.parametrize("max_model_len", [128, 8192, 65536])
+def test_mamba_none_pool_cost_is_constant_with_context_length(max_model_len):
+    spec = MambaSpec(
+        block_size=max_model_len,
+        shapes=((1_603_584,),),
+        dtypes=(torch.bfloat16,),
+        mamba_cache_mode="none",
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+    )
+
+    assert spec.max_memory_usage_bytes(vllm_config) == spec.page_size_bytes
+    assert spec.max_num_blocks_per_req(vllm_config, max_model_len) == 1
+
+
+def test_kvarn_hybrid_alignment_shares_logical_boundary_not_physical_page():
+    cache_config = SimpleNamespace(
+        cache_dtype="kvarn_k4v4_g128",
+        block_size=128,
+        mamba_block_size=8192,
+        mamba_cache_mode="align",
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(),
+    )
+
+    Platform._align_hybrid_block_size(vllm_config, SimpleNamespace())
+
+    assert cache_config.block_size == 128
+    assert cache_config.mamba_block_size == 128
+
+
+def test_kvarn_hybrid_non_align_mode_preserves_mamba_logical_block_size():
+    cache_config = SimpleNamespace(
+        cache_dtype="kvarn_k4v4_g128",
+        block_size=128,
+        mamba_block_size=8192,
+        mamba_cache_mode="all",
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(),
+    )
+
+    Platform._align_hybrid_block_size(vllm_config, SimpleNamespace())
+
+    assert cache_config.block_size == 128
+    assert cache_config.mamba_block_size == 8192
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "is_hybrid", "expected_calls"),
+    [
+        ("kvarn_k4v4_g128_compact", True, ["hybrid"]),
+        ("kvarn_k4v4_g128_compact", False, ["heterogeneous"]),
+        ("auto", True, ["hybrid", "heterogeneous"]),
+    ],
+)
+def test_kvarn_hybrid_skips_shared_pool_heterogeneous_alignment(
+    monkeypatch, cache_dtype, is_hybrid, expected_calls
+):
+    """Independent KVarN pools must retain their natural page geometry."""
+    calls = []
+    monkeypatch.setattr(
+        Platform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        Platform,
+        "_align_hybrid_block_size",
+        classmethod(lambda cls, vllm_config, backend: calls.append("hybrid")),
+    )
+    monkeypatch.setattr(
+        Platform,
+        "_align_heterogeneous_kv_block_size",
+        classmethod(lambda cls, vllm_config, backend: calls.append("heterogeneous")),
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            user_specified_block_size=True,
+            cache_dtype=cache_dtype,
+            kv_cache_dtype_skip_layers=["sliding_window"],
+        ),
+        model_config=SimpleNamespace(is_hybrid=is_hybrid),
+    )
+
+    Platform.update_block_size_for_backend(vllm_config)
+
+    assert calls == expected_calls
 
 
 @pytest.mark.parametrize(
@@ -1861,6 +2287,28 @@ def test_get_max_concurrency_for_kv_cache_config():
         vllm_config, kv_cache_config_scheduler_shape
     ) == get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config_uniform_group
+    )
+
+    # A physical pool may own more than one logical group. Its per-request
+    # demand is the sum of those groups, not the largest individual demand.
+    kv_cache_config_multi_group_pool = KVCacheConfig(
+        num_blocks=1153 * 3,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer_0"], full_attention_spec),
+            KVCacheGroupSpec(["layer_1"], sliding_window_spec),
+            KVCacheGroupSpec(["layer_2"], full_attention_spec),
+        ],
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=1153 * 3 + 1, group_ids=[0, 1]),
+            KVCachePoolSpec(num_blocks=1024 * 4 + 1, group_ids=[2]),
+        ],
+    )
+    assert (
+        get_max_concurrency_for_kv_cache_config(
+            vllm_config, kv_cache_config_multi_group_pool
+        )
+        == 3
     )
 
 

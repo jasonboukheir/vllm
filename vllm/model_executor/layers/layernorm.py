@@ -9,6 +9,7 @@ import torch.nn.functional as F
 # Import kernels
 import vllm.kernels  # noqa: F401
 from vllm import envs, ir
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
@@ -147,6 +148,17 @@ class GemmaRMSNorm(CustomOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            self._xpu_kvarn_request_stable_rmsnorm = False
+        else:
+            from vllm.model_executor.determinism.request_stable_linear import (
+                use_xpu_kvarn_request_stable_rmsnorm,
+            )
+
+            self._xpu_kvarn_request_stable_rmsnorm = (
+                use_xpu_kvarn_request_stable_rmsnorm(vllm_config)
+            )
 
     def forward_native(
         self,
@@ -155,9 +167,41 @@ class GemmaRMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
         weight = self.weight.float() + 1.0
-        if residual is None:
-            return ir.ops.rms_norm(x, weight, self.variance_epsilon)
-        return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
+
+        def apply_once(
+            part_x: torch.Tensor,
+            part_residual: torch.Tensor | None,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            if part_residual is None:
+                return ir.ops.rms_norm(part_x, weight, self.variance_epsilon)
+            return ir.ops.fused_add_rms_norm(
+                part_x, part_residual, weight, self.variance_epsilon
+            )
+
+        def request_invariant_apply_once(
+            part_x: torch.Tensor,
+            part_residual: torch.Tensor | None,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            return rms_norm_batch_invariant(
+                part_x,
+                weight,
+                self.variance_epsilon,
+                residual=part_residual,
+            )
+
+        if not self._xpu_kvarn_request_stable_rmsnorm:
+            return apply_once(x, residual)
+
+        from vllm.model_executor.determinism.request_stable_linear import (
+            apply_rms_norm_by_request,
+        )
+
+        return apply_rms_norm_by_request(
+            x,
+            residual,
+            apply_once,
+            request_invariant_apply_once,
+        )
 
     def forward_cuda(
         self,
@@ -171,6 +215,19 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        from vllm.model_executor.determinism.request_stable_linear import (
+            get_xpu_kvarn_request_slices,
+        )
+
+        # The fused XPU kernel bypasses the request-stable reduction used by
+        # the scoped KVarN profile. Keep that profile on the invariant native
+        # path whenever the model runner attached request boundaries.
+        if (
+            self._xpu_kvarn_request_stable_rmsnorm
+            and get_xpu_kvarn_request_slices() is not None
+        ):
+            return self.forward_native(x, residual)
+
         import vllm._xpu_ops  # noqa: F401 registers torch.ops.vllm.xpu_gemma_rms_norm
 
         # Fall back to the native path if the fused gemma kernels are not

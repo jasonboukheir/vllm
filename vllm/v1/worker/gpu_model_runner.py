@@ -163,6 +163,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
@@ -244,6 +245,7 @@ from .utils import (
     copy_kv_cache_blocks_inplace,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
+    zero_mamba_block_ids,
 )
 
 if TYPE_CHECKING:
@@ -252,6 +254,11 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _block_table_cpu_view(block_table: Any, num_reqs: int) -> np.ndarray:
+    """Return only live request rows from the authoritative CPU mirror."""
+    return block_table.get_numpy_array()[:num_reqs]
 
 
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
@@ -530,7 +537,6 @@ class GPUModelRunner(
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
         )
-
         self.is_pooling_model = model_config.runner_type == "pooling"
         self.enable_prompt_embeds = model_config.enable_prompt_embeds
         self.is_multimodal_raw_input_only_model = (
@@ -1171,13 +1177,38 @@ class GPUModelRunner(
             kernel_block_sizes=self._kernel_block_sizes,
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=self.compilation_config.static_forward_context,
-            num_blocks=self.kv_cache_config.num_blocks,
+            num_blocks=[
+                self.kv_cache_config.num_blocks_for_group(group_id)
+                for group_id in range(self.kv_cache_config.num_managed_groups)
+            ],
+            group_pool_ids=[
+                self.kv_cache_config.pool_id_for_group(group_id)
+                for group_id in range(self.kv_cache_config.num_managed_groups)
+            ],
+        )
+        self._zero_block_ids([NULL_BLOCK_ID])
+        zero_mamba_block_ids(
+            self.kv_cache_config,
+            self.compilation_config.static_forward_context,
+            [
+                (group_id, [NULL_BLOCK_ID])
+                for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ],
+            self.device,
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
-        """Zero the KV cache memory for the given block IDs."""
+        """Zero block IDs across all pools (used only for the null block)."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
+
+    def _zero_block_ids_by_group(
+        self, group_block_ids: list[tuple[int, list[int]]]
+    ) -> None:
+        """Zero group-qualified IDs only in their physical backing pools."""
+        if hasattr(self, "_kv_block_zeroer"):
+            self._kv_block_zeroer.zero_block_ids_by_group(group_block_ids)
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -1242,11 +1273,18 @@ class GPUModelRunner(
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            self._zero_block_ids_by_group(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.new_mamba_block_ids_to_zero:
+            zero_mamba_block_ids(
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
+                scheduler_output.new_mamba_block_ids_to_zero,
+                self.device,
+            )
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
                 scheduler_output.kv_cache_block_copies,
             )
 
@@ -2354,6 +2392,13 @@ class GPUModelRunner(
             blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)
             return blk_table_tensor
 
+        def _get_block_table_cpu(kv_cache_gid: int):
+            kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
+            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                return None
+            blk_table = self.input_batch.block_table[kv_cache_gid]
+            return _block_table_cpu_view(blk_table, num_reqs)
+
         assert slot_mappings is not None
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
@@ -2467,6 +2512,7 @@ class GPUModelRunner(
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
+            block_table_cpu=_get_block_table_cpu(0),
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
@@ -2600,6 +2646,7 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+                cm.block_table_cpu = _get_block_table_cpu(kv_cache_gid)
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
@@ -6573,7 +6620,7 @@ class GPUModelRunner(
         from vllm.v1.worker.workspace import reset_workspace_manager
 
         # Calls torch.accelerator.synchronize()
-        self._cleanup_profiling_kv_cache()
+        self._cleanup_profiling_kv_cache(release_model=True)
         if current_platform.is_rocm():
             # Drop captured graphs before distributed teardown. On ROCm, delayed
             # graph destruction can surface HSA faults in the next engine startup.
@@ -6590,8 +6637,15 @@ class GPUModelRunner(
             torch.accelerator.empty_cache()
             torch.accelerator.synchronize()
 
-    def _cleanup_profiling_kv_cache(self) -> None:
+    def _cleanup_profiling_kv_cache(self, *, release_model: bool = False) -> None:
         torch.accelerator.synchronize()
+        if self.cache_config.cache_dtype.startswith("kvarn_"):
+            from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
+
+            if release_model:
+                KVarNAttentionImpl.reset_process_state()
+            else:
+                KVarNAttentionImpl.reset_cache_state()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
@@ -7042,6 +7096,9 @@ class GPUModelRunner(
         Initialize the attention backends and attention metadata builders.
         """
         assert len(self.attn_groups) == 0, "Attention backends are already initialized"
+        draft_layer_names: set[str] = getattr(
+            getattr(self, "drafter", None), "_draft_attn_layer_names", set()
+        )
 
         class AttentionGroupKey(NamedTuple):
             """Deduplication key for attention groups within a KV cache group.
@@ -7076,6 +7133,14 @@ class GPUModelRunner(
             # layer.
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_backend = layers[layer_name].get_attn_backend()
+
+                if (
+                    attn_backend.get_name() == "KVARN"
+                    and layer_name in draft_layer_names
+                ):
+                    # KVarN builders own mutable tail-pool and flush state.
+                    # The drafter's builder must exclusively own its layers.
+                    continue
 
                 if layer_name in self.kv_sharing_fast_prefill_eligible_layers:
                     attn_backend = create_fast_prefill_custom_backend(
@@ -7340,6 +7405,8 @@ class GPUModelRunner(
             return
         for attn_groups in self.attn_groups:
             yield from attn_groups
+        # Draft-only backends still own physical allocations that need zeroing.
+        yield from getattr(getattr(self, "drafter", None), "draft_attn_groups", ())
 
     def initialize_kv_cache_tensors(
         self,
@@ -7552,7 +7619,11 @@ class GPUModelRunner(
             )
             spec, layer_names = encoder_only_attn_specs.popitem()
             self.kv_cache_config.kv_cache_groups.append(
-                KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)
+                KVCacheGroupSpec(
+                    layer_names=layer_names,
+                    kv_cache_spec=spec,
+                    enable_kv_transfer=False,
+                )
             )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:

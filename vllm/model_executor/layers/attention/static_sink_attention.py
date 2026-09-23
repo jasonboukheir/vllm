@@ -100,6 +100,9 @@ def create_static_sink_attention_backend(
             common_attn_metadata.block_table_tensor = self.block_table_with_sink[
                 :num_reqs
             ]
+            # The original CPU mirror does not include the synthetic sink
+            # prefix. Force consumers to derive metadata from the replacement.
+            common_attn_metadata.block_table_cpu = None
 
             return super().build(common_prefix_len, common_attn_metadata, fast_build)
 
