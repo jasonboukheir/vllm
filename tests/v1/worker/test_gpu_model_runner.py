@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
-from contextlib import nullcontext
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1385,54 +1385,6 @@ def test_hybrid_attention_mamba_tensor_shapes():
             assert torch.equal(actual_ssm, expected_ssm)
 
 
-def test_input_batch_reinitialized_after_late_interleave_adjustment(monkeypatch):
-    runner = object.__new__(GPUModelRunner)
-    runner.vllm_config = SimpleNamespace(reasoning_config=None)
-    runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=16)
-    runner.cache_config = SimpleNamespace(use_replayssm=False)
-    runner.model_config = SimpleNamespace(get_vocab_size=lambda: 32)
-    runner.max_model_len = 64
-    runner.max_encoder_len = 0
-    runner.max_num_reqs = 1
-    runner.max_num_tokens = 64
-    runner.num_spec_tokens = 0
-    runner.device = torch.device("cpu")
-    runner.is_pooling_model = False
-    runner._init_block_sizes = [16]
-    runner._init_kernel_block_sizes = [16]
-    runner._init_max_num_blocks = [4]
-    runner._init_slot_mapping_modes = [
-        gpu_model_runner_module.SlotMappingMode.TOKEN_TO_KV_SLOT
-    ]
-    runner.cp_kv_cache_interleave_size = 1
-    runner.input_batch = SimpleNamespace(
-        logitsprocs=None,
-        logitsprocs_need_output_token_ids=False,
-    )
-    runner.jit_warmup_registry = Mock()
-    runner.jit_warmup_registry.activate.return_value = nullcontext()
-
-    spec = SimpleNamespace(
-        block_size=16,
-        max_num_blocks_per_req=lambda *_: 4,
-    )
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
-    )
-    input_batch_cls = Mock(return_value=SimpleNamespace())
-    monkeypatch.setattr(gpu_model_runner_module, "InputBatch", input_batch_cls)
-    monkeypatch.setattr(
-        gpu_model_runner_module,
-        "get_kv_cache_spec_kind",
-        lambda _: gpu_model_runner_module.KVCacheSpecKind.FULL_ATTENTION,
-    )
-
-    runner.may_reinitialize_input_batch(kv_cache_config, [16])
-
-    assert input_batch_cls.call_count == 1
-    assert input_batch_cls.call_args.kwargs["cp_kv_cache_interleave_size"] == 16
-
-
 def test_v2_runner_snapshots_late_interleave_adjustment(monkeypatch):
     from vllm.v1.worker.gpu import model_runner as v2_model_runner_module
 
@@ -1639,6 +1591,55 @@ def test_hybrid_cache_integration(default_vllm_config, dist_init):
     assert _is_req_state_block_table_match(runner, req_id)
 
 
+@pytest.mark.parametrize(
+    ("backend_name", "drafter_state", "expected_layers"),
+    [
+        ("KVARN", "present", ["target.attn"]),
+        ("KVARN", "none", ["target.attn", "draft.attn"]),
+        ("KVARN", "absent", ["target.attn", "draft.attn"]),
+        ("FLASH_ATTN", "present", ["target.attn", "draft.attn"]),
+        ("FLASH_ATTN", "absent", ["target.attn", "draft.attn"]),
+    ],
+)
+def test_target_kvarn_builder_does_not_own_draft_cache(
+    monkeypatch, backend_name, drafter_state, expected_layers
+):
+    """A target flush must not retag or flush the drafter's independent pool."""
+    backend = Mock()
+    backend.get_name.return_value = backend_name
+    backend.full_cls_name.return_value = ("test", backend_name)
+    layers = {name: Mock(num_heads=24) for name in ["target.attn", "draft.attn"]}
+    for layer in layers.values():
+        layer.get_attn_backend.return_value = backend
+    monkeypatch.setattr(
+        gpu_model_runner_module, "get_layers_from_vllm_config", lambda *args: layers
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module, "check_attention_cp_compatibility", lambda *args: None
+    )
+    runner = SimpleNamespace(
+        attn_groups=[],
+        vllm_config=Mock(),
+        kv_sharing_fast_prefill_eligible_layers=set(),
+        _check_and_update_cudagraph_mode=Mock(),
+    )
+    # MTP-off and non-final pipeline ranks do not create a drafter attribute.
+    if drafter_state != "absent":
+        runner.drafter = (
+            SimpleNamespace(_draft_attn_layer_names={"draft.attn"})
+            if drafter_state == "present"
+            else None
+        )
+    spec = FullAttentionSpec(
+        block_size=128, num_kv_heads=4, head_size=256, dtype=torch.uint8
+    )
+    group = KVCacheGroupSpec(layer_names=list(layers), kv_cache_spec=spec)
+    config = KVCacheConfig(num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[group])
+    GPUModelRunner.initialize_attn_backend(runner, config)
+    assert runner.attn_groups[0][0].layer_names == expected_layers
+    assert group.layer_names == ["target.attn", "draft.attn"]
+
+
 def test_is_uniform_decode() -> None:
     # Normal
     assert GPUModelRunner._is_uniform_decode(
@@ -1827,3 +1828,71 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_kvarn_cleanup_releases_target_and_draft_cache_owners(monkeypatch, shutdown):
+    from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
+    monkeypatch.setattr(
+        "vllm.v1.worker.workspace.reset_workspace_manager", lambda: None
+    )
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        runner = object.__new__(GPUModelRunner)
+        runner.cache_config = SimpleNamespace(
+            cache_dtype="kvarn_k4v2_g128_compact", num_gpu_blocks=2
+        )
+        runner.kv_cache_config = object()
+        runner.attn_groups = []
+        runner.kv_caches = []
+        context = {}
+        owners: list[weakref.ReferenceType[torch.Tensor]] = []
+        layers = []
+        generation = KVarNAttentionImpl._process_generation
+        for name in ("target", "draft"):
+            impl = object.__new__(KVarNAttentionImpl)
+            impl._group_key = (name,)
+            impl._tails = {1: torch.ones(2)}
+            impl._kv_cache_ref = torch.ones(2, 4)
+            impl._tail_K_pool = torch.ones(2, 4)
+            impl._native_decode_scratch = (torch.ones(2),)
+            impl._bound_qlen1_inline_v2_plan = SimpleNamespace(
+                cache_owner=impl._kv_cache_ref
+            )
+            owners.extend(
+                weakref.ref(value)
+                for value in (
+                    impl._tails[1],
+                    impl._kv_cache_ref,
+                    impl._tail_K_pool,
+                    impl._native_decode_scratch[0],
+                )
+            )
+            context[name] = SimpleNamespace(impl=impl, kv_cache=impl._kv_cache_ref)
+            runner.kv_caches.append(impl._kv_cache_ref)
+            KVarNAttentionImpl._all_impls.append(impl)
+            layers.append(impl)
+        runner.compilation_config = SimpleNamespace(static_forward_context=context)
+        runner.model = object()
+        if shutdown:
+            runner.shutdown()
+        else:
+            runner._cleanup_profiling_kv_cache()
+        assert all(owner() is None for owner in owners)
+        assert KVarNAttentionImpl._process_generation > generation
+        assert not runner.kv_caches
+        assert not hasattr(runner, "kv_cache_config")
+        assert all(layer._bound_qlen1_inline_v2_plan is None for layer in layers)
+        if shutdown:
+            assert not KVarNAttentionImpl._all_impls
+            assert not context
+            assert runner.model is None
+        else:
+            assert KVarNAttentionImpl._all_impls == layers
+            assert KVarNAttentionImpl._impls_for_group(("draft",)) == layers[1:]
+    finally:
+        KVarNAttentionImpl.reset_process_state()

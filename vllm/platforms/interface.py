@@ -647,7 +647,18 @@ class Platform:
         # Phase 3: Align block/page sizes when multiple KV dtypes share the
         # block pool (e.g. nvfp4 primary + unquantized skip layers).
         # May override the user's --block-size.
-        if cache_config.kv_cache_dtype_skip_layers:
+        # Non-MLA KVarN hybrid models allocate attention and recurrent cache
+        # groups in independent physical pools.  Their page sizes must remain
+        # independent: heterogeneous alignment is only valid for groups that
+        # coexist in the legacy shared pool, and it would also enlarge a
+        # fixed-size KVarN tile beyond the backend's supported group size.
+        independent_kvarn_pools = (
+            model_config.is_hybrid
+            and isinstance(cache_config.cache_dtype, str)
+            and cache_config.cache_dtype.startswith("kvarn_")
+            and not cache_config.cache_dtype.startswith("kvarn_mla")
+        )
+        if cache_config.kv_cache_dtype_skip_layers and not independent_kvarn_pools:
             cls._align_heterogeneous_kv_block_size(vllm_config, backend_cls)
 
     @classmethod
@@ -802,6 +813,22 @@ class Platform:
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
+        if cache_config.cache_dtype.startswith("kvarn_") and not (
+            cache_config.cache_dtype.startswith("kvarn_mla")
+        ):
+            if cache_config.mamba_cache_mode == "align":
+                # Independent pools decouple physical page sizes, but align
+                # mode still needs one logical publication boundary. Otherwise
+                # recurrent state may advance before a 128-token compressed
+                # attention page and the two pools describe different prefixes.
+                cache_config.mamba_block_size = cache_config.block_size
+            logger.info(
+                "Keeping independent KVarN and Mamba page sizes; using Mamba "
+                "block size %s for align-mode logical boundaries.",
+                cache_config.mamba_block_size,
+            )
+            return
+
         if cache_config.cache_dtype == "auto":
             kv_cache_dtype = model_config.dtype
         else:
@@ -850,6 +877,31 @@ class Platform:
                 attn_page_size_1_token = lcm(tq_page, skip_page)
             else:
                 attn_page_size_1_token = tq_page
+        elif cache_config.cache_dtype.startswith("kvarn_") and not (
+            cache_config.cache_dtype.startswith("kvarn_mla")
+        ):
+            from vllm.model_executor.layers.quantization.kvarn.config import (
+                KVarNConfig,
+            )
+
+            kvarn_config = KVarNConfig.from_cache_dtype(
+                cache_config.cache_dtype, model_config.get_head_size()
+            )
+            kvarn_page = (
+                model_config.get_num_kv_heads(parallel_config)
+                * kvarn_config.record_bytes
+                // kvarn_config.group
+            )
+            if cache_config.kv_cache_dtype_skip_layers:
+                skip_page = FullAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=model_config.dtype,
+                ).page_size_bytes
+                attn_page_size_1_token = lcm(kvarn_page, skip_page)
+            else:
+                attn_page_size_1_token = kvarn_page
         else:
             attn_spec = FullAttentionSpec(
                 block_size=1,

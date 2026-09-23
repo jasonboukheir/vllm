@@ -68,6 +68,11 @@ class GDNAttentionMetadata:
     non_spec_query_start_loc: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes + 1,]
     )
+    # Immutable CPU copy used by eager platform dispatch. The source is a view
+    # into a persistent runner buffer which is overwritten on the next step.
+    non_spec_query_start_loc_cpu: tuple[int, ...] | None = None
+    non_spec_num_computed_tokens_cpu: tuple[int, ...] | None = None
+    non_spec_is_prefilling_cpu: tuple[bool, ...] | None = None
 
     spec_state_indices_tensor: torch.Tensor | None = None  # shape: [batch, num_spec]
     non_spec_state_indices_tensor: torch.Tensor | None = (
@@ -109,6 +114,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.compilation_config = vllm_config.compilation_config
         self.speculative_config = vllm_config.speculative_config
+        from vllm.model_executor.determinism.request_stable_linear import (
+            use_xpu_kvarn_request_stable_context,
+        )
+
+        self._needs_request_stable_metadata = use_xpu_kvarn_request_stable_context(
+            vllm_config
+        )
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
             _resolve_gdn_prefill_backend,
         )
@@ -232,6 +244,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
+        # CPU length bounds can include rejected speculative tokens. Only the
+        # request-stable profile needs this exact device-to-host snapshot.
+        request_start_positions_cpu = (
+            (m.seq_lens - m.naive_query_lens()).cpu()
+            if self._needs_request_stable_metadata
+            else None
+        )
+        request_is_prefilling_cpu = m.is_prefilling
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         block_table_tensor = mamba_get_block_table_tensor(
             m.block_table_tensor,
@@ -523,6 +543,37 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_has_initial_state=prefill_has_initial_state,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu=(
+                tuple(int(value) for value in non_spec_query_start_loc_cpu.tolist())
+                if non_spec_query_start_loc_cpu is not None
+                else None
+            ),
+            non_spec_num_computed_tokens_cpu=(
+                tuple(
+                    int(value)
+                    for value in (
+                        request_start_positions_cpu
+                        if spec_sequence_masks_cpu is None
+                        else request_start_positions_cpu[~spec_sequence_masks_cpu]
+                    ).tolist()
+                )
+                if non_spec_query_start_loc_cpu is not None
+                and request_start_positions_cpu is not None
+                else None
+            ),
+            non_spec_is_prefilling_cpu=(
+                tuple(
+                    bool(value)
+                    for value in (
+                        request_is_prefilling_cpu
+                        if spec_sequence_masks_cpu is None
+                        else request_is_prefilling_cpu[~spec_sequence_masks_cpu]
+                    ).tolist()
+                )
+                if non_spec_query_start_loc_cpu is not None
+                and request_is_prefilling_cpu is not None
+                else None
+            ),
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             spec_sequence_masks=spec_sequence_masks,

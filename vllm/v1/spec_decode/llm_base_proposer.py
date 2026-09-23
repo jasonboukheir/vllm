@@ -812,8 +812,11 @@ class SpecDecodeBaseProposer:
             self.max_model_len,
         )
 
+        # The CPU bound may alias target-owned storage or a prior draft step.
         if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
-            common_attn_metadata.seq_lens_cpu_upper_bound += 1
+            common_attn_metadata.seq_lens_cpu_upper_bound = (
+                common_attn_metadata.seq_lens_cpu_upper_bound + 1
+            )
 
         return positions
 
@@ -1149,6 +1152,7 @@ class SpecDecodeBaseProposer:
             max_query_len=new_query_len_per_req.max().item(),
             max_seq_len=common_attn_metadata.max_seq_len,
             block_table_tensor=common_attn_metadata.block_table_tensor,
+            block_table_cpu=common_attn_metadata.block_table_cpu,
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
@@ -1258,6 +1262,7 @@ class SpecDecodeBaseProposer:
             max_query_len=new_query_len_per_req.max().item(),
             max_seq_len=new_seq_lens_cpu.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
+            block_table_cpu=common_attn_metadata.block_table_cpu,
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
