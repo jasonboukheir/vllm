@@ -4573,6 +4573,23 @@ class GPUModelRunner(
             <= self.effective_drafter_max_model_len
         )
 
+    def _should_populate_offloaded_mtp_cache(
+        self, common_attn_metadata: CommonAttentionMetadata | None
+    ) -> bool:
+        """Keep shared target/MTP pages complete when no draft tokens fit."""
+        transfer_config = self.vllm_config.kv_transfer_config
+        return bool(
+            common_attn_metadata is not None
+            and common_attn_metadata.max_seq_len <= self.effective_drafter_max_model_len
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and self.cache_config.cache_dtype == "kvarn_k4v2_g128_compact"
+            and transfer_config is not None
+            and transfer_config.kv_connector == "OffloadingConnector"
+            and transfer_config.kv_connector_extra_config.get("spec_name")
+            == "IndependentCPUOffloadingSpec"
+        )
+
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -4632,11 +4649,16 @@ class GPUModelRunner(
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
 
-        def propose_draft_token_ids(sampled_token_ids):
+        def propose_draft_token_ids(sampled_token_ids, *, populate_cache_only=False):
             assert spec_decode_common_attn_metadata is not None
+            draft_scheduler_output = (
+                replace(scheduler_output, num_spec_tokens_to_schedule=0)
+                if populate_cache_only
+                else scheduler_output
+            )
             with record_function_or_nullcontext("gpu_model_runner: draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
+                draft_token_ids = self.propose_draft_token_ids(
+                    draft_scheduler_output,
                     sampled_token_ids,
                     self.input_batch.sampling_metadata,
                     hidden_states,
@@ -4646,7 +4668,9 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
-                self._copy_draft_token_ids_to_cpu(scheduler_output)
+                if not populate_cache_only:
+                    self._draft_token_ids = draft_token_ids
+                    self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
         draft_after_bookkeeping = False
@@ -4680,6 +4704,15 @@ class GPUModelRunner(
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
+                elif self._should_populate_offloaded_mtp_cache(
+                    spec_decode_common_attn_metadata
+                ):
+                    # The target's last prefill chunk can fit while K draft
+                    # tokens do not. K=0 still runs the first MTP forward, so
+                    # RAM offload receives complete shared attention pages.
+                    # Discard its Bx0 result; retain the normal no-draft
+                    # placeholders and valid-token bookkeeping below.
+                    propose_draft_token_ids(sampled_token_ids, populate_cache_only=True)
                 else:
                     if self.valid_sampled_token_count_event is not None:
                         assert spec_decode_common_attn_metadata is not None

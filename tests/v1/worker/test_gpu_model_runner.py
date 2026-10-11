@@ -422,6 +422,136 @@ def test_sample_tokens_skips_pp_group_lookup_without_async_scheduling(
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
 
 
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("profile_change", "seq_len", "expected_draft_count"),
+    [
+        (None, 4095, 0),
+        (None, 4096, 0),
+        (None, 4094, 2),
+        (None, 4097, None),
+        ("no_connector", 4095, None),
+        ("other_connector", 4095, None),
+        ("other_offload_spec", 4095, None),
+        ("other_cache_dtype", 4095, None),
+        ("other_drafter", 4095, None),
+    ],
+)
+def test_sample_tokens_populates_offloaded_mtp_cache_at_context_limit(
+    profile_change, seq_len, expected_draft_count
+):
+    """A cache-only MTP forward must never publish its empty draft tensor."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    transfer_config = SimpleNamespace(
+        kv_connector="OffloadingConnector",
+        kv_connector_extra_config={"spec_name": "IndependentCPUOffloadingSpec"},
+    )
+    runner.vllm_config = SimpleNamespace(kv_transfer_config=transfer_config)
+    runner.cache_config = SimpleNamespace(cache_dtype="kvarn_k4v2_g128_compact")
+    runner.speculative_config = SimpleNamespace(
+        method="mtp",
+        disable_padded_drafter_batch=False,
+        use_eagle=lambda: True,
+        use_dflash=lambda: False,
+        uses_draft_model=lambda: False,
+        uses_extract_hidden_states=lambda: False,
+        use_ngram_gpu=lambda: False,
+    )
+    if profile_change == "no_connector":
+        runner.vllm_config.kv_transfer_config = None
+    elif profile_change == "other_connector":
+        transfer_config.kv_connector = "OtherConnector"
+    elif profile_change == "other_offload_spec":
+        transfer_config.kv_connector_extra_config["spec_name"] = "CPUOffloadingSpec"
+    elif profile_change == "other_cache_dtype":
+        runner.cache_config.cache_dtype = "auto"
+    elif profile_change == "other_drafter":
+        runner.speculative_config.method = "eagle"
+
+    runner.num_spec_tokens = 2
+    runner.effective_drafter_max_model_len = 4096
+    runner.use_async_scheduling = False
+    runner.use_aux_hidden_state_outputs = False
+    runner.supports_mm_inputs = False
+    runner.device = torch.device("cpu")
+    runner.parallel_config = SimpleNamespace(data_parallel_size=1)
+    runner.input_batch = SimpleNamespace(req_ids=["request"], sampling_metadata=Mock())
+    runner.input_ids = SimpleNamespace(gpu=torch.arange(128))
+    runner.requests = {}
+    runner.discard_request_mask = SimpleNamespace(gpu=torch.tensor([False]))
+    runner.valid_sampled_token_count_event = object()
+    runner._get_positions = lambda count: torch.arange(count)
+    runner.get_model = lambda: SimpleNamespace()
+    runner._copy_valid_sampled_token_count = Mock()
+    runner._update_states_after_model_execute = Mock()
+    runner.finalize_kv_connector = Mock()
+    runner.eplb_step = Mock()
+    runner.kv_connector_output = None
+
+    sampled = torch.tensor([[7]], dtype=torch.int64)
+    runner._sample = Mock(return_value=SimpleNamespace(sampled_token_ids=sampled))
+    runner.drafter = Mock(spec=gpu_model_runner_module.EagleProposer)
+    runner.drafter.prepare_next_token_ids_padded.return_value = (
+        sampled[:, 0],
+        torch.ones(1, dtype=torch.int32),
+    )
+    runner.drafter.propose.side_effect = lambda **kwargs: torch.full(
+        (1, kwargs["num_speculative_tokens"]), 11, dtype=torch.int64
+    )
+    runner.drafter.take_last_draft_probs.return_value = None
+    copied_drafts = []
+
+    def copy_draft_token_ids(scheduler_output, *, zeros_only=False):
+        copied_drafts.append((runner._draft_token_ids.clone(), zeros_only))
+
+    runner._copy_draft_token_ids_to_cpu = copy_draft_token_ids
+    scheduler_output = _schedule_cached_requests(
+        ["request"], {"request": 128}, [[]], [seq_len - 128], [0]
+    )
+    scheduler_output.num_spec_tokens_to_schedule = 2
+    common_metadata = SimpleNamespace(max_seq_len=seq_len, num_actual_tokens=128)
+    hidden_states = torch.zeros(128, 4)
+    runner.execute_model_state = gpu_model_runner_module.ExecuteModelState(
+        scheduler_output,
+        torch.zeros(1, 16),
+        None,
+        common_metadata,
+        hidden_states,
+        hidden_states[-1:],
+        None,
+        None,
+        None,
+        None,
+    )
+    runner._bookkeeping_sync = Mock(
+        return_value=(0, None, None, [[7]], {}, ["request"], {"request": 0}, [])
+    )
+
+    output = runner.sample_tokens(None)
+
+    assert output.sampled_token_ids == [[7]]
+    assert scheduler_output.num_spec_tokens_to_schedule == 2
+    if expected_draft_count is None:
+        runner.drafter.propose.assert_not_called()
+    else:
+        runner.drafter.propose.assert_called_once()
+        assert (
+            runner.drafter.propose.call_args.kwargs["num_speculative_tokens"]
+            == expected_draft_count
+        )
+        assert (
+            runner.drafter.propose.call_args.kwargs["common_attn_metadata"]
+            is common_metadata
+        )
+    runner._copy_valid_sampled_token_count.assert_called_once()
+    runner.finalize_kv_connector.assert_called_once()
+    assert len(copied_drafts) == 1
+    draft_ids, zeros_only = copied_drafts[0]
+    assert draft_ids.shape == (1, 2)
+    assert zeros_only is (expected_draft_count != 2)
+    assert torch.all(draft_ids == (11 if expected_draft_count == 2 else 0))
+
+
 def test_select_common_block_size_no_valid_option():
     backend_a = _make_mock_backend_for_kernel_block_size([64])
     backend_b = _make_mock_backend_for_kernel_block_size([MultipleOf(16)])
