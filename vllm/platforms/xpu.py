@@ -122,10 +122,16 @@ def _check_kvarn_beta_unsupported_config(
             "XPU KVarN beta does not support graph mode; use --enforce-eager "
             "or set cudagraph_mode=NONE, or use --kv-cache-dtype=auto"
         )
-    if vllm_config.cache_config.enable_prefix_caching:
+    if vllm_config.cache_config.enable_prefix_caching and not (
+        cache_dtype == "kvarn_k4v2_g128_compact"
+        and getattr(vllm_config.model_config.hf_config, "model_type", None) == "qwen3_5"
+        and vllm_config.model_config.dtype == torch.bfloat16
+        and vllm_config.parallel_config.tensor_parallel_size == 1
+        and vllm_config.parallel_config.pipeline_parallel_size == 1
+    ):
         raise ValueError(
-            "XPU KVarN beta does not support prefix caching; disable it "
-            "or use --kv-cache-dtype=auto"
+            "XPU KVarN prefix caching requires Qwen3.5, compact K4V2, "
+            "BF16 compute and TP1/PP1"
         )
     multimodal_config = getattr(vllm_config.model_config, "multimodal_config", None)
     language_model_only = bool(getattr(multimodal_config, "language_model_only", False))

@@ -2422,6 +2422,50 @@ def test_kvarn_estimated_context_fits_concurrent_recurrent_reservation(
         kv_cache_utils.get_kv_cache_config_from_groups(config, groups, available)
 
 
+@pytest.mark.parametrize("enable_caching", [False, True])
+@pytest.mark.parametrize("spare_checkpoints", [0, 1, 3, 4, 7])
+def test_kvarn_prefix_checkpoint_reserve_preserves_full_context(
+    enable_caching, spare_checkpoints
+):
+    attention = new_kv_cache_spec(block_size=128)
+    mamba = new_mamba_spec(
+        block_size=128,
+        shapes=((attention.page_size_bytes,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    groups = [
+        KVCacheGroupSpec(["full"], attention),
+        KVCacheGroupSpec(["mamba"], mamba),
+    ]
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
+        model_config=SimpleNamespace(max_model_len=1024),
+        cache_config=SimpleNamespace(
+            cache_dtype="kvarn_k4v2_g128_compact",
+            enable_prefix_caching=enable_caching,
+            mamba_cache_mode="align",
+            prefix_cache_retention_interval=0,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+    )
+    # Eight attention pages preserve the full context. Sixteen recurrent
+    # blocks serve four active requests; cached checkpoints need spare slots.
+    available = (
+        9 * attention.page_size_bytes + (17 + spare_checkpoints) * mamba.page_size_bytes
+    )
+    allocation = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, groups, available
+    )
+    retained = min(4, spare_checkpoints) if enable_caching else 0
+    assert allocation.num_blocks_for_group(1) == 17 + retained
+    assert allocation.num_blocks_for_group(0) == 9 + 4 * (spare_checkpoints - retained)
+    assert (allocation.num_blocks_for_group(0) - 1) * 128 >= 1024
+    assert sum(t.size for t in allocation.kv_cache_tensors) == available
+
+
 @pytest.mark.parametrize("max_model_len", [128, 8192, 65536])
 def test_mamba_none_pool_cost_is_constant_with_context_length(max_model_len):
     spec = MambaSpec(

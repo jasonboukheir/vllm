@@ -515,6 +515,14 @@ class Scheduler(SchedulerInterface):
         )
         if use_internal_checkpoint:
             last_cache_position = 0
+        # Identical resends must recompute the last prompt token for logits.
+        # At an aligned prompt end their hit is one block below an extension's
+        # hit; materialize that state as well as retaining it in the manager.
+        resend_cache_position = (
+            (request.num_prompt_tokens - 1) // block_size * block_size
+        )
+        if self.use_eagle_block_drop:
+            resend_cache_position = max(resend_cache_position - block_size, 0)
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
         # tokens. State is written at chunk ends, so chunk ends must be block
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
@@ -563,6 +571,9 @@ class Scheduler(SchedulerInterface):
             else 0,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position if self.needs_mamba_cache_alignment else 0,
+            resend_cache_position
+            if self.needs_mamba_cache_alignment and not use_internal_checkpoint
+            else 0,
             # Fine-grained hits: the prompt's partial-tail entry can only be
             # registered by a chunk ending exactly at its last hash boundary.
             tail_boundary

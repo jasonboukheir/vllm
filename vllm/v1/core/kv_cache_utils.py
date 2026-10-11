@@ -1978,13 +1978,44 @@ def get_kv_cache_config_from_groups(
             bytes_per_group_block[group_id] * blocks_per_quantum[group_id]
             for group_id in attention_group_ids
         )
+        max_model_len = vllm_config.model_config.max_model_len
+        if getattr(vllm_config.cache_config, "enable_prefix_caching", False):
+            checkpoint_groups = [
+                group_id
+                for group_id, group in enumerate(kv_cache_groups)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+                and group.kv_cache_spec.mamba_cache_mode == "align"
+            ]
+            if checkpoint_groups:
+                # Live recurrent slots alone can evict every reusable state
+                # during a full batch. Keep up to one extra checkpoint per
+                # sequence, without spending the attention pages needed for
+                # one maximum-length request.
+                checkpoint_bytes = sum(
+                    bytes_per_group_block[i] for i in checkpoint_groups
+                )
+                min_attention_bytes = (
+                    cdiv(max_model_len, token_quantum) * bytes_per_quantum
+                )
+                spare_bytes = max(
+                    available_memory - reserved_bytes - min_attention_bytes, 0
+                )
+                checkpoint_blocks = min(max_num_seqs, spare_bytes // checkpoint_bytes)
+                for group_id in checkpoint_groups:
+                    pool_block_counts[group_id] += checkpoint_blocks
+                reserved_bytes += checkpoint_blocks * checkpoint_bytes
+                logger.info(
+                    "Reserved %d extra recurrent prefix checkpoints per pool "
+                    "while preserving max_model_len=%d",
+                    checkpoint_blocks,
+                    max_model_len,
+                )
         # get_kv_cache_configs has already translated num_gpu_blocks_override
         # into an effective independent-pool byte budget. Applying the legacy
         # block override again here would confuse resident requests with
         # attention token quanta.
         num_quanta = (available_memory - reserved_bytes) // bytes_per_quantum
         attention_capacity_tokens = num_quanta * token_quantum
-        max_model_len = vllm_config.model_config.max_model_len
         if attention_capacity_tokens < max_model_len:
             raise ValueError(
                 "Insufficient attention KV cache after reserving Mamba state "
