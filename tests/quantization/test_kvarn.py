@@ -4088,6 +4088,44 @@ def test_cpu_offload_rejects_incomplete_resident_page():
         KVarNAttentionImpl.reset_process_state()
 
 
+@pytest.mark.parametrize("mixed_batch", [False, True])
+def test_padded_mtp_step_preserves_completed_pages_for_cpu_offload(mixed_batch):
+    """An out-of-context draft performs no writes and must preserve cached KV."""
+    resident_ids = {3, 4, 10, 11} if mixed_batch else {3, 4}
+    sinks = {3, 10} if mixed_batch else {3}
+    builder, resident = _make_kvarn_lifecycle_builder(resident_ids, sinks, pool_size=6)
+    try:
+        impl = KVarNAttentionImpl._all_impls[0]
+        impl._tails = {}
+        impl._tail_K_pool = torch.zeros(6, 2, 2, 2, dtype=torch.float16)
+        impl._tail_V_pool = torch.zeros_like(impl._tail_K_pool)
+        rows = [[3, 4], [10, 11, 12]] if mixed_batch else [[3, 4]]
+        lengths = [1, 257] if mixed_batch else [1]
+        cam = _kvarn_lifecycle_common(rows, lengths, [1] * len(rows))
+        cam.slot_mapping[0] = -1
+        with (
+            patch(
+                "vllm.v1.attention.backends.kvarn_attn.split_decodes_and_prefills",
+                return_value=(len(rows), 0, len(rows), 0),
+            ),
+            patch.object(KVarNAttentionImpl, "_batched_flush") as flush,
+        ):
+            builder.build(0, cam)
+            assert builder._block_fill[3] == builder._block_fill[4] == 128
+            assert {3, 4}.issubset(resident)
+            if mixed_batch:
+                assert [bid for _, bid, _ in flush.call_args.args[0]] == [11]
+                assert 12 in resident and 11 not in resident
+            else:
+                flush.assert_not_called()
+            payloads = KVarNAttentionImpl.prepare_cpu_offload(
+                builder._group_key, [3, 4]
+            )
+            assert payloads.keys() == {3}
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
 def test_cpu_reload_recycled_sink_restores_before_attention_reads():
     """Loading over stale IDs must restore owned FP16 data only on adoption."""
     builder, resident, impl = _make_cpu_offload_lifecycle()

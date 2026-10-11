@@ -1196,6 +1196,16 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             query_lens_cpu = [_qsl_l[i + 1] - _qsl_l[i] for i in range(len(_qsl_l) - 1)]
         else:
             query_lens_cpu = [1] * len(seq_lens_cpu)
+        # MTP masks proposals past the context ceiling with slot=-1 and
+        # seq_len=1. They perform no cache writes and must not reset the sink's
+        # fill count or reclaim the request's still-readable resident pages.
+        # Inspect device slots only for these rare one-token candidate rows.
+        padded_rows: set[int] = set()
+        query_start = 0
+        for row_idx, (sl, q_len) in enumerate(zip(seq_lens_cpu, query_lens_cpu)):
+            if sl == 1 and q_len == 1 and cam.slot_mapping[query_start].item() < 0:
+                padded_rows.add(row_idx)
+            query_start += q_len
         # block_table as a numpy 2-D array (C-backed, lazy element access) rather
         # than .tolist(): the full B×max_blocks nested-list build was ~7 ms/step
         # at B=256 and dominated build() once the flush was vectorized.
@@ -1253,6 +1263,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
         for b in range(B):
             if b >= bt_rows:
                 break
+            if b in padded_rows:
+                continue
             sl = seq_lens_cpu[b]
             if bt_cols == 0 or sl <= 0:
                 continue
@@ -1294,6 +1306,14 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             dict_map = KVarNAttentionImpl._block_to_slot_dict[gk]
             free_slots = KVarNAttentionImpl._free_slots[gk]
             sinks = KVarNAttentionImpl._global_sink_blocks[gk]
+            padded_row_blocks = {
+                int(bid)
+                for b in padded_rows
+                if b < bt_rows
+                for bid in block_table_np[b]
+                if int(bid) in dict_map
+            }
+            blocks_needed.update(padded_row_blocks)
 
             # Full defer is an unbounded diagnostic ablation. Bounded prefill
             # and decode policies retain only the newest non-sink history while
@@ -1387,6 +1407,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 if s0 < 0:
                     continue
                 row0_set.add(s0)
+                if b in padded_rows:
+                    continue
                 pending = pending_restores.pop(s0, None)
                 committed = seq_lens_cpu[b] - query_lens_cpu[b]
                 if pending is not None and committed >= GROUP:
@@ -1455,7 +1477,9 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             flush_seen: set[int] = set()
             prefill_window_flush_ids: set[int] = set()
             decode_window_flush_ids: set[int] = set()
-            protected_history_blocks = window_prefill_blocks | window_decode_blocks
+            protected_history_blocks = (
+                window_prefill_blocks | window_decode_blocks | padded_row_blocks
+            )
             for b in range(B):
                 if b >= bt_rows or bt_cols == 0:
                     break
@@ -2004,7 +2028,13 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
                 if bid not in resident:
                     continue
                 if builder is None or builder._block_fill.get(bid, 0) < builder._group:
-                    raise RuntimeError("Cannot offload an incomplete KVarN page")
+                    fill = None if builder is None else builder._block_fill.get(bid)
+                    group = None if builder is None else builder._group
+                    raise RuntimeError(
+                        "Cannot offload an incomplete KVarN page: "
+                        f"layer={impl.layer_name}, block_id={bid}, "
+                        f"filled_tokens={fill}, block_size={group}"
+                    )
                 flush_pairs.append((impl, bid, impl._kv_cache_ref))
                 if bid in cls._global_sink_blocks.get(gk, set()):
                     sink_ids.add(bid)
