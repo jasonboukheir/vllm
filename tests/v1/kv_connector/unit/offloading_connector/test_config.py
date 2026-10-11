@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupRole,
     KVCacheGroupSpec,
+    KVCachePoolSpec,
     KVCacheSpec,
     KVCacheTensor,
     MambaSpec,
@@ -278,6 +279,33 @@ def _make_mamba_hybrid_kv_cache_config() -> KVCacheConfig:
             ),
         ],
     )
+
+
+def test_independent_pool_sizes_account_for_each_group_page():
+    """Host allocation charges pages, without averaging unequal GPU pools."""
+    groups = _make_mamba_hybrid_kv_cache_config().kv_cache_groups
+    capacities = (11, 3)
+    config = KVCacheConfig(
+        num_blocks=min(capacities),
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=capacity * group.kv_cache_spec.page_size_bytes,
+                layers=group.layer_names,
+                layer_stride=capacity * group.kv_cache_spec.page_size_bytes,
+                block_stride=group.kv_cache_spec.page_size_bytes,
+            )
+            for group, capacity in zip(groups, capacities)
+        ],
+        kv_cache_groups=groups,
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=capacity, group_ids=[group_id])
+            for group_id, capacity in enumerate(capacities)
+        ],
+    )
+    offloading = build_offloading_config(_make_vllm_config(), config)
+    pages = [group.kv_cache_spec.page_size_bytes for group in groups]
+    assert [group.page_size_bytes for group in offloading.groups] == pages
+    assert offloading.worker_kv_bytes_per_block == sum(pages)
 
 
 def _parallelism_agnostic(

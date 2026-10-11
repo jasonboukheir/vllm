@@ -276,3 +276,34 @@ def test_prefix_hit_requires_matching_cached_blocks_in_every_pool():
     cached, hit, _ = manager.get_computed_blocks(_request("second", 13))
     assert hit == 4
     assert [_ids(group) for group in cached.blocks] == [[(0, 1)], [(1, 1)]]
+
+
+def test_active_only_cache_preserves_shared_live_blocks_until_last_request_finishes():
+    """RAM-only retention must not evict a prefix still used by another request."""
+    manager = _make_manager((8, 6), enable_caching=True)
+    for pool in manager.coordinator.block_pools:
+        pool.retain_idle_cache = False
+    first = _request("first", 12)
+    assert manager.allocate_slots(first, num_new_tokens=12) is not None
+    manager.cache_blocks(first, 12)
+    second = _request("second", 13)
+    cached, hit, _ = manager.get_computed_blocks(second)
+    assert hit == 12
+    assert (
+        manager.allocate_slots(
+            second,
+            num_new_tokens=1,
+            num_new_computed_tokens=hit,
+            new_computed_blocks=cached,
+        )
+        is not None
+    )
+
+    manager.free(first)
+    assert manager.get_computed_blocks(_request("while-live", 13))[1] == 12
+    manager.free(second)
+    assert manager.get_computed_blocks(_request("after-finish", 13))[1] == 0
+    assert all(
+        pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
+        for pool in manager.coordinator.block_pools
+    )

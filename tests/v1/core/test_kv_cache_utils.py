@@ -2127,6 +2127,26 @@ def test_kv_cache_config_supports_independent_group_capacities():
         generate_scheduler_kv_cache_config([config, other_worker])
 
 
+@pytest.mark.parametrize("explicit,num_blocks", [(False, 0), (False, -1), (True, 0)])
+def test_kv_cache_config_zero_capacity_only_for_implicit_metadata(explicit, num_blocks):
+    """Metadata can describe no allocated cache; explicit physical pools cannot."""
+    kwargs = dict(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["full"], new_kv_cache_spec())],
+        kv_cache_pools=(
+            [KVCachePoolSpec(num_blocks=num_blocks, group_ids=[0])]
+            if explicit
+            else None
+        ),
+    )
+    if not explicit and num_blocks == 0:
+        assert KVCacheConfig(**kwargs).num_blocks_for_group(0) == 0
+    else:
+        with pytest.raises(ValueError, match="at least one block"):
+            KVCacheConfig(**kwargs)
+
+
 def test_kv_cache_config_defaults_each_group_to_shared_capacity():
     """Existing uniform-pool configurations retain their old behavior."""
     groups = [
@@ -2147,17 +2167,21 @@ def test_kv_cache_config_defaults_each_group_to_shared_capacity():
 
 
 @pytest.mark.parametrize(
-    "connector",
+    "connector,spec_name,allowed",
     [
-        "NixlConnector",
-        "MooncakeConnector",
-        "OffloadingConnector",
-        "SimpleCPUOffloadConnector",
-        "MultiConnector",
+        ("NixlConnector", None, False),
+        ("MooncakeConnector", None, False),
+        ("OffloadingConnector", None, False),
+        ("SimpleCPUOffloadConnector", None, False),
+        ("MultiConnector", None, False),
+        ("OffloadingConnector", "IndependentCPUOffloadingSpec", True),
+        ("NixlConnector", "IndependentCPUOffloadingSpec", False),
     ],
 )
-def test_independent_kv_cache_pools_reject_kv_connectors(connector):
-    """Beta KVarN must fail closed until connectors carry physical pool IDs."""
+def test_independent_kv_cache_pools_require_pool_aware_connector(
+    connector, spec_name, allowed
+):
+    """Only the CPU backend that preserves pool identity may reuse these IDs."""
     groups = [
         KVCacheGroupSpec(["full"], new_kv_cache_spec(block_size=128)),
         KVCacheGroupSpec(["mamba"], new_mamba_spec(block_size=512)),
@@ -2171,9 +2195,16 @@ def test_independent_kv_cache_pools_reject_kv_connectors(connector):
             KVCachePoolSpec(num_blocks=3, group_ids=[1]),
         ],
     )
-    transfer = KVTransferConfig(kv_connector=connector, kv_role="kv_both")
+    transfer = KVTransferConfig(
+        kv_connector=connector,
+        kv_role="kv_both",
+        kv_connector_extra_config={"spec_name": spec_name} if spec_name else {},
+    )
     vllm_config = SimpleNamespace(kv_transfer_config=transfer)
 
+    if allowed:
+        kv_cache_utils._validate_kv_transfer_pool_compat(vllm_config, [config])
+        return
     with pytest.raises(NotImplementedError, match="independent KV cache pools"):
         kv_cache_utils._validate_kv_transfer_pool_compat(vllm_config, [config])
 
@@ -2423,9 +2454,10 @@ def test_kvarn_estimated_context_fits_concurrent_recurrent_reservation(
 
 
 @pytest.mark.parametrize("enable_caching", [False, True])
+@pytest.mark.parametrize("cpu_offload", [False, True])
 @pytest.mark.parametrize("spare_checkpoints", [0, 1, 3, 4, 7])
 def test_kvarn_prefix_checkpoint_reserve_preserves_full_context(
-    enable_caching, spare_checkpoints
+    enable_caching, cpu_offload, spare_checkpoints
 ):
     attention = new_kv_cache_spec(block_size=128)
     mamba = new_mamba_spec(
@@ -2450,6 +2482,15 @@ def test_kvarn_prefix_checkpoint_reserve_preserves_full_context(
         ),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
+        kv_transfer_config=(
+            KVTransferConfig(
+                kv_connector="OffloadingConnector",
+                kv_role="kv_both",
+                kv_connector_extra_config={"spec_name": "IndependentCPUOffloadingSpec"},
+            )
+            if cpu_offload
+            else None
+        ),
     )
     # Eight attention pages preserve the full context. Sixteen recurrent
     # blocks serve four active requests; cached checkpoints need spare slots.
@@ -2459,7 +2500,7 @@ def test_kvarn_prefix_checkpoint_reserve_preserves_full_context(
     allocation = kv_cache_utils.get_kv_cache_config_from_groups(
         config, groups, available
     )
-    retained = min(4, spare_checkpoints) if enable_caching else 0
+    retained = min(4, spare_checkpoints) if enable_caching and not cpu_offload else 0
     assert allocation.num_blocks_for_group(1) == 17 + retained
     assert allocation.num_blocks_for_group(0) == 9 + 4 * (spare_checkpoints - retained)
     assert (allocation.num_blocks_for_group(0) - 1) * 128 >= 1024
