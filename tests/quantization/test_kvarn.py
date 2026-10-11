@@ -4040,6 +4040,138 @@ def test_lifecycle_builder_flushes_before_capacity_and_reclaims_completion():
         KVarNAttentionImpl.reset_process_state()
 
 
+def _make_cpu_offload_lifecycle():
+    builder, resident = _make_kvarn_lifecycle_builder({3, 4}, sinks={3}, pool_size=4)
+    impl = KVarNAttentionImpl._all_impls[0]
+    impl._tails = {}
+    impl._tail_K_pool = torch.arange(32, dtype=torch.float16).view(4, 2, 2, 2)
+    impl._tail_V_pool = impl._tail_K_pool + 100
+    KVarNAttentionImpl._metadata_builders[builder._group_key] = builder
+    return builder, resident, impl
+
+
+def test_cpu_offload_preserves_active_residency_and_exact_sink_bytes():
+    """Packed copies must not evict an active sink or its recent FP16 pages."""
+    builder, resident, impl = _make_cpu_offload_lifecycle()
+    try:
+        before = dict(resident)
+        with patch.object(KVarNAttentionImpl, "_batched_flush") as flush:
+            payloads = KVarNAttentionImpl.prepare_cpu_offload(
+                builder._group_key, [3, 4, 5]
+            )
+        assert [bid for _, bid, _ in flush.call_args.args[0]] == [3, 4]
+        assert resident == before
+        assert payloads.keys() == {3}
+        payload = payloads[3]
+        assert payload[:2].tolist() == [1, 0]
+        values = payload[2:].view(torch.float16)
+        torch.testing.assert_close(values[:8], impl._tail_K_pool[0].flatten())
+        torch.testing.assert_close(values[8:], impl._tail_V_pool[0].flatten())
+        impl._tail_K_pool[0].zero_()
+        assert values[:8].tolist() == list(range(8))
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_cpu_offload_rejects_incomplete_resident_page():
+    """An uncommitted speculative tail must never be permanently quantized."""
+    builder, _, _ = _make_cpu_offload_lifecycle()
+    try:
+        builder._block_fill[4] = 127
+        with (
+            patch.object(KVarNAttentionImpl, "_batched_flush") as flush,
+            pytest.raises(RuntimeError, match="incomplete KVarN page"),
+        ):
+            KVarNAttentionImpl.prepare_cpu_offload(builder._group_key, [3, 4])
+        flush.assert_not_called()
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_cpu_reload_recycled_sink_restores_before_attention_reads():
+    """Loading over stale IDs must restore owned FP16 data only on adoption."""
+    builder, resident, impl = _make_cpu_offload_lifecycle()
+    try:
+        with patch.object(KVarNAttentionImpl, "_batched_flush"):
+            payload = KVarNAttentionImpl.prepare_cpu_offload(builder._group_key, [3])[3]
+        expected_k = impl._tail_K_pool[resident[3]].clone()
+        expected_v = impl._tail_V_pool[resident[3]].clone()
+        builder._retired_sinks[3] = None
+        KVarNAttentionImpl.prepare_cpu_reload(builder._group_key, [3, 4], {3: payload})
+        assert resident == {}
+        assert builder._retired_sinks == {}
+        assert builder._block_fill == {}
+        payload.zero_()  # The CPU arena slot may be reused after load completion.
+        impl._tail_K_pool.zero_()
+        impl._tail_V_pool.zero_()
+        flush_calls = []
+        _run_kvarn_lifecycle_build(
+            builder, [[3, 4, 5]], [257], [1], num_decodes=1, flush_calls=flush_calls
+        )
+        assert set(resident) == {3, 5}
+        slot = resident[3]
+        torch.testing.assert_close(impl._tail_K_pool[slot], expected_k)
+        torch.testing.assert_close(impl._tail_V_pool[slot], expected_v)
+        assert not KVarNAttentionImpl._pending_cpu_sinks[builder._group_key]
+        assert impl.layer_name in builder._group_key
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_cpu_reload_abandoned_sink_is_discarded_on_fresh_write():
+    """Canceled loads cannot inject old prompt bytes into recycled new requests."""
+    builder, resident, impl = _make_cpu_offload_lifecycle()
+    try:
+        with patch.object(KVarNAttentionImpl, "_batched_flush"):
+            payload = KVarNAttentionImpl.prepare_cpu_offload(builder._group_key, [3])[3]
+        KVarNAttentionImpl.prepare_cpu_reload(builder._group_key, [3, 4], {3: payload})
+        impl._tail_K_pool.zero_()
+        _run_kvarn_lifecycle_build(
+            builder, [[3]], [2], [2], num_decodes=0, flush_calls=[]
+        )
+        assert not KVarNAttentionImpl._pending_cpu_sinks[builder._group_key]
+        assert torch.count_nonzero(impl._tail_K_pool[resident[3]]) == 0
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
+def test_cpu_sink_payload_handles_independent_target_and_draft_residency():
+    """One KV group can contain separately managed target and MTP tail pools."""
+    builder, resident, impl = _make_cpu_offload_lifecycle()
+    try:
+        draft = object.__new__(KVarNAttentionImpl)
+        draft.__dict__.update(impl.__dict__)
+        draft.layer_name = "draft.self_attn"
+        draft._group_key = (draft.layer_name,)
+        draft._tail_K_pool = impl._tail_K_pool + 200
+        draft._tail_V_pool = impl._tail_V_pool + 200
+        draft_builder = object.__new__(KVarNMetadataBuilder)
+        draft_builder._group = 128
+        draft_builder._block_fill = {3: 128}
+        draft_builder._retired_sinks = {}
+        gk = draft._group_key
+        KVarNAttentionImpl._all_impls.append(draft)
+        KVarNAttentionImpl._metadata_builders[gk] = draft_builder
+        KVarNAttentionImpl._block_to_slot_dict[gk] = {3: 0}
+        KVarNAttentionImpl._global_sink_blocks[gk] = set()
+        KVarNAttentionImpl._free_slots[gk] = [3, 2, 1]
+        KVarNAttentionImpl._allocator_pool_size[gk] = 4
+        names = [draft.layer_name, impl.layer_name]
+        with patch.object(KVarNAttentionImpl, "_batched_flush"):
+            payload = KVarNAttentionImpl.prepare_cpu_offload(names, [3])[3]
+        layer_bytes = 2 + 4 * impl._tail_K_pool[0].numel()
+        assert payload[0].item() == 0
+        assert payload[layer_bytes].item() == 1
+        KVarNAttentionImpl.prepare_cpu_reload(names, [3], {3: payload})
+        assert 3 not in resident
+        assert not KVarNAttentionImpl._pending_cpu_sinks[gk]
+        assert KVarNAttentionImpl._pending_cpu_sinks[builder._group_key][3].keys() == {
+            impl.layer_name
+        }
+    finally:
+        KVarNAttentionImpl.reset_process_state()
+
+
 def test_kvarn_rotation_uses_2d_gemm_and_preserves_scratch_canary(monkeypatch):
     """The XPU batched matmul writer must not return to the K/V store path."""
     num_tokens, num_heads, head_dim = 3, 2, 4

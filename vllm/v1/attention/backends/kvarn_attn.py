@@ -35,6 +35,7 @@ from __future__ import annotations
 import functools
 import math
 import os
+import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -1267,6 +1268,7 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     blocks_needed.add(bid)
                     self._block_fill[bid] = min(sl, (k + 1) * GROUP) - k * GROUP
         gk = self._group_key
+        KVarNAttentionImpl._metadata_builders[gk] = self
         # Claim THIS group's impls by layer name (set on the impl in
         # Attention.__init__) and tag them with the true group key, so their
         # _ensure_pool / store paths use this group's slot allocator + mirror.
@@ -1376,6 +1378,8 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
             # tokens) and attention would read garbage for the whole first
             # block — repetition-loops on multi-turn chat.
             row0_set: set[int] = set()
+            pending_restores = KVarNAttentionImpl._pending_cpu_sinks.get(gk, {})
+            restore_sinks: dict[int, dict[str, torch.Tensor]] = {}
             for b in range(B):
                 if b >= bt_rows or bt_cols == 0:
                     break
@@ -1383,6 +1387,14 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                 if s0 < 0:
                     continue
                 row0_set.add(s0)
+                pending = pending_restores.pop(s0, None)
+                committed = seq_lens_cpu[b] - query_lens_cpu[b]
+                if pending is not None and committed >= GROUP:
+                    restore_sinks[s0] = pending
+                    self._block_fill[s0] = GROUP
+                    sinks.add(s0)
+                    is_sink_t[s0] = True
+                    KVarNAttentionImpl._bump_allocator_lifecycle_epoch(gk)
                 if s0 in sinks:
                     blocks_needed.add(s0)  # live/retired sink keeps its slot
                 elif s0 in blocks_needed:  # written this step → fresh sink
@@ -1614,6 +1626,23 @@ class KVarNMetadataBuilder(AttentionMetadataBuilder[KVarNMetadata]):
                     KVarNAttentionImpl._max_known_block_id[gk] = max(
                         KVarNAttentionImpl._max_known_block_id.get(gk, 0), bid
                     )
+
+            # Restore only sinks adopted by this batch, after reclaim creates
+            # space. Pending/canceled loads never occupy GPU tail-pool slots.
+            for bid, layer_payloads in restore_sinks.items():
+                slot = dict_map[bid]
+                for impl in group_impls:
+                    payload = layer_payloads[impl.layer_name]
+                    impl._ensure_pool(device, num_blocks_hint=bid + 1)
+                    k = impl._tail_K_pool[slot]
+                    v = impl._tail_V_pool[slot]
+                    n = k.numel()
+                    values = payload.view(torch.float16)
+                    k.copy_(values[:n].view_as(k))
+                    v.copy_(values[n:].view_as(v))
+
+            for bid in blocks_needed:
+                pending_restores.pop(bid, None)
 
         # ── Persistent cu_seqlens buffers (in-place updated) ─────────────
         # A captured graph bakes in tensor addresses, so cu_seqlens MUST live
@@ -1946,6 +1975,127 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
     # Registry of impls so the builder can enumerate per-layer pools when
     # it needs to update sink markers / trigger flushes.
     _all_impls: ClassVar[list[KVarNAttentionImpl]] = []
+    _metadata_builders: ClassVar[weakref.WeakValueDictionary] = (
+        weakref.WeakValueDictionary()
+    )
+    _pending_cpu_sinks: ClassVar[dict[tuple, dict[int, dict[str, torch.Tensor]]]] = {}
+
+    @classmethod
+    def prepare_cpu_offload(
+        cls, layer_names: Sequence[str], block_ids: Sequence[int]
+    ) -> dict[int, torch.Tensor]:
+        """Materialize committed pages and snapshot their resident FP16 sinks.
+
+        The caller must pass only complete, committed cache blocks and fence
+        reuse until its copies finish. Active tail-pool residency is unchanged.
+        Each returned byte tensor follows ``layer_names`` order: two header
+        bytes (valid, reserved), then the layer's FP16 K and V tile bytes.
+        """
+        by_name = {impl.layer_name: impl for impl in cls._all_impls}
+        impls = [by_name[name] for name in layer_names]
+        bids = list(dict.fromkeys(int(bid) for bid in block_ids))
+        flush_pairs = []
+        sink_ids: set[int] = set()
+        for impl in impls:
+            gk = impl._group_key
+            resident = cls._block_to_slot_dict.get(gk, {})
+            builder = cls._metadata_builders.get(gk)
+            for bid in bids:
+                if bid not in resident:
+                    continue
+                if builder is None or builder._block_fill.get(bid, 0) < builder._group:
+                    raise RuntimeError("Cannot offload an incomplete KVarN page")
+                flush_pairs.append((impl, bid, impl._kv_cache_ref))
+                if bid in cls._global_sink_blocks.get(gk, set()):
+                    sink_ids.add(bid)
+        cls._batched_flush(flush_pairs)
+        layer_bytes = [2 + 2 * impl._tail_K_pool[0].numel() * 2 for impl in impls]
+        result = {}
+        for bid in sink_ids:
+            payload = torch.zeros(sum(layer_bytes), dtype=torch.uint8, device="cpu")
+            offset = 0
+            for impl, size in zip(impls, layer_bytes):
+                gk = impl._group_key
+                slot = cls._block_to_slot_dict.get(gk, {}).get(bid)
+                if slot is not None and bid in cls._global_sink_blocks.get(gk, set()):
+                    payload[offset] = 1
+                    k = impl._tail_K_pool[slot].view(torch.uint8).flatten()
+                    v = impl._tail_V_pool[slot].view(torch.uint8).flatten()
+                    payload[offset + 2 : offset + 2 + k.numel()].copy_(k)
+                    payload[offset + 2 + k.numel() : offset + size].copy_(v)
+                offset += size
+            result[bid] = payload
+        return result
+
+    @classmethod
+    def prepare_cpu_reload(
+        cls,
+        layer_names: Sequence[str],
+        block_ids: Sequence[int],
+        sink_payloads: dict[int, torch.Tensor],
+    ) -> None:
+        """Discard stale destination residency and queue owned CPU sink data.
+
+        Call after fenced page copies complete and before a restored request's
+        next metadata build. Packed history is immediately ready for use.
+        """
+        by_name = {impl.layer_name: impl for impl in cls._all_impls}
+        impls = [by_name[name] for name in layer_names]
+        bids = {int(bid) for bid in block_ids}
+        groups = {impl._group_key for impl in impls}
+        for gk in groups:
+            resident = cls._block_to_slot_dict.get(gk, {})
+            sinks = cls._global_sink_blocks.get(gk, set())
+            pending = cls._pending_cpu_sinks.setdefault(gk, {})
+            builder = cls._metadata_builders.get(gk)
+            for bid in bids:
+                slot = resident.pop(bid, None)
+                if slot is not None:
+                    cls._free_slots[gk].append(slot)
+                sinks.discard(bid)
+                pending.pop(bid, None)
+                if builder is not None:
+                    builder._block_fill.pop(bid, None)
+                    builder._retired_sinks.pop(bid, None)
+            for mkey, lookup in cls._block_to_slot_t_per_device.items():
+                if mkey[1] == gk:
+                    present = [bid for bid in bids if bid < lookup.shape[0]]
+                    lookup[present] = -1
+                    cls._is_sink_t_per_device[mkey][present] = False
+            cls._bump_allocator_lifecycle_epoch(gk)
+        for impl in impls:
+            for bid in bids:
+                impl._tails.pop(bid, None)
+
+        for bid, raw in sink_payloads.items():
+            if bid not in bids:
+                raise ValueError("KVarN sink payload has no destination page")
+            payload = raw.to(device="cpu", dtype=torch.uint8).contiguous().clone()
+            expected = sum(2 + 4 * impl._tail_K_pool[0].numel() for impl in impls)
+            if payload.numel() != expected:
+                raise ValueError("Invalid KVarN sink payload size")
+            offset = 0
+            per_group: dict[tuple, dict[str, torch.Tensor]] = {}
+            for impl in impls:
+                size = 2 + 4 * impl._tail_K_pool[0].numel()
+                if payload[offset].item():
+                    per_group.setdefault(impl._group_key, {})[impl.layer_name] = (
+                        payload[offset + 2 : offset + size]
+                    )
+                offset += size
+            for gk, layers in per_group.items():
+                required = {impl.layer_name for impl in impls if impl._group_key == gk}
+                if layers.keys() != required:
+                    raise ValueError("Incomplete KVarN sink group payload")
+                pending = cls._pending_cpu_sinks[gk]
+                limit = cls._allocator_pool_size[gk]
+                while len(pending) >= limit:
+                    pending.pop(next(iter(pending)))
+                    logger.warning_once(
+                        "KVarN pending sink restores reached tail-pool capacity; "
+                        "old canceled/delayed loads retain packed history."
+                    )
+                pending[bid] = layers
 
     @classmethod
     def _bump_allocator_lifecycle_epoch(cls, group_key: tuple) -> None:
@@ -2035,6 +2185,10 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls._pool_epoch_counter += 1
         cls._flush_index_counters.clear()
         cls._cached_prefill_materializer_counters.clear()
+        cls._pending_cpu_sinks.clear()
+        for builder in cls._metadata_builders.values():
+            builder._block_fill.clear()
+            builder._retired_sinks.clear()
         _hadamard_cached.cache_clear()
 
     @classmethod
@@ -2048,6 +2202,7 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         cls._qlen1_inline_plan = None
         cls._cached_prefill_materializer = None
         cls._all_impls.clear()
+        cls._metadata_builders.clear()
 
     @classmethod
     def _select_flush_index_materialization(

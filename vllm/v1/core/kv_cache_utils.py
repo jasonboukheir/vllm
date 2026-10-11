@@ -1979,7 +1979,9 @@ def get_kv_cache_config_from_groups(
             for group_id in attention_group_ids
         )
         max_model_len = vllm_config.model_config.max_model_len
-        if getattr(vllm_config.cache_config, "enable_prefix_caching", False):
+        if getattr(
+            vllm_config.cache_config, "enable_prefix_caching", False
+        ) and not _uses_independent_cpu_offload(vllm_config):
             checkpoint_groups = [
                 group_id
                 for group_id, group in enumerate(kv_cache_groups)
@@ -2963,6 +2965,16 @@ def _project_kv_cache_groups_to_worker(
     return projected_groups
 
 
+def _uses_independent_cpu_offload(vllm_config: VllmConfig) -> bool:
+    config = getattr(vllm_config, "kv_transfer_config", None)
+    return bool(
+        config is not None
+        and config.kv_connector == "OffloadingConnector"
+        and config.kv_connector_extra_config.get("spec_name")
+        == "IndependentCPUOffloadingSpec"
+    )
+
+
 def _validate_kv_transfer_pool_compat(
     vllm_config: VllmConfig, kv_cache_configs: list[KVCacheConfig]
 ) -> None:
@@ -2972,6 +2984,7 @@ def _validate_kv_transfer_pool_compat(
         kv_transfer_config is not None
         and kv_transfer_config.is_kv_transfer_instance
         and any(config.has_independent_kv_cache_pools for config in kv_cache_configs)
+        and not _uses_independent_cpu_offload(vllm_config)
     ):
         raise NotImplementedError(
             f"KV connector {kv_transfer_config.kv_connector} does not yet support "

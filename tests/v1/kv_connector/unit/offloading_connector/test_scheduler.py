@@ -57,6 +57,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCachePoolSpec,
     MambaSpec,
     SlidingWindowSpec,
 )
@@ -197,7 +198,9 @@ def test_swa_offload_window_covers_unaligned_hit(
     manager.complete_load(job.keys, state.req_context)
 
 
-def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
+def _make_partial_tail_scheduler(
+    independent_pools: bool = False,
+) -> OffloadingConnectorScheduler:
     vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
     vllm_config.cache_config.prefix_match_unit = 4
     vllm_config.speculative_config = None
@@ -205,6 +208,16 @@ def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
         enable_kv_cache_events=True, publisher="null"
     )
     kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    if independent_pools:
+        kv_cache_config = KVCacheConfig(
+            num_blocks=100,
+            kv_cache_tensors=[],
+            kv_cache_groups=kv_cache_config.kv_cache_groups,
+            kv_cache_pools=[
+                KVCachePoolSpec(num_blocks=128, group_ids=[0]),
+                KVCachePoolSpec(num_blocks=100, group_ids=[1]),
+            ],
+        )
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
 
@@ -424,6 +437,35 @@ def test_normal_store_excludes_align_mode_mamba_sources():
     assert isinstance(src_spec, GPULoadStoreSpec)
     assert src_spec.block_ids.tolist() == [11]
     assert src_spec.group_sizes == [1, 0]
+
+
+@pytest.mark.parametrize("cow_reuse", [False, True])
+def test_independent_pool_reuse_flushes_only_its_own_pending_store(cow_reuse):
+    """Attention ID 99 cannot flush the unrelated recurrent pool's ID 99."""
+    scheduler = _make_partial_tail_scheduler(independent_pools=True)
+    _make_partial_tail_request(scheduler)
+    scheduler.manager.prepare_store.side_effect = lambda keys, ctx: (
+        generate_store_output(keys)
+    )
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"req": [(1, 99, 16)]},
+    )
+    [job_id] = scheduler.build_connector_meta(output).store_jobs
+
+    for group_id in (0, 1):
+        output = SchedulerOutput.make_empty()
+        if cow_reuse:
+            output.kv_cache_block_copies = [KVCacheBlockCopy(98, 99, group_id=group_id)]
+        else:
+            output.scheduled_cached_reqs.req_ids = ["req"]
+            output.scheduled_cached_reqs.new_block_ids = [
+                ([99], []) if group_id == 0 else ([], [99])
+            ]
+        meta = scheduler.build_connector_meta(output)
+        assert meta.jobs_to_flush == ({job_id} if group_id == 1 else set())
 
 
 def test_partial_lookup_returns_exact_boundary_and_group_load_keys():

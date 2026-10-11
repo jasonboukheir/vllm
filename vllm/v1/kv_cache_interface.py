@@ -1528,6 +1528,7 @@ class KVCacheConfig:
     """Physical cache pools, or one shared legacy pool when omitted."""
 
     def __post_init__(self) -> None:
+        implicit_pool = self.kv_cache_pools is None
         if self.kv_cache_pools is None:
             self.kv_cache_pools = [
                 KVCachePoolSpec(
@@ -1538,7 +1539,7 @@ class KVCacheConfig:
 
         group_pool_ids: list[int | None] = [None] * len(self.kv_cache_groups)
         for pool_id, pool in enumerate(self.kv_cache_pools):
-            if pool.num_blocks <= 0:
+            if pool.num_blocks < 0 or (pool.num_blocks == 0 and not implicit_pool):
                 raise ValueError("KV cache pools must contain at least one block")
             for group_id in pool.group_ids:
                 if not 0 <= group_id < len(self.kv_cache_groups):

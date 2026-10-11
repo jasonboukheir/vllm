@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import logging
 import random
 import time
@@ -18,9 +19,13 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
+    ReqContext,
     TransferResult,
+    make_offload_key,
 )
-from vllm.v1.kv_offload.cpu import gpu_worker
+from vllm.v1.kv_offload.config import OffloadingConfig, OffloadingGroupConfig
+from vllm.v1.kv_offload.cpu import gpu_worker, independent
+from vllm.v1.kv_offload.cpu.byte_pool import BytePoolOffloadingManager
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
@@ -35,6 +40,127 @@ DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:0"]
 NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
+
+
+@pytest.mark.parametrize("has_sink", [False, True])
+def test_independent_host_roundtrip_preserves_group_pages_and_sink_bytes(
+    monkeypatch: pytest.MonkeyPatch, has_sink: bool
+) -> None:
+    """Check copy addresses on CPU, including unequal pools and strided layers."""
+    from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
+
+    groups = (
+        OffloadingGroupConfig(
+            group_id=3,
+            tokens_per_block=128,
+            layer_names=("attention.0", "attention.1"),
+            page_size_bytes=20,
+            sink_size_bytes=8,
+        ),
+        OffloadingGroupConfig(
+            group_id=7,
+            tokens_per_block=128,
+            layer_names=("recurrent",),
+            page_size_bytes=96,
+        ),
+    )
+    config = MagicMock(spec=OffloadingConfig, groups=groups)
+    # Layer views need not have a row stride equal to their payload size.
+    tensors = [
+        torch.arange(7 * 12, dtype=torch.uint8).view(7, 12)[:, 2:9],
+        torch.arange(7 * 19, dtype=torch.uint8).view(7, 19)[:, 3:16],
+        torch.arange(3 * 96, dtype=torch.int64).to(torch.uint8).view(3, 96),
+    ]
+    caches = CanonicalKVCaches(
+        tensors=[CanonicalKVCacheTensor(t, t.shape[1]) for t in tensors],
+        group_data_refs=[
+            [CanonicalKVCacheRef(0, 7), CanonicalKVCacheRef(1, 13)],
+            [CanonicalKVCacheRef(2, 96)],
+        ],
+    )
+    empty = torch.empty
+
+    def pageable_empty(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(independent.torch, "empty", pageable_empty)
+    platform = MagicMock()
+    platform.is_xpu.return_value = True
+    monkeypatch.setattr(independent, "current_platform", platform)
+    sink = torch.arange(6, dtype=torch.uint8)
+    snapshots = MagicMock(return_value={1: sink} if has_sink else {})
+    reloads = MagicMock()
+    monkeypatch.setattr(KVarNAttentionImpl, "prepare_cpu_offload", snapshots)
+    monkeypatch.setattr(KVarNAttentionImpl, "prepare_cpu_reload", reloads)
+    worker = independent.IndependentCPUOffloadingWorker(config, caches, 512)
+    regions = [
+        (t.untyped_storage().data_ptr(), t.untyped_storage().nbytes())
+        for t in [*tensors, worker.host]
+    ]
+
+    def copy_bytes(src, dst, sizes):
+        assert src.dtype == dst.dtype == sizes.dtype == torch.uint64
+        for source, destination, size in zip(
+            src.tolist(), dst.tolist(), sizes.tolist()
+        ):
+            for address in (source, destination):
+                assert any(
+                    base <= address and address + size <= base + length
+                    for base, length in regions
+                )
+            ctypes.memmove(destination, source, size)
+
+    monkeypatch.setattr(independent.ops, "swap_blocks_batch", copy_bytes)
+    manager = BytePoolOffloadingManager(
+        512, {3: 20, 7: 96}, sink_bytes={3: 8}, tokens_per_block={3: 128}
+    )
+    ctx = ReqContext("roundtrip")
+    keys = [
+        make_offload_key(b"first", 3),
+        make_offload_key(b"second", 3),
+        make_offload_key(b"first", 7),
+    ]
+    ctx.set_offload_key_position(keys[0], 128)
+    ctx.set_offload_key_position(keys[1], 256)
+    stored = manager.prepare_store(keys, ctx)
+    assert stored is not None
+    original = [tensor.clone() for tensor in tensors]
+    assert worker.submit_store(
+        1,
+        GPULoadStoreSpec([1, 5, 1], group_sizes=(2, 1), block_indices=(0, 0)),
+        stored.store_spec,
+    )
+    manager.complete_store(keys, ctx)
+    snapshots.assert_called_once_with(groups[0].layer_names, [1, 5])
+
+    for tensor in tensors:
+        tensor.zero_()
+    assert worker.submit_load(
+        2,
+        manager.prepare_load(keys, ctx),
+        GPULoadStoreSpec([6, 2, 2], group_sizes=(2, 1), block_indices=(0, 0)),
+    )
+    manager.complete_load(keys, ctx)
+    for index, tensor in enumerate(tensors):
+        mappings = {6: 1, 2: 5} if index < 2 else {2: 1}
+        for destination, row in enumerate(tensor):
+            source = mappings.get(destination)
+            expected = (
+                original[index][source] if source is not None else torch.zeros_like(row)
+            )
+            torch.testing.assert_close(row, expected)
+    reloads.assert_called_once()
+    names, ids, sinks = reloads.call_args.args
+    assert names == groups[0].layer_names and ids == [6, 2]
+    assert set(sinks) == ({6} if has_sink else set())
+    if has_sink:
+        torch.testing.assert_close(sinks[6], sink)
+    results = worker.get_finished()
+    assert [r.job_id for r in results] == [1, 2]
+    assert all(r.success and r.transfer_size == 136 + 6 * has_sink for r in results)
+    assert worker.get_finished() == []
+    assert platform.current_stream.return_value.synchronize.call_count == 2
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-specific test")

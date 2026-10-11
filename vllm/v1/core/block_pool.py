@@ -170,6 +170,7 @@ class BlockPool:
         self.medium = medium
         self.pool_id = pool_id
         self.enable_caching = enable_caching
+        self.retain_idle_cache = True
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
@@ -730,6 +731,8 @@ class BlockPool:
             block.ref_cnt -= 1
             self._reuse_watchers[block.block_id] = on_reuse
             if block.ref_cnt == 0:
+                if not self.retain_idle_cache:
+                    self._maybe_evict_cached_block(block)
                 released.append(block)
         self.free_block_queue.append_n(released)
 
@@ -797,6 +800,8 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
+                if not self.retain_idle_cache:
+                    self._maybe_evict_cached_block(block)
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
