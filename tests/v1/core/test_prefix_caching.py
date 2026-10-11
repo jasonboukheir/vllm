@@ -61,6 +61,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupRole,
     KVCacheGroupSpec,
+    KVCachePoolSpec,
     KVCacheSpecKind,
     MambaSpec,
     MLAAttentionSpec,
@@ -127,6 +128,14 @@ def make_kv_cache_manager(kv_cache_config: KVCacheConfig, **kwargs) -> KVCacheMa
     config (LCM of group block sizes) unless explicitly provided. This mirrors
     ``resolve_kv_cache_block_sizes`` for the non-context-parallel case used by
     these tests, so callers don't have to pass it at every site."""
+    if kwargs.pop("independent_pools", False):
+        kv_cache_config = replace(
+            kv_cache_config,
+            kv_cache_pools=[
+                KVCachePoolSpec(num_blocks=kv_cache_config.num_blocks, group_ids=[i])
+                for i in range(len(kv_cache_config.kv_cache_groups))
+            ],
+        )
     kwargs.setdefault(
         "scheduler_block_size",
         lcm(*(g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups)),
@@ -4957,7 +4966,8 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     assert [len(blocks) for blocks in computed_blocks.blocks] == [2, 8]
 
 
-def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
+@pytest.mark.parametrize("independent_pools", [False, True])
+def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt(independent_pools):
     """An identical resend and a longer sibling resume at DIFFERENT positions.
 
     How far a lookup matches depends on who is asking. A resend of the same
@@ -5006,6 +5016,7 @@ def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
         hash_block_size=block_size,
         retention_interval=0,
         use_eagle=True,
+        independent_pools=independent_pools,
     )
 
     # 128 tokens, an exact multiple of the 32-token alignment. A longer sibling
@@ -5015,23 +5026,40 @@ def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
     req0 = make_request("0", token_ids, block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
     assert num_computed_tokens == 0
-    # Prefill in block-aligned chunks the way the align-mode scheduler does: a
-    # state only materializes as a chunk's running-state block, so a
-    # single-shot prefill could not retain the lower one.
-    for chunk_end in (32, 64, 96, 128):
+    # Drive the real splitter: retaining a boundary is insufficient unless the
+    # scheduler also materializes the recurrent state there.
+    scheduler = SimpleNamespace(
+        mamba_prefill_alignment=block_size,
+        needs_mamba_cache_alignment=True,
+        use_eagle_block_drop=True,
+        hash_block_size=block_size,
+        mamba_has_prefill_checkpoint_blocks=False,
+        mamba_partial_cache_hit=False,
+        mamba_shared_prefix_checkpoint=False,
+        max_num_scheduled_tokens=2048,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+    )
+    chunk_ends = []
+    while req0.num_computed_tokens < req0.num_tokens:
+        num_new_tokens = Scheduler._mamba_block_aligned_split(
+            scheduler, req0, req0.num_tokens - req0.num_computed_tokens
+        )
         blocks = manager.allocate_slots(
             req0,
-            chunk_end - req0.num_computed_tokens,
+            num_new_tokens,
             num_computed_tokens,
             computed_blocks,
             num_lookahead_tokens=num_spec,
         )
         assert blocks is not None
-        req0.num_computed_tokens = chunk_end
+        req0.num_computed_tokens += num_new_tokens
+        chunk_ends.append(req0.num_computed_tokens)
+        manager.new_step_starts()
+    assert chunk_ends == [64, 96, 128]
 
     # Block ``i`` ends at token ``(i + 1) * 32``, so positions 64 and 96 are
     # mamba blocks 1 and 2.
-    pool = manager.block_pool
+    pool = manager.coordinator.single_type_managers[1].block_pool
     expected_mamba_cached = {1, 2}
     for i in range(4):
         cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
@@ -5815,7 +5843,8 @@ def test_mamba_shared_prefix_survives_zero_retention():
     assert cached_mamba_blocks(96) == {5, 14}
 
 
-def test_mamba_shared_prefix_reuse_under_zero_retention():
+@pytest.mark.parametrize("independent_pools", [False, True])
+def test_mamba_shared_prefix_reuse_under_zero_retention(independent_pools):
     """Full cross-request Marconi flow: a partial shared prefix cached by the
     detecting request must stay reusable by a later request under
     ``prefix_cache_retention_interval=0``. Without the pin the junction is
@@ -5830,6 +5859,7 @@ def test_mamba_shared_prefix_reuse_under_zero_retention():
             enable_caching=True,
             hash_block_size=block_size,
             retention_interval=retention,
+            independent_pools=independent_pools,
         )
         shared = [7 for _ in range(2 * block_size)]  # 2-block shared prefix
 

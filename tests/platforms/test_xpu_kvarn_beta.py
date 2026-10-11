@@ -104,6 +104,15 @@ def test_kvarn_beta_accepts_supported_eager_text_configuration() -> None:
     _check_kvarn_beta_unsupported_config(_config(), CUDAGraphMode.NONE)
 
 
+@pytest.mark.parametrize("num_speculative_tokens", [1, 2])
+def test_k4v2_qwen_mtp_accepts_prefix_caching(num_speculative_tokens):
+    config = _mtp_config()
+    config.cache_config.cache_dtype = "kvarn_k4v2_g128_compact"
+    config.cache_config.enable_prefix_caching = True
+    config.speculative_config.num_speculative_tokens = num_speculative_tokens
+    _check_kvarn_beta_unsupported_config(config, CUDAGraphMode.NONE)
+
+
 @pytest.mark.parametrize(
     "draft_dtype",
     [

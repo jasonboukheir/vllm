@@ -27,6 +27,8 @@ BLOCK_SIZE = 4
 
 def _make_manager(
     pool_capacities: tuple[int, int] = (5, 2),
+    *,
+    enable_caching: bool = False,
 ) -> KVCacheManager:
     groups = [
         KVCacheGroupSpec(
@@ -55,7 +57,7 @@ def _make_manager(
         max_model_len=64,
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
-        enable_caching=False,
+        enable_caching=enable_caching,
     )
 
 
@@ -232,3 +234,45 @@ def test_mamba_zeroing_ids_remain_group_qualified():
     assert blocks is not None
     assert manager.take_new_block_ids()
     assert manager.take_new_mamba_block_ids() == [(1, [1])]
+
+
+def test_prefix_hits_keep_overlapping_block_ids_in_their_own_pools():
+    manager = _make_manager((8, 6), enable_caching=True)
+    first = _request("first", 12)
+    assert manager.allocate_slots(first, num_new_tokens=12) is not None
+    manager.cache_blocks(first, 12)
+    manager.free(first)
+
+    second = _request("second", 13)
+    cached, hit, _ = manager.get_computed_blocks(second)
+    assert hit == 12
+    assert [_ids(group) for group in cached.blocks] == [
+        [(0, 1), (0, 2), (0, 3)],
+        [(1, 1), (1, 2), (1, 3)],
+    ]
+    assert (
+        manager.allocate_slots(
+            second,
+            num_new_tokens=1,
+            num_new_computed_tokens=hit,
+            new_computed_blocks=cached,
+        )
+        is not None
+    )
+    assert all(block.ref_cnt == 1 for group in cached.blocks for block in group)
+    manager.free(second)
+    assert manager.reset_prefix_cache()
+    assert manager.get_computed_blocks(_request("after-reset", 13))[1] == 0
+
+
+def test_prefix_hit_requires_matching_cached_blocks_in_every_pool():
+    manager = _make_manager((8, 6), enable_caching=True)
+    first = _request("first", 12)
+    assert manager.allocate_slots(first, num_new_tokens=12) is not None
+    manager.cache_blocks(first, 12)
+    manager.free(first)
+
+    manager.coordinator.block_pools[1].evict_blocks({2})
+    cached, hit, _ = manager.get_computed_blocks(_request("second", 13))
+    assert hit == 4
+    assert [_ids(group) for group in cached.blocks] == [[(0, 1)], [(1, 1)]]
