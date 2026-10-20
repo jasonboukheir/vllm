@@ -95,3 +95,25 @@ def test_no_forward_starts_deferred_load_once(monkeypatch: pytest.MonkeyPatch):
     connector.no_forward(_scheduler_output(False))
 
     assert events == ["handle", "bind", "start", "wait", "clear"]
+
+
+def test_deferred_store_precedes_page_reuse_and_restore(monkeypatch):
+    connector = _make_connector(monkeypatch, [])
+    page = torch.tensor([41])
+    saved = []
+    connector.kv_connector.handle_preemptions.side_effect = lambda _: saved.append(
+        page.clone()
+    )
+    connector.kv_connector.start_load_kv.side_effect = lambda *a, **kw: page.fill_(73)
+    output = _scheduler_output(True)
+
+    connector.prepare_cache_update(output)
+    # The runner initializes recycled pages between the save fence and load.
+    page.zero_()
+    connector.pre_forward(output)
+
+    assert len(saved) == 1 and saved[0].item() == 41
+    assert page.item() == 73
+    connector.post_forward(set())
+    connector.prepare_cache_update(_scheduler_output(False))
+    assert len(saved) == 2 and saved[1].item() == 73

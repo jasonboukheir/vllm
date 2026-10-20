@@ -1545,6 +1545,11 @@ def _make_fake_kv_cache_manager():
         _FakeSingleTypeManager(True, 16, [10, 11, 12, 13, 14, 15]),  # attention
         _FakeSingleTypeManager(False, 16, [20, 21, 22, 23, 24, 25]),  # mamba
     )
+    manager.kv_cache_config = MagicMock()
+    manager.kv_cache_config.kv_cache_groups = (
+        MagicMock(enable_kv_transfer=True),
+        MagicMock(enable_kv_transfer=False),
+    )
     return manager
 
 
@@ -1573,7 +1578,7 @@ def test_failed_load_rezeroes_unwritten_skipped_blocks():
 
     # Attention blocks covering tokens >= 48 are re-recorded for zeroing
     # and flow into the next step's zero list; Mamba blocks are not.
-    assert scheduler._get_new_block_ids_to_zero() == [13, 14, 15]
+    assert scheduler._get_new_block_ids_to_zero() == [(0, [13, 14, 15])]
 
 
 # ── Mamba N-1 prefill tests ──────────────────────────────────────────────

@@ -54,6 +54,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -351,11 +352,16 @@ class Scheduler(SchedulerInterface):
             if self.num_spec_tokens
             else 0
         )
-        self._spec_decode_step_blocks = sum(
-            cdiv(num_spec_decode_tokens, manager.block_size)
-            for manager in self.kv_cache_manager.coordinator.single_type_managers
-            if not isinstance(manager.kv_cache_spec, MambaSpec)
-        )
+        spec_decode_step_blocks = [0] * len(self.kv_cache_manager.block_pools)
+        for group_id, manager in enumerate(
+            self.kv_cache_manager.coordinator.single_type_managers
+        ):
+            if not isinstance(manager.kv_cache_spec, MambaSpec):
+                pool_id = kv_cache_config.pool_id_for_group(group_id)
+                spec_decode_step_blocks[pool_id] += cdiv(
+                    num_spec_decode_tokens, manager.block_size
+                )
+        self._spec_decode_step_blocks = tuple(spec_decode_step_blocks)
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
@@ -1288,16 +1294,20 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
-                reserved_blocks = 0
+                reserved_blocks: tuple[int, ...] = ()
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations)
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
-                    reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
-                        + self._spec_decode_step_blocks
+                    reserved_blocks = tuple(
+                        prefill + decode
+                        for prefill, decode in zip(
+                            self._inflight_prefill_reserved_blocks(),
+                            self._spec_decode_step_blocks,
+                            strict=True,
+                        )
                     )
 
                 # Replayed tokens are already counted in the adopted hit; a
@@ -1564,6 +1574,9 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
+            new_mamba_block_ids_to_zero=(
+                self.kv_cache_manager.take_new_mamba_block_ids() or None
+            ),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
             kv_connector_block_state=kv_connector_block_state,
@@ -1610,7 +1623,9 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _get_new_block_ids_to_zero(self) -> list[int] | None:
+    def _get_new_block_ids_to_zero(
+        self,
+    ) -> list[tuple[int, list[int]]] | None:
         # Drain new attention block ids every step so the manager-side list
         # does not grow unbounded; only kv-cache zeroing consumes them.
         new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()
@@ -3107,23 +3122,40 @@ class Scheduler(SchedulerInterface):
             )
         return delay_free or partial_tail_delay, kv_xfer_params
 
-    def _request_remaining_blocks(self, request: Request) -> int:
-        """Blocks `request` still needs to hold its full sequence and be promoted."""
+    def _request_remaining_blocks(self, request: Request) -> tuple[int, ...]:
+        """Per-pool blocks still needed to finish prefill and enter decode."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
         num_tokens = full_num_tokens
         if self.num_spec_tokens:
             num_tokens += 1 + self.num_spec_tokens + self.num_lookahead_tokens
-        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
-            request_id=request.request_id,
-            num_tokens=num_tokens,
-            new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
-            num_encoder_tokens=0,
-            total_computed_tokens=request.num_computed_tokens,
-            num_local_computed_tokens=request.num_computed_tokens,
-            num_tokens_main_model=full_num_tokens,
-            apply_admission_cap=True,
-            prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+        coordinator = self.kv_cache_manager.coordinator
+        required = list(
+            coordinator.get_num_blocks_to_allocate_by_pool(
+                request_id=request.request_id,
+                num_tokens=num_tokens,
+                new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=request.num_computed_tokens,
+                num_local_computed_tokens=request.num_computed_tokens,
+                num_tokens_main_model=full_num_tokens,
+                apply_admission_cap=True,
+                prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+            )
         )
+        if (
+            self.kv_cache_config.has_independent_kv_cache_pools
+            and request.status == RequestStatus.RUNNING
+        ):
+            assert self.kv_cache_config.kv_cache_pools is not None
+            for pool_id, pool in enumerate(self.kv_cache_config.kv_cache_pools):
+                if len(pool.group_ids) != 1:
+                    continue
+                manager = coordinator.single_type_managers[pool.group_ids[0]]
+                if isinstance(manager, MambaManager):
+                    required[pool_id] = manager.cap_future_reservation(
+                        request.request_id, required[pool_id]
+                    )
+        return tuple(required)
 
     def _set_kv_fetch_stage(self, request: Request, stage: str | None) -> None:
         kv_fetch_stages = self._kv_fetch_stages
@@ -3135,11 +3167,13 @@ class Scheduler(SchedulerInterface):
                 kv_fetch_stages[request] = stage
                 self._kv_fetch_counts[stage] += 1
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
-        """Num blocks in-flight prefills still need to finish (their reservation)."""
-        return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
-        )
+    def _inflight_prefill_reserved_blocks(self) -> tuple[int, ...]:
+        """Reserve each prefill's remaining blocks in their physical pool."""
+        reserved = [0] * len(self.kv_cache_manager.block_pools)
+        for request in self._inflight_prefills:
+            for pool_id, required in enumerate(self._request_remaining_blocks(request)):
+                reserved[pool_id] += required
+        return tuple(reserved)
 
     def _load_restores_replay_window(self, request: Request) -> bool:
         """Whether the KV connector's load for ``request`` restores every DSV41

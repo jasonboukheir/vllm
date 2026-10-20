@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call
@@ -37,6 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     get_sliding_window_size_in_chunks,
 )
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_coordinator import replay_boundaries
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -57,6 +59,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCachePoolSpec,
     MambaSpec,
     SlidingWindowSpec,
 )
@@ -200,6 +203,7 @@ def test_swa_offload_window_covers_unaligned_hit(
 
 def _make_partial_tail_scheduler(
     recurrent_only: bool = False,
+    independent_pools: bool = False,
 ) -> OffloadingConnectorScheduler:
     vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
     vllm_config.cache_config.prefix_match_unit = None if recurrent_only else 4
@@ -209,7 +213,21 @@ def _make_partial_tail_scheduler(
     )
     kv_cache_config = _make_mamba_hybrid_kv_cache_config()
     if recurrent_only:
-        kv_cache_config.kv_cache_groups = kv_cache_config.kv_cache_groups[1:]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=100,
+            kv_cache_tensors=[],
+            kv_cache_groups=kv_cache_config.kv_cache_groups[1:],
+        )
+    if independent_pools:
+        kv_cache_config = KVCacheConfig(
+            num_blocks=100,
+            kv_cache_tensors=[],
+            kv_cache_groups=kv_cache_config.kv_cache_groups,
+            kv_cache_pools=[
+                KVCachePoolSpec(num_blocks=128, group_ids=[0]),
+                KVCachePoolSpec(num_blocks=100, group_ids=[1]),
+            ],
+        )
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
 
@@ -429,6 +447,35 @@ def test_normal_store_excludes_align_mode_mamba_sources():
     assert isinstance(src_spec, GPULoadStoreSpec)
     assert src_spec.block_ids.tolist() == [11]
     assert src_spec.group_sizes == [1, 0]
+
+
+@pytest.mark.parametrize("cow_reuse", [False, True])
+def test_independent_pool_reuse_flushes_only_its_own_pending_store(cow_reuse):
+    """Attention ID 99 cannot flush the unrelated recurrent pool's ID 99."""
+    scheduler = _make_partial_tail_scheduler(independent_pools=True)
+    _make_partial_tail_request(scheduler)
+    scheduler.manager.prepare_store.side_effect = lambda keys, ctx: (
+        generate_store_output(keys)
+    )
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"req": [(1, 99, 16)]},
+    )
+    [job_id] = scheduler.build_connector_meta(output).store_jobs
+
+    for group_id in (0, 1):
+        output = SchedulerOutput.make_empty()
+        if cow_reuse:
+            output.kv_cache_block_copies = [KVCacheBlockCopy(98, 99, group_id=group_id)]
+        else:
+            output.scheduled_cached_reqs.req_ids = ["req"]
+            output.scheduled_cached_reqs.new_block_ids = [
+                ([99], []) if group_id == 0 else ([], [99])
+            ]
+        meta = scheduler.build_connector_meta(output)
+        assert meta.jobs_to_flush == ({job_id} if group_id == 1 else set())
 
 
 def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
@@ -4791,6 +4838,7 @@ class TestSharedGroupMTPOffload:
         )
         kv_group_configs = runner.connector_scheduler.config.kv_group_configs
         assert [c.is_eagle_group for c in kv_group_configs] == [False, False]
+        assert runner.connector_scheduler.replay_boundaries(12) == (4, 8)
 
         runner.new_request(token_ids=[0] * block_size * 3)
         runner.manager.prepare_store.side_effect = lambda keys, req_context: (
@@ -4822,7 +4870,9 @@ class TestMambaHybridOffloadServing:
     MAMBA_BLOCK = 16
     PROMPT_TOKENS = 28  # 7 hash blocks; 1 full mamba chunk
 
-    def _make_scheduler(self, speculative_config, mamba_eagle=False):
+    def _make_scheduler(
+        self, speculative_config, mamba_eagle=False, with_draft_window=False
+    ):
         vllm_config = _make_vllm_config(
             extra_config={"self_describing_kv_events": True}
         )
@@ -4857,10 +4907,35 @@ class TestMambaHybridOffloadServing:
                 ),
             ],
         )
+        if with_draft_window:
+            kv_cache_config.kv_cache_groups.append(
+                KVCacheGroupSpec(
+                    ["draft_layer"],
+                    SlidingWindowSpec(
+                        block_size=self.BLOCK,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                        sliding_window=2 * self.BLOCK,
+                    ),
+                )
+            )
+            # Rebuild the pool mapping after adding the group's physical cache.
+            kv_cache_config = KVCacheConfig(
+                num_blocks=64,
+                kv_cache_tensors=[],
+                kv_cache_groups=kv_cache_config.kv_cache_groups,
+            )
+            vllm_config.cache_config.prefix_cache_retention_interval = 0
         spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
-        return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+        scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+        if with_draft_window:
+            scheduler.replay_boundaries = partial(
+                replay_boundaries, scheduler_block_size=self.BLOCK, use_eagle=True
+            )
+        return scheduler
 
-    def _roundtrip_served_tokens(self, scheduler) -> int:
+    def _roundtrip_served_tokens(self, scheduler, boundary_tokens=None) -> int:
         """Request A: prompt-only store, finish; request A2: served tokens."""
         stored: set = set()
         scheduler.manager.lookup.side_effect = lambda key, ctx: (
@@ -4890,6 +4965,7 @@ class TestMambaHybridOffloadServing:
             request.num_prompt_tokens = self.PROMPT_TOKENS
             request.num_tokens = self.PROMPT_TOKENS
             request.num_computed_tokens = 0
+            request.shared_prefix_boundary = 0
             request.block_hashes = [
                 BlockHash(f"h{i}".encode())
                 for i in range(self.PROMPT_TOKENS // self.BLOCK)
@@ -4911,6 +4987,8 @@ class TestMambaHybridOffloadServing:
         n_mamba = self.PROMPT_TOKENS // self.MAMBA_BLOCK
         req_status.group_states[0].block_ids[:] = list(range(1, n_full + 1))
         req_status.group_states[1].block_ids[:] = list(range(101, 101 + n_mamba + 1))
+        if len(req_status.group_states) == 3:
+            req_status.group_states[2].block_ids[:] = list(range(201, 201 + n_full))
 
         out = SimpleNamespace(
             num_scheduled_tokens={"A": self.PROMPT_TOKENS},
@@ -4918,7 +4996,9 @@ class TestMambaHybridOffloadServing:
             kv_connector_block_state=KVConnectorBlockState(
                 req_ids=set(),
                 resolve_block_ids={}.__getitem__,
-                boundary_state_offloads={"A": [(1, 101, self.MAMBA_BLOCK)]},
+                boundary_state_offloads={
+                    "A": [(1, 101, boundary_tokens or self.MAMBA_BLOCK)]
+                },
             ),
         )
         scheduler._build_partial_tail_store_jobs(out)
@@ -4965,3 +5045,15 @@ class TestMambaHybridOffloadServing:
             False,
         ]
         assert self._roundtrip_served_tokens(scheduler) == 16
+
+    @pytest.mark.parametrize("prompt_tokens", [44, 45])
+    def test_sparse_draft_window_restores_at_recurrent_replay_boundary(
+        self, prompt_tokens
+    ):
+        self.MAMBA_BLOCK = self.BLOCK
+        self.PROMPT_TOKENS = prompt_tokens
+        scheduler = self._make_scheduler(
+            _shared_kv_mtp_config(), with_draft_window=True
+        )
+        boundary = replay_boundaries(prompt_tokens, self.BLOCK, True)[0]
+        assert self._roundtrip_served_tokens(scheduler, boundary) == boundary

@@ -593,8 +593,11 @@ class VllmConfig:
         # Recycling-aware KV cache specs (sliding-window, chunked-local) reserve
         # for this because out-of-window blocks are freed on the processed-token
         # basis, so in-flight steps transiently keep their blocks.
+        # The drafter can write beyond the last scheduled target token. Include
+        # that trailing margin in both startup sizing and runtime admission.
         return (
             self.max_concurrent_batches * self.scheduler_config.max_num_batched_tokens
+            + self.num_lookahead_tokens
         )
 
     @property
@@ -2913,6 +2916,8 @@ class VllmConfig:
 
     def _get_v2_model_runner_unsupported_features(self) -> list[str]:
         """Collect features not yet supported by the V2 model runner."""
+        from vllm.platforms import current_platform
+
         unsupported: list[str] = []
         speculative_config = self.speculative_config
 
@@ -2949,6 +2954,16 @@ class VllmConfig:
 
         if self.parallel_config.use_ubatching:
             unsupported.extend(self._get_dbo_unsupported_features())
+
+        cache_dtype = self.cache_config.cache_dtype
+        if (
+            isinstance(cache_dtype, str)
+            and cache_dtype.startswith("kvarn_")
+            and not (
+                current_platform.is_xpu() and cache_dtype == "kvarn_k4v2_g128_compact"
+            )
+        ):
+            unsupported.append("KVarN KV cache (requires Model Runner V1)")
 
         return unsupported
 
