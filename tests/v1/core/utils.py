@@ -18,6 +18,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.config.cache import MambaCacheMode
 from vllm.config.model import RunnerOption
 from vllm.config.scheduler import SchedulerPolicy
 from vllm.multimodal.inputs import (
@@ -79,6 +80,8 @@ def create_scheduler(
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
+    kv_cache_config: KVCacheConfig | None = None,
+    mamba_cache_mode: MambaCacheMode = "none",
     runner: RunnerOption = "auto",
     per_request_spec_decode_metrics: str = "none",
     scheduling_policy: SchedulerPolicy = "fcfs",
@@ -140,6 +143,7 @@ def create_scheduler(
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
         enable_prefix_caching=enable_prefix_caching,
+        mamba_cache_mode=mamba_cache_mode,
     )
     kv_transfer_config = None
     if isinstance(use_kv_connector, MockKVConfig):
@@ -221,11 +225,12 @@ def create_scheduler(
             head_size=1,
             dtype=torch.float32,
         )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,  # A large number of blocks to hold all requests
-        kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
-    )
+    if kv_cache_config is None:
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,  # A large number of blocks to hold all requests
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(["layer"], kv_cache_spec)],
+        )
     cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(vllm_config)
     if scheduler_cls is None:

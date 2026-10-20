@@ -23,12 +23,17 @@ from vllm.v1.outputs import (
 )
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
 class KVConnector:
     """KVConnector interface used by GPUModelRunner."""
+
+    def prepare_cache_update(self, scheduler_output: "SchedulerOutput") -> None:
+        """Fence outgoing pages before the runner reuses their storage."""
+        pass
 
     def pre_forward(
         self,
@@ -65,7 +70,17 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
 
         self._pending_load_kwargs: dict[str, Any] | None = None
+        self._prepared_metadata: KVConnectorMetadata | None = None
         self._disabled = False
+
+    def prepare_cache_update(self, scheduler_output: "SchedulerOutput") -> None:
+        if self._disabled:
+            return
+        metadata = scheduler_output.kv_connector_metadata
+        assert metadata is not None
+        if self._prepared_metadata is not metadata:
+            self.kv_connector.handle_preemptions(metadata)
+            self._prepared_metadata = metadata
 
     def pre_forward(
         self,
@@ -78,8 +93,9 @@ class ActiveKVConnector(KVConnector):
 
         kv_connector_metadata = scheduler_output.kv_connector_metadata
         assert kv_connector_metadata is not None
-        self.kv_connector.handle_preemptions(kv_connector_metadata)
+        self.prepare_cache_update(scheduler_output)
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
+        self._prepared_metadata = None
         self._pending_load_kwargs = self._build_load_kwargs(
             scheduler_output, input_batch, attn_metadata
         )
