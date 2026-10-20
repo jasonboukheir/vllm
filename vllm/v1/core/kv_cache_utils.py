@@ -164,6 +164,8 @@ class KVCacheBlock:
 
     # Block ID, ranging from 0 to num_gpu_blocks - 1.
     block_id: int
+    # Physical block-pool namespace. Block IDs are only unique within a pool.
+    pool_id: int = field(default=0, kw_only=True)
     # Reference count.
     ref_cnt: int = 0
     # Deferred frees may contain blocks from multiple pools.
@@ -253,6 +255,9 @@ def trim_null_head(blocks: _BlockSeq) -> _BlockSeq:
 class KVCacheBlockCopy(NamedTuple):
     src_block_id: int
     dst_block_id: int
+    # Block IDs are local to a physical pool. The originating group identifies
+    # that pool; group zero preserves the legacy single-pool construction.
+    group_id: int = 0
 
 
 class FreeKVCacheBlockQueue:
@@ -1073,6 +1078,17 @@ def get_max_concurrency_for_kv_cache_config(
 
     Host groups use a separate pool; the smaller concurrency limit applies.
     """
+    if kv_cache_config.has_independent_kv_cache_pools:
+        assert kv_cache_config.kv_cache_pools is not None
+        blocks_per_request = [
+            _physical_blocks_per_request(vllm_config, group)
+            for group in kv_cache_config.kv_cache_groups
+        ]
+        return min(
+            (pool.num_blocks - 1)
+            / sum(blocks_per_request[group_id] for group_id in pool.group_ids)
+            for pool in kv_cache_config.kv_cache_pools
+        )
     num_blocks_per_request = 0
     host_blocks_per_request = 0
     for group in kv_cache_config.kv_cache_groups:
@@ -1104,6 +1120,10 @@ def generate_scheduler_kv_cache_config(
         cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks
         for cfg in kv_cache_configs
     )
+    assert all(
+        cfg.kv_cache_pools == kv_cache_configs[0].kv_cache_pools
+        for cfg in kv_cache_configs
+    ), "Workers must agree on physical pool topology and capacity"
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
@@ -1152,6 +1172,39 @@ def update_kv_cache_capacity(
         f"{max_model_len:,}",
         max_concurrency,
     )
+    if kv_cache_config.has_independent_kv_cache_pools:
+        assert kv_cache_config.kv_cache_pools is not None
+        for pool_id, pool in enumerate(kv_cache_config.kv_cache_pools):
+            groups = [kv_cache_config.kv_cache_groups[i] for i in pool.group_ids]
+            request_blocks = sum(
+                _physical_blocks_per_request(vllm_config, group) for group in groups
+            )
+            pool_tensor_sizes = {
+                tensor.size
+                for tensor in kv_cache_config.kv_cache_tensors
+                if tensor.pool_id == pool_id
+            }
+            assert len(pool_tensor_sizes) <= 1
+            allocated_bytes = next(iter(pool_tensor_sizes), 0)
+            pool_concurrency = (pool.num_blocks - 1) / request_blocks
+            logger.info_once(
+                "KV cache pool %d: groups=%s, types=%s, layers=%d, "
+                "physical_blocks=%s, null_blocks=1, usable_blocks=%s, "
+                "block_sizes=%s, page_sizes=%s bytes, "
+                "allocated=%s bytes, max_request_blocks=%s, concurrency=%.2fx%s",
+                pool_id,
+                tuple(pool.group_ids),
+                tuple(type(group.kv_cache_spec).__name__ for group in groups),
+                sum(len(group.layer_names) for group in groups),
+                f"{pool.num_blocks:,}",
+                f"{pool.num_blocks - 1:,}",
+                tuple(group.kv_cache_spec.block_size for group in groups),
+                tuple(group.kv_cache_spec.page_size_bytes for group in groups),
+                f"{allocated_bytes:,}",
+                f"{request_blocks:,}",
+                pool_concurrency,
+                " (limiting)" if pool_concurrency == max_concurrency else "",
+            )
 
 
 class BlockHashListWithBlockSize:
@@ -1261,3 +1314,11 @@ def resolve_block_hashes(
         return block_hashes
     assert block_size % hash_block_size == 0
     return BlockHashListWithBlockSize(block_hashes, hash_block_size, block_size)
+
+
+def _physical_blocks_per_request(
+    vllm_config: VllmConfig, group: KVCacheGroupSpec
+) -> int:
+    """Return the peak number of resident pages for one request and pool."""
+    spec = group.kv_cache_spec
+    return cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)

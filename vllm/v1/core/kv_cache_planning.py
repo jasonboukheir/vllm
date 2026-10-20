@@ -15,7 +15,10 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_config_builder import KVCacheConfigBuilder
-from vllm.v1.core.kv_cache_utils import _kv_cache_device_name
+from vllm.v1.core.kv_cache_utils import (
+    _kv_cache_device_name,
+    _physical_blocks_per_request,
+)
 from vllm.v1.hisparse.layout import (
     get_hisparse_host_pool_bytes,
     get_hisparse_kv_cache_config,
@@ -31,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
+    KVCachePoolSpec,
     KVCacheSpec,
     KVCacheTensor,
     MambaSpec,
@@ -172,7 +176,7 @@ def check_enough_kv_cache_memory(
         # of the specs since grouping may unify them in-place.
         groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
         check_memory = (
-            available_memory - _pool_bytes_per_block(vllm_config, groups)
+            available_memory - _null_block_bytes(vllm_config, groups)
             if groups
             else available_memory
         )
@@ -415,6 +419,8 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
 
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    *,
+    independent_pools: bool = False,
 ) -> list[KVCacheGroupSpec]:
     """Generates the KV cache groups for hybrid models with multiple
     attention types but still with a uniform page size (physical memory per
@@ -474,6 +480,8 @@ def _get_kv_cache_groups_uniform_page_size(
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
+        independent_pools: Keep compatible layers together without pool padding.
+
     Returns:
         The generated KVCacheGroupSpecs
 
@@ -505,6 +513,12 @@ def _get_kv_cache_groups_uniform_page_size(
         else:
             layer_buckets.append(list(layer_names))
             spec_buckets.append([layer_spec])
+
+    if independent_pools:
+        # Separate allocations need no common layer count. Splitting by the
+        # smallest bucket turns a single mixed-precision draft into one
+        # scheduler group and metadata builder per layer.
+        return create_kv_cache_group_specs(kv_cache_spec, layer_buckets)
 
     # Split each group into smaller groups, to make the number of layers in each
     # group identical. Add padding to the last group of each type if necessary.
@@ -671,6 +685,11 @@ def get_kv_cache_config_from_groups(
         host_budget = get_hisparse_host_pool_bytes(vllm_config)
         return get_hisparse_kv_cache_config(
             vllm_config, kv_cache_groups, available_memory, host_budget
+        )
+
+    if _uses_independent_kvarn_pools(vllm_config, kv_cache_groups):
+        return _get_independent_kv_cache_config(
+            vllm_config, kv_cache_groups, available_memory
         )
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
@@ -1156,24 +1175,37 @@ def get_kv_cache_groups(
         if not isinstance(v, HiddenStateCacheSpec)
     }
 
-    if packed_groups := _get_packed_kv_cache_groups(vllm_config, filtered_spec):
-        # Block-outermost blocks are strided by the widest group, so hidden
-        # groups need no page alignment.
-        packed_groups += [
-            KVCacheGroupSpec([name], spec) for name, spec in hidden_specs.items()
-        ]
-        return packed_groups
+    # KVarN hybrid models use independent physical pools, so their attention
+    # pages do not need to be enlarged to the recurrent-state page size.
+    cache_config = getattr(vllm_config, "cache_config", None)
+    cache_dtype = getattr(cache_config, "cache_dtype", None)
+    independent_kvarn_pools = (
+        isinstance(cache_dtype, str)
+        and cache_dtype.startswith("kvarn_")
+        and not cache_dtype.startswith("kvarn_mla")
+        and any(isinstance(spec, MambaSpec) for spec in filtered_spec.values())
+    )
+    if not independent_kvarn_pools:
+        if packed_groups := _get_packed_kv_cache_groups(vllm_config, filtered_spec):
+            # Block-outermost blocks are strided by the widest group, so hidden
+            # groups need no page alignment.
+            packed_groups += [
+                KVCacheGroupSpec([name], spec) for name, spec in hidden_specs.items()
+            ]
+            return packed_groups
 
-    # Prefer preserving each layer's cache semantics. If physical pages cannot
-    # be unified, try a supported allocation-only fallback before failing.
-    try:
-        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
-    except NotImplementedError:
-        fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
-        if fallback_groups is None:
-            raise
-        return fallback_groups
-    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+        # Prefer preserving each layer's cache semantics. If physical pages
+        # cannot be unified, try a supported allocation-only fallback.
+        try:
+            filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+        except NotImplementedError:
+            fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
+            if fallback_groups is None:
+                raise
+            return fallback_groups
+    groups = _get_kv_cache_groups_uniform_page_size(
+        filtered_spec, independent_pools=independent_kvarn_pools
+    )
 
     # Add hidden-state layers back with page aligned to the common page.
     if hidden_specs:
@@ -1267,6 +1299,9 @@ def _max_memory_usage_bytes_from_groups(
     kv_cache_groups = [group for group in kv_cache_groups if not group.host_resident]
     if not kv_cache_groups:
         return 0
+
+    if _uses_independent_kvarn_pools(vllm_config, kv_cache_groups):
+        return _independent_pool_bytes_for_requests(vllm_config, kv_cache_groups, 1)
 
     bytes_per_block = _pool_bytes_per_block_from_builder(
         builder, vllm_config, kv_cache_groups
@@ -1519,6 +1554,26 @@ def get_kv_cache_configs(
             if not groups:
                 adjusted_memory.append(avail_mem)
                 continue
+            if _uses_independent_kvarn_pools(vllm_config, groups):
+                if override < 1:
+                    raise ValueError(
+                        "num_gpu_blocks_override must include a null block"
+                    )
+                override_memory = _independent_pool_bytes_for_requests(
+                    vllm_config, groups, 1, attention_blocks=override - 1
+                ) + _null_block_bytes(vllm_config, groups)
+                if override_memory > avail_mem:
+                    raise ValueError(
+                        "num_gpu_blocks_override exceeds profiled KV cache memory: "
+                        f"required {override_memory} bytes, available {avail_mem} bytes"
+                    )
+                adjusted_memory.append(override_memory)
+                logger.info(
+                    "Overriding each attention KV pool to %d blocks (including null); "
+                    "retaining bounded recurrent and sliding-window pools",
+                    override,
+                )
+                continue
             bytes_per_block = _pool_bytes_per_block_from_builder(
                 builder, vllm_config, groups
             )
@@ -1535,7 +1590,12 @@ def get_kv_cache_configs(
     # still uses the full memory.
     check_memory = [
         (
-            avail_mem - _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
+            avail_mem
+            - (
+                _null_block_bytes(vllm_config, groups)
+                if _uses_independent_kvarn_pools(vllm_config, groups)
+                else _pool_bytes_per_block_from_builder(builder, vllm_config, groups)
+            )
             if groups
             else avail_mem
         )
@@ -1565,6 +1625,14 @@ def get_kv_cache_configs(
         assert sum(len(group.layer_names) for group in projected_groups) == len(
             kv_cache_spec_one_worker
         ), "Some layers are not assigned to any group."
+        if _uses_independent_kvarn_pools(vllm_config, projected_groups):
+            kv_cache_configs.append(
+                get_kv_cache_config_from_groups(
+                    vllm_config, projected_groups, available_memory_one_worker
+                )
+            )
+            continue
+
         bytes_per_block = _pool_bytes_per_block_from_builder(
             builder, vllm_config, projected_groups
         )
@@ -1577,22 +1645,64 @@ def get_kv_cache_configs(
             )
         )
 
-    # Change the num_blocks of each rank to the smallest among all ranks.
-    # We also need to shrink the tensor size proportionally to avoid
-    # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
-    )
-    for i, kv_cache_config in enumerate(kv_cache_configs):
-        if kv_cache_config.num_blocks == min_num_blocks:
-            continue
-        # Re-plan with exactly the smallest rank's block count, so strides and
-        # offsets stay consistent with the shrunken allocation.
-        kv_cache_configs[i] = builder.get_kv_cache_config_from_groups(
-            vllm_config,
-            kv_cache_config.kv_cache_groups,
-            min_num_blocks,
+    if any(config.has_independent_kv_cache_pools for config in kv_cache_configs):
+        # Reconcile each physical namespace independently across workers. KVarN
+        # attention and recurrent pools intentionally have different policies, so
+        # one legacy num_blocks ratio cannot describe both.
+        num_pools = len(kv_cache_configs[0].kv_cache_pools or ())
+        assert all(
+            len(config.kv_cache_pools or ()) == num_pools for config in kv_cache_configs
         )
+        min_pool_blocks = [
+            min(config.num_blocks_for_pool(pool_id) for config in kv_cache_configs)
+            for pool_id in range(num_pools)
+        ]
+        layout: KVCacheLayout | None = None
+        for kv_cache_config in kv_cache_configs:
+            assert kv_cache_config.kv_cache_pools is not None
+            old_pool_blocks = [
+                pool.num_blocks for pool in kv_cache_config.kv_cache_pools
+            ]
+            if old_pool_blocks == min_pool_blocks:
+                continue
+            if layout is None:
+                layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+            kv_cache_config.kv_cache_pools = [
+                KVCachePoolSpec(
+                    num_blocks=num_blocks,
+                    group_ids=list(pool.group_ids),
+                )
+                for pool, num_blocks in zip(
+                    kv_cache_config.kv_cache_pools, min_pool_blocks
+                )
+            ]
+            kv_cache_config.kv_cache_tensors = _plan_kv_cache_tensors(
+                kv_cache_config.kv_cache_groups,
+                min_pool_blocks,
+                layout,
+                kv_cache_config.has_independent_kv_cache_pools,
+            )
+            kv_cache_config.num_blocks = min(min_pool_blocks)
+
+    else:
+        # Change the num_blocks of each rank to the smallest among all ranks.
+        # We also need to shrink the tensor size proportionally to avoid
+        # allocating unused memory.
+        min_num_blocks = min(
+            kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+        )
+        for i, kv_cache_config in enumerate(kv_cache_configs):
+            if kv_cache_config.num_blocks == min_num_blocks:
+                continue
+            # Re-plan with exactly the smallest rank's block count, so strides and
+            # offsets stay consistent with the shrunken allocation.
+            kv_cache_configs[i] = builder.get_kv_cache_config_from_groups(
+                vllm_config,
+                kv_cache_config.kv_cache_groups,
+                min_num_blocks,
+            )
+
+    _validate_kv_transfer_pool_compat(vllm_config, kv_cache_configs)
 
     for kv_cache_config in kv_cache_configs:
         kv_cache_config.kv_tp_replicas = kv_cache_groups_tp_replicas(
@@ -1716,3 +1826,284 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
         return get_kv_cache_config_from_groups(
             vllm_config, kv_cache_groups, num_blocks * bytes_per_block
         )
+
+
+def _uses_independent_kvarn_pools(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> bool:
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    return (
+        isinstance(cache_dtype, str)
+        and cache_dtype.startswith("kvarn_")
+        and not cache_dtype.startswith("kvarn_mla")
+        and len(kv_cache_groups) > 1
+        and not any(group.host_resident for group in kv_cache_groups)
+        and any(isinstance(group.kv_cache_spec, MambaSpec) for group in kv_cache_groups)
+    )
+
+
+def _independent_pool_bytes_for_requests(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    num_requests: int,
+    *,
+    attention_blocks: int | None = None,
+) -> int:
+    """Size usable pages, optionally overriding each full-attention pool's blocks.
+
+    Null pages are excluded. Bounded pools retain every recurrent/draft slot.
+    """
+    max_num_seqs = getattr(
+        getattr(vllm_config, "scheduler_config", None), "max_num_seqs", 1
+    )
+    return sum(
+        _get_kv_cache_bytes_per_block(
+            [group], vllm_config.cache_config.get_resolved_kv_cache_layout()
+        )
+        * (
+            max_num_seqs * _physical_blocks_per_request(vllm_config, group)
+            if isinstance(group.kv_cache_spec, (MambaSpec, SlidingWindowSpec))
+            else (
+                attention_blocks
+                if attention_blocks is not None
+                else num_requests * _physical_blocks_per_request(vllm_config, group)
+            )
+        )
+        for group in kv_cache_groups
+    )
+
+
+def _null_block_bytes(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> int:
+    if _uses_independent_kvarn_pools(vllm_config, kv_cache_groups):
+        return sum(
+            _get_kv_cache_bytes_per_block(
+                [group], vllm_config.cache_config.get_resolved_kv_cache_layout()
+            )
+            for group in kv_cache_groups
+        )
+    return _pool_bytes_per_block(vllm_config, kv_cache_groups)
+
+
+def _plan_kv_cache_tensors(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    pool_block_counts: list[int],
+    layout: KVCacheLayout,
+    independent_pools: bool,
+) -> list[KVCacheTensor]:
+    """Build current stride-aware views for shared or independent pools."""
+    kv_cache_tensors: list[KVCacheTensor] = []
+    group_sets = (
+        [[group] for group in kv_cache_groups]
+        if independent_pools
+        else [kv_cache_groups]
+    )
+    assert len(group_sets) == len(pool_block_counts)
+    for pool_id, (pool_groups, pool_num_blocks) in enumerate(
+        zip(group_sets, pool_block_counts)
+    ):
+        pool_bytes_per_block = _get_kv_cache_bytes_per_block(pool_groups, layout)
+        interleaved_block_stride = (
+            pool_bytes_per_block if layout.is_block_outermost else None
+        )
+        pool_size = pool_bytes_per_block * pool_num_blocks
+
+        for group in pool_groups:
+            layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+                for layer_name, spec in group.kv_cache_spec.kv_cache_specs.items():
+                    layers_by_spec[spec].append(layer_name)
+            elif group.layer_names:
+                layers_by_spec[group.kv_cache_spec].extend(group.layer_names)
+
+            byte_offset = 0
+            for spec, layer_names in layers_by_spec.items():
+                block_stride = interleaved_block_stride
+                padded_page = _get_layer_block_stride(spec)
+                if block_stride is None and padded_page != spec.page_size_bytes:
+                    assert layout.is_block_compact, f"{layout.name} cannot pad pages"
+                    block_stride = padded_page
+                layer_stride, block_stride, _, _, _ = compute_layout_strides(
+                    spec,
+                    pool_num_blocks,
+                    len(layer_names),
+                    layout,
+                    fixed_strides=(None, block_stride, None, None, None),
+                )
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=pool_size,
+                        layers=layer_names,
+                        layer_stride=layer_stride,
+                        block_stride=block_stride,
+                        offset=byte_offset,
+                        pool_id=pool_id,
+                    )
+                )
+                byte_offset += len(layer_names) * (
+                    spec.page_size_bytes if layout.is_block_outermost else layer_stride
+                )
+    return kv_cache_tensors
+
+
+def _uses_independent_cpu_offload(vllm_config: VllmConfig) -> bool:
+    config = getattr(vllm_config, "kv_transfer_config", None)
+    return bool(
+        config is not None
+        and config.kv_connector == "OffloadingConnector"
+        and config.kv_connector_extra_config.get("spec_name")
+        == "IndependentCPUOffloadingSpec"
+    )
+
+
+def _validate_kv_transfer_pool_compat(
+    vllm_config: VllmConfig, kv_cache_configs: list[KVCacheConfig]
+) -> None:
+    """Reject connectors until their block IDs include physical pool ownership."""
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if (
+        kv_transfer_config is not None
+        and kv_transfer_config.is_kv_transfer_instance
+        and any(config.has_independent_kv_cache_pools for config in kv_cache_configs)
+        and not _uses_independent_cpu_offload(vllm_config)
+    ):
+        raise NotImplementedError(
+            f"KV connector {kv_transfer_config.kv_connector} does not yet support "
+            "independent KV cache pools"
+        )
+
+
+def _get_independent_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    for group in kv_cache_groups:
+        validate_kv_cache_layout(layout, [group])
+    blocks_per_request = [
+        _physical_blocks_per_request(vllm_config, group) for group in kv_cache_groups
+    ]
+    bytes_per_group_block = [
+        _get_kv_cache_bytes_per_block([group], layout) for group in kv_cache_groups
+    ]
+    max_num_seqs = getattr(
+        getattr(vllm_config, "scheduler_config", None), "max_num_seqs", 1
+    )
+
+    # Every namespace owns one null block. Recurrent state has a fixed
+    # per-live-request cost, while attention pages are shared dynamically
+    # among short and long requests. Reserve Mamba for the scheduler's
+    # concurrency ceiling, then spend the remaining budget on attention.
+    pool_block_counts = [1] * len(kv_cache_groups)
+    for group_id, (group, request_blocks) in enumerate(
+        zip(kv_cache_groups, blocks_per_request)
+    ):
+        if isinstance(group.kv_cache_spec, (MambaSpec, SlidingWindowSpec)):
+            pool_block_counts[group_id] += max_num_seqs * request_blocks
+
+    reserved_bytes = sum(
+        block_count * block_bytes
+        for block_count, block_bytes in zip(pool_block_counts, bytes_per_group_block)
+    )
+    if reserved_bytes > available_memory:
+        raise ValueError(
+            "Insufficient KV cache memory to reserve Mamba state for "
+            f"max_num_seqs={max_num_seqs}: required {reserved_bytes} bytes, "
+            f"available {available_memory} bytes"
+        )
+
+    attention_group_ids = [
+        group_id
+        for group_id, group in enumerate(kv_cache_groups)
+        if not isinstance(group.kv_cache_spec, (MambaSpec, SlidingWindowSpec))
+    ]
+    assert attention_group_ids
+    token_quantum = math.lcm(
+        *(
+            kv_cache_groups[group_id].kv_cache_spec.block_size
+            for group_id in attention_group_ids
+        )
+    )
+    blocks_per_quantum = {
+        group_id: token_quantum // kv_cache_groups[group_id].kv_cache_spec.block_size
+        for group_id in attention_group_ids
+    }
+    bytes_per_quantum = sum(
+        bytes_per_group_block[group_id] * blocks_per_quantum[group_id]
+        for group_id in attention_group_ids
+    )
+    max_model_len = vllm_config.model_config.max_model_len
+    override = getattr(vllm_config.cache_config, "num_gpu_blocks_override", None)
+    if (
+        override is None
+        and getattr(vllm_config.cache_config, "enable_prefix_caching", False)
+        and not _uses_independent_cpu_offload(vllm_config)
+    ):
+        checkpoint_groups = [
+            group_id
+            for group_id, group in enumerate(kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+            and group.kv_cache_spec.mamba_cache_mode == "align"
+        ]
+        if checkpoint_groups:
+            # Live recurrent slots alone can evict every reusable state
+            # during a full batch. Keep up to one extra checkpoint per
+            # sequence, without spending the attention pages needed for
+            # one maximum-length request.
+            checkpoint_bytes = sum(bytes_per_group_block[i] for i in checkpoint_groups)
+            min_attention_bytes = cdiv(max_model_len, token_quantum) * bytes_per_quantum
+            spare_bytes = max(
+                available_memory - reserved_bytes - min_attention_bytes, 0
+            )
+            checkpoint_blocks = min(max_num_seqs, spare_bytes // checkpoint_bytes)
+            for group_id in checkpoint_groups:
+                pool_block_counts[group_id] += checkpoint_blocks
+            reserved_bytes += checkpoint_blocks * checkpoint_bytes
+            logger.info(
+                "Reserved %d extra recurrent prefix checkpoints per pool "
+                "while preserving max_model_len=%d",
+                checkpoint_blocks,
+                max_model_len,
+            )
+    num_quanta = (available_memory - reserved_bytes) // bytes_per_quantum
+    for group_id in attention_group_ids:
+        pool_block_counts[group_id] = (
+            override
+            if override is not None
+            else 1 + num_quanta * blocks_per_quantum[group_id]
+        )
+    allocated_bytes = sum(
+        count * size for count, size in zip(pool_block_counts, bytes_per_group_block)
+    )
+    if allocated_bytes > available_memory:
+        raise ValueError(
+            "num_gpu_blocks_override exceeds profiled KV cache memory: "
+            f"required {allocated_bytes} bytes, available {available_memory} bytes"
+        )
+    attention_capacity_tokens = min(
+        (pool_block_counts[i] - 1) * kv_cache_groups[i].kv_cache_spec.block_size
+        for i in attention_group_ids
+    )
+    if attention_capacity_tokens < max_model_len:
+        raise ValueError(
+            "Insufficient attention KV cache after reserving Mamba state "
+            f"for max_num_seqs={max_num_seqs}: capacity "
+            f"{attention_capacity_tokens} tokens, required {max_model_len}"
+        )
+    kv_cache_pools = [
+        KVCachePoolSpec(num_blocks=num_blocks, group_ids=[group_id])
+        for group_id, num_blocks in enumerate(pool_block_counts)
+    ]
+    return KVCacheConfig(
+        num_blocks=min(pool_block_counts),
+        kv_cache_tensors=_plan_kv_cache_tensors(
+            kv_cache_groups, pool_block_counts, layout, True
+        ),
+        kv_cache_groups=kv_cache_groups,
+        prefix_cache_retention_interval=(
+            vllm_config.cache_config.prefix_cache_retention_interval
+        ),
+        kv_cache_pools=kv_cache_pools,
+    )

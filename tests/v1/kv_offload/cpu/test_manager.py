@@ -17,6 +17,10 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     make_offload_key,
 )
+from vllm.v1.kv_offload.cpu.byte_pool import (
+    BytePoolOffloadingManager,
+    HostPages,
+)
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec, CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
@@ -1772,3 +1776,331 @@ def test_lru_insert_orders_positioned_chunks_without_followup_access(ready_on_in
     assert evicted is not None
     assert [key for key, _ in evicted] == [tail, middle]
     assert policy.get(head) is not None
+
+
+class TestBytePoolOffloadingManager:
+    """Exercise bounded host allocation without a GPU or transfer worker."""
+
+    @pytest.mark.parametrize("reverse_completion", [False, True])
+    def test_running_prefix_survives_incremental_stores(self, reverse_completion):
+        manager = BytePoolOffloadingManager(576, {0: 64, 1: 128, 2: 192})
+        ctx = make_req_context("running")
+        groups = [
+            [make_offload_key(str(position).encode(), group) for position in range(3)]
+            for group in range(2)
+        ]
+        batches = []
+        for position in range(3):
+            batch = [group[position] for group in groups]
+            for key in batch:
+                ctx.set_offload_key_position(key, (position + 1) * 128)
+            assert manager.prepare_store(batch, ctx) is not None
+            batches.append(batch)
+            if not reverse_completion:
+                manager.complete_store(batch, ctx)
+        if reverse_completion:
+            for batch in reversed(batches):
+                manager.complete_store(batch, ctx)
+
+        replacement = make_offload_key(b"pressure", 2)
+        output = manager.prepare_store([replacement], make_req_context("other"))
+        assert output is not None
+        assert set(output.evicted_keys) == {group[-1] for group in groups}
+        for group in groups:
+            assert all(
+                manager.lookup(key, ctx) is LookupResult.HIT for key in group[:-1]
+            )
+
+    def test_reports_host_cache_hit_source(self):
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        manager = BytePoolOffloadingManager(64, {0: 64})
+        ctx = make_req_context("host")
+        key = to_key(1)
+        assert manager.prepare_store([key], ctx) is not None
+        manager.complete_store([key], ctx)
+        assert manager.lookup(key, ctx) is LookupResult.HIT
+        assert manager.get_load_source(key, ctx) is CacheHitSource.HOST
+
+    @pytest.mark.parametrize("reuse_method", ["load", "store"])
+    def test_running_reused_prefix_outlives_new_tail(self, reuse_method):
+        manager = BytePoolOffloadingManager(256, {0: 64})
+        head, middle, tail = to_keys([1, 2, 3])
+        seed = make_req_context("seed")
+        assert manager.prepare_store([head, middle], seed) is not None
+        manager.complete_store([head, middle], seed)
+        manager.on_request_finished(seed)
+
+        ctx = make_req_context("reuse")
+        for position, key in enumerate([head, middle, tail], 1):
+            ctx.set_offload_key_position(key, position * 128)
+        if reuse_method == "load":
+            manager.prepare_load([head, middle], ctx)
+            manager.complete_load([middle, head], ctx)
+        else:
+            assert manager.prepare_store([head, middle], ctx) is not None
+        assert manager.prepare_store([tail], ctx) is not None
+        manager.complete_store([tail], ctx)
+
+        output = manager.prepare_store(to_keys([10, 11, 12]), make_req_context("other"))
+        assert output is not None
+        assert output.evicted_keys == [tail, middle]
+        assert manager.lookup(head, ctx) is LookupResult.HIT
+
+    def test_failed_offer_preserves_running_prefix_recency(self):
+        manager = BytePoolOffloadingManager(256, {0: 64, 1: 128})
+        ctx = make_req_context("running")
+        head, middle, tail, held = to_keys([1, 2, 3, 4])
+        for position, key in enumerate([head, middle, tail, held], 1):
+            ctx.set_offload_key_position(key, position * 128)
+            assert manager.prepare_store([key], ctx) is not None
+            if key != held:
+                manager.complete_store([key], ctx)
+
+        # Three victims cannot fit two 128-byte pages around the pinned page.
+        large = [make_offload_key(str(i).encode(), 1) for i in (5, 6)]
+        assert manager.prepare_store(large, make_req_context("failed")) is None
+        assert all(
+            manager.lookup(key, ctx) is LookupResult.HIT for key in (head, middle, tail)
+        )
+        output = manager.prepare_store([to_key(7)], make_req_context("retry"))
+        assert output is not None and output.evicted_keys == [tail]
+        assert manager.lookup(held, ctx) is LookupResult.HIT_PENDING
+
+    def test_running_backfill_orders_by_position(self):
+        manager = BytePoolOffloadingManager(192, {0: 64})
+        ctx = make_req_context("backfill")
+        head, middle, tail = to_keys([1, 2, 3])
+        for position, key in enumerate([head, middle, tail], 1):
+            ctx.set_offload_key_position(key, position * 128)
+        for key in [head, tail, middle]:
+            assert manager.prepare_store([key], ctx) is not None
+            manager.complete_store([key], ctx)
+        output = manager.prepare_store([to_key(4)], make_req_context("other"))
+        assert output is not None and output.evicted_keys == [tail]
+
+    def test_failed_store_retry_preserves_prefix_order(self):
+        manager = BytePoolOffloadingManager(128, {0: 64})
+        ctx = make_req_context("retry")
+        head, tail = to_keys([1, 2])
+        ctx.set_offload_key_position(head, 128)
+        ctx.set_offload_key_position(tail, 256)
+        assert manager.prepare_store([head], ctx) is not None
+        manager.complete_store([head], ctx, success=False)
+        for key in [head, tail]:
+            assert manager.prepare_store([key], ctx) is not None
+            manager.complete_store([key], ctx)
+        output = manager.prepare_store([to_key(3)], make_req_context("other"))
+        assert output is not None and output.evicted_keys == [tail]
+
+    def test_reset_discards_running_request_recency(self):
+        manager = BytePoolOffloadingManager(128, {0: 64})
+        ctx = make_req_context("resumed")
+        head, other_key = to_keys([1, 2])
+        ctx.set_offload_key_position(head, 128)
+        assert manager.prepare_store([head], ctx) is not None
+        manager.complete_store([head], ctx)
+        manager.reset_cache()
+        other = make_req_context("other")
+        other.set_offload_key_position(other_key, 128)
+        assert manager.prepare_store([other_key], other) is not None
+        manager.complete_store([other_key], other)
+        assert manager.prepare_store([head], ctx) is not None
+        manager.complete_store([head], ctx)
+        output = manager.prepare_store([to_key(3)], make_req_context("pressure"))
+        assert output is not None and output.evicted_keys == [other_key]
+
+    def test_old_request_preserves_newer_shared_access(self):
+        manager = BytePoolOffloadingManager(192, {0: 64})
+        old = make_req_context("old")
+        pinned, cold, shared = to_keys([1, 2, 3])
+        for context, key, position in [
+            (old, pinned, 128),
+            (make_req_context("cold"), cold, 128),
+            (make_req_context("newer"), shared, 256),
+        ]:
+            context.set_offload_key_position(key, position)
+            assert manager.prepare_store([key], context) is not None
+            manager.complete_store([key], context)
+        manager.prepare_load([pinned], old)
+        old.set_offload_key_position(shared, 256)
+        manager.prepare_load([shared], old)
+        manager.complete_load([shared], old)
+        output = manager.prepare_store([to_key(4)], make_req_context("pressure"))
+        assert output is not None and output.evicted_keys == [cold]
+        manager.complete_load([pinned], old)
+
+    def test_incremental_stores_do_not_rescan_prefix_positions(self):
+        class CountingContext(ReqContext):
+            position_lookups = 0
+
+            def get_offload_key_position(self, key: OffloadKey) -> int | None:
+                self.position_lookups += 1
+                return super().get_offload_key_position(key)
+
+        keys = to_keys(list(range(64)))
+        manager = BytePoolOffloadingManager(64 * len(keys), {0: 64})
+        ctx = CountingContext(req_id="incremental")
+        for position, key in enumerate(keys, 1):
+            ctx.set_offload_key_position(key, position * 128)
+            assert manager.prepare_store([key], ctx) is not None
+            manager.complete_store([key], ctx)
+        assert 0 < ctx.position_lookups <= 3 * len(keys)
+
+    def test_unequal_groups_and_first_page_sink_share_a_byte_budget(self):
+        manager = BytePoolOffloadingManager(
+            448, {0: 63, 1: 256}, sink_bytes={0: 64}, tokens_per_block={0: 128}
+        )
+        ctx = make_req_context("hybrid")
+        # Identical hashes from different physical groups must remain distinct.
+        first = make_offload_key(b"same-prefix", 0)
+        recurrent = make_offload_key(b"same-prefix", 1)
+        second = make_offload_key(b"next-prefix", 0)
+        ctx.set_offload_key_position(first, 128)
+        ctx.set_offload_key_position(second, 256)
+        keys = [first, recurrent, second]
+        output = manager.prepare_store(keys, ctx)
+        assert output is not None and output.keys_to_store == keys
+        assert isinstance(output.store_spec, HostPages)
+        pages = output.store_spec.pages
+        assert [(p.offset, p.size, p.group_id, p.has_sink) for p in pages] == [
+            (0, 128, 0, True),
+            (128, 256, 1, False),
+            (384, 64, 0, False),
+        ]
+        manager.complete_store(keys, ctx)
+        loaded = manager.prepare_load([second, recurrent, first], ctx)
+        assert loaded.pages == list(reversed(pages))
+        manager.complete_load(keys, ctx)
+
+    @pytest.mark.parametrize("direction", ["store", "load"])
+    def test_in_flight_transfers_prevent_eviction(self, direction):
+        manager = BytePoolOffloadingManager(128, {0: 64, 1: 128})
+        ctx = make_req_context(direction)
+        held, ready = to_keys([1, 2])
+        assert manager.prepare_store([held, ready], ctx) is not None
+        manager.complete_store([ready], ctx)
+        if direction == "load":
+            manager.complete_store([held], ctx)
+            manager.prepare_load([held], ctx)
+        replacement = make_offload_key(b"large", 1)
+        assert manager.prepare_store([replacement], ctx) is None
+        assert manager.lookup(ready, ctx) == LookupResult.HIT
+        if direction == "load":
+            manager.complete_load([held], ctx)
+        else:
+            assert manager.lookup(held, ctx) == LookupResult.HIT_PENDING
+            manager.complete_store([held], ctx)
+        output = manager.prepare_store([replacement], ctx)
+        assert output is not None and set(output.evicted_keys) == {held, ready}
+
+    def test_failed_multi_page_offer_keeps_cache_and_free_ranges_intact(self):
+        manager = BytePoolOffloadingManager(256, {0: 64, 1: 128})
+        ctx = make_req_context("fragmented")
+        old, held_1, held_2 = to_keys([1, 2, 3])
+        assert manager.prepare_store([old, held_1, held_2], ctx) is not None
+        manager.complete_store([old], ctx)
+        before = list(manager.entries.items()), list(manager.free_ranges)
+        small = to_key(4)
+        large = make_offload_key(b"large", 1)
+        # The first page fits, but even evicting old cannot fit the second.
+        assert manager.prepare_store([small, large], ctx) is None
+        assert (list(manager.entries.items()), manager.free_ranges) == before
+        assert manager.lookup(old, ctx) == LookupResult.HIT
+        manager.complete_store([held_1, held_2], ctx)
+        assert manager.prepare_store([small, large], ctx) is not None
+
+    def test_failed_stores_coalesce_space_for_a_larger_group(self):
+        manager = BytePoolOffloadingManager(256, {0: 64, 1: 256})
+        ctx = make_req_context("failed-transfer")
+        keys = to_keys([1, 2, 3, 4])
+        assert manager.prepare_store(keys, ctx) is not None
+        manager.complete_store([keys[1], keys[3], keys[0], keys[2]], ctx, success=False)
+        large = make_offload_key(b"large", 1)
+        output = manager.prepare_store([large], ctx)
+        assert output is not None
+        assert isinstance(output.store_spec, HostPages)
+        assert [(p.offset, p.size) for p in output.store_spec.pages] == [(0, 256)]
+
+    def test_ready_keys_in_the_same_offer_cannot_be_evicted(self):
+        manager = BytePoolOffloadingManager(128, {0: 64, 1: 128})
+        ctx = make_req_context("protected")
+        keys = to_keys([1, 2])
+        assert manager.prepare_store(keys, ctx) is not None
+        manager.complete_store(keys, ctx)
+        large = make_offload_key(b"large", 1)
+        assert manager.prepare_store([keys[0], large], ctx) is None
+        assert all(manager.lookup(key, ctx) == LookupResult.HIT for key in keys)
+
+    def test_reset_reclaims_pinned_ranges_under_connector_flush_contract(self):
+        manager = BytePoolOffloadingManager(128, {0: 64, 1: 128})
+        ctx = make_req_context("before-reset")
+        reading, writing = to_keys([1, 2])
+        assert manager.prepare_store([reading, writing], ctx) is not None
+        manager.complete_store([reading], ctx)
+        manager.prepare_load([reading], ctx)
+        manager.reset_cache()
+        assert manager.lookup(reading, ctx) == LookupResult.MISS
+        assert manager.lookup(writing, ctx) == LookupResult.MISS
+        # The scheduler flushes old transfers before issuing this new store and
+        # suppresses old completion callbacks; the manager can reuse offsets.
+        large = make_offload_key(b"after-reset", 1)
+        output = manager.prepare_store([large], make_req_context("after-reset"))
+        assert output is not None
+        assert isinstance(output.store_spec, HostPages)
+        assert output.store_spec.pages[0].offset == 0
+        manager.on_request_finished(ctx)
+        assert manager.lookup(large, ctx) == LookupResult.HIT_PENDING
+
+    def test_prefix_recency_survives_out_of_order_store_completion(self):
+        manager = BytePoolOffloadingManager(128, {0: 64})
+        ctx = make_req_context("prefix")
+        head, tail = to_keys([1, 2])
+        ctx.set_offload_key_position(head, 128)
+        ctx.set_offload_key_position(tail, 256)
+        assert manager.prepare_store([head], ctx) is not None
+        assert manager.prepare_store([tail], ctx) is not None
+        manager.on_request_finished(ctx)
+        manager.complete_store([head], ctx)
+        manager.complete_store([tail], ctx)
+        output = manager.prepare_store([to_key(3)], make_req_context("replacement"))
+        assert output is not None and output.evicted_keys == [tail]
+
+    def test_overlapping_loads_remain_pinned_until_both_finish(self):
+        manager = BytePoolOffloadingManager(64, {0: 64})
+        ctx = make_req_context("writer")
+        first, second = to_keys([1, 2])
+        assert manager.prepare_store([first], ctx) is not None
+        manager.complete_store([first], ctx)
+        reader_1, reader_2 = make_req_context("reader-1"), make_req_context("reader-2")
+        manager.prepare_load([first], reader_1)
+        manager.prepare_load([first], reader_2)
+        manager.complete_load([first], reader_1)
+        assert manager.prepare_store([second], ctx) is None
+        manager.complete_load([first], reader_2)
+        assert manager.prepare_store([second], ctx) is not None
+
+    def test_duplicate_keys_do_not_leak_transfer_references(self):
+        manager = BytePoolOffloadingManager(64, {0: 64})
+        ctx = make_req_context("duplicates")
+        first, second = to_keys([1, 2])
+        output = manager.prepare_store([first, first], ctx)
+        assert output is not None and output.keys_to_store == [first]
+        manager.complete_store([first], ctx)
+        pages = manager.prepare_load([first, first], ctx).pages
+        assert len(pages) == 2 and pages[0] == pages[1]
+        manager.complete_load([first], ctx)
+        assert manager.prepare_store([second], ctx) is not None
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"capacity": 0, "group_bytes": {0: 64}},
+            {"capacity": 64, "group_bytes": {}},
+            {"capacity": 64, "group_bytes": {0: 0}},
+            {"capacity": 64, "group_bytes": {0: 64}, "sink_bytes": {0: 16}},
+        ],
+    )
+    def test_invalid_allocation_geometry_is_rejected(self, kwargs):
+        with pytest.raises(ValueError):
+            BytePoolOffloadingManager(**kwargs)

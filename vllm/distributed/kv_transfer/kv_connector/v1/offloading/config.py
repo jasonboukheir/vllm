@@ -84,6 +84,19 @@ def get_sliding_window_size_in_chunks(
     return None
 
 
+def _group_sink_bytes(group: "KVCacheGroupSpec", cache_dtype: str) -> int:
+    if not isinstance(cache_dtype, str) or not cache_dtype.startswith("kvarn_"):
+        return 0
+    spec = group.kv_cache_spec
+    if not isinstance(spec, AttentionSpec) or not spec.kv_quant_mode.is_kvarn:
+        return 0
+    # Aligned flags followed by rotated FP16 K/V; target and drafter can
+    # independently retire their sink representation.
+    return 2 + len(group.layer_names) * (
+        2 + spec.block_size * spec.num_kv_heads * spec.head_size * 4
+    )
+
+
 def build_offloading_config(
     vllm_config: "VllmConfig",
     kv_cache_config: "KVCacheConfig",
@@ -162,6 +175,10 @@ def build_offloading_config(
             group_id=group_id,
             tokens_per_block=tokens_per_block,
             layer_names=tuple(group.layer_names),
+            page_size_bytes=_group_kv_bytes_per_block(group),
+            sink_size_bytes=_group_sink_bytes(
+                group, vllm_config.cache_config.cache_dtype
+            ),
             sliding_window_size_in_chunks=get_sliding_window_size_in_chunks(
                 next(iter(iter_layer_specs(group.kv_cache_spec))),
                 tokens_per_block * blocks_per_chunk,
@@ -174,7 +191,8 @@ def build_offloading_config(
 
     worker_kv_bytes_per_block = 0
     if (
-        kv_cache_config.hisparse_host_num_blocks is None
+        not kv_cache_config.has_independent_kv_cache_pools
+        and kv_cache_config.hisparse_host_num_blocks is None
         and kv_cache_config.num_blocks > 0
         and kv_cache_config.kv_cache_tensors
     ):

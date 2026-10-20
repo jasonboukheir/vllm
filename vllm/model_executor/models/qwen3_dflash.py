@@ -27,6 +27,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.modelopt import ModelOptQuantConfigBase
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -422,6 +423,14 @@ class DFlashQwen3Model(nn.Module):
         self.config = speculative_config.draft_model_config.hf_config
         self.vocab_size = self.config.vocab_size
         self.quant_config = get_draft_quant_config(vllm_config)
+        if self.quant_config is not None:
+            if not isinstance(self.quant_config, ModelOptQuantConfigBase):
+                self.quant_config.apply_vllm_mapper(
+                    self.hf_to_vllm_mapper.get_rename_mapper()
+                )
+            self.quant_config.packed_modules_mapping.update(
+                Qwen3ForCausalLM.packed_modules_mapping
+            )
         map_draft_quant_config(
             self.quant_config,
             self.hf_to_vllm_mapper,

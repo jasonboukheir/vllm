@@ -19,6 +19,9 @@ class OffloadingGroupConfig:
     # Chunks of this group the tier keeps for one request, or None when
     # attention reaches back without a bound (a full layer).
     sliding_window_size_in_chunks: int | None = None
+    # Actual per-group storage for independent physical pools.
+    page_size_bytes: int = 0
+    sink_size_bytes: int = 0
 
 
 @dataclass(frozen=True)

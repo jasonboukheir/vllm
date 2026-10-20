@@ -28,11 +28,13 @@ def _run_prepare(
     cp_size: int = 1,
     cp_interleave: int = 1,
     draft_dcp_size: int | None = None,
+    max_model_len: int = 128,
+    num_speculative_steps: int = 3,
+    sample_from_anchor: bool = True,
 ):
     device = torch.device(current_platform.device_type)
     max_num_reqs = 4
     max_num_tokens = 16
-    num_speculative_steps = 3
 
     input_buffers = SimpleNamespace(
         input_ids=torch.full((max_num_tokens,), -1, dtype=torch.int32, device=device),
@@ -112,12 +114,12 @@ def _run_prepare(
         ),
         dcp_size=cp_size if draft_dcp_size is None else draft_dcp_size,
         parallel_drafting_token_id=123,
-        num_query_per_req=num_speculative_steps,
+        num_query_per_req=num_speculative_steps + (not sample_from_anchor),
         num_speculative_steps=num_speculative_steps,
         max_num_reqs=max_num_reqs,
         max_num_tokens=max_num_tokens,
-        max_model_len=128,
-        sample_from_anchor=True,
+        max_model_len=max_model_len,
+        sample_from_anchor=sample_from_anchor,
     )
     with (
         patch(
@@ -152,6 +154,19 @@ def _run_prepare(
         temperature=temperature.cpu(),
         seeds=seeds.cpu(),
     )
+
+
+def test_dflash2_context_ceiling_queries_cannot_alias_last_page():
+    out = _run_prepare(
+        target_positions=[4, 5, 6, 7],
+        block_table_values=[1, 2],
+        max_model_len=8,
+        num_speculative_steps=7,
+        sample_from_anchor=False,
+    )
+    assert out.context_slot_mapping[:4].tolist() == [8, 9, PAD_SLOT_ID, PAD_SLOT_ID]
+    assert out.query_slot_mapping[:8].tolist() == [10, 11] + [PAD_SLOT_ID] * 6
+    assert out.input_buffers.positions[:8].cpu().tolist() == [6] + [7] * 7
 
 
 @pytest.mark.parametrize("cp_rank,cp_size", [(0, 1), (0, 2), (1, 2)])

@@ -66,6 +66,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCachePoolSpec,
     MambaSpec,
     SlidingWindowSpec,
 )
@@ -1242,6 +1243,102 @@ def test_local_prefill_interval_defers_inflight_prefill_chunk(interval: int):
     # Once the interval has elapsed the chunk resumes.
     output = scheduler.schedule()
     assert "chk0" in output.num_scheduled_tokens
+
+
+@pytest.mark.parametrize("num_spec", [0, 2])
+@pytest.mark.parametrize("max_num_seqs", [2, 4])
+def test_async_hit_admission_reserves_only_the_pool_that_needs_blocks(
+    num_spec, max_num_seqs
+):
+    """The last RAM-hit slot can load while other requests prefill or decode."""
+    from tests.v1.kv_connector.unit.utils import create_model_runner_output
+
+    block_size = 16
+    groups = [
+        KVCacheGroupSpec(
+            ["target"],
+            FullAttentionSpec(
+                block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["recurrent"],
+            MambaSpec(
+                block_size=block_size,
+                shapes=((1,),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+                num_speculative_blocks=num_spec,
+            ),
+        ),
+    ]
+    capacities = [65, 1 + max_num_seqs * (2 + num_spec)]
+    if num_spec:
+        groups.append(
+            KVCacheGroupSpec(
+                ["draft"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=32,
+                ),
+            )
+        )
+        capacities.append(17)
+    config = KVCacheConfig(
+        num_blocks=min(capacities),
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        kv_cache_pools=[
+            KVCachePoolSpec(capacity, [i]) for i, capacity in enumerate(capacities)
+        ],
+    )
+    scheduler = create_scheduler(
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=128,
+        max_model_len=256,
+        long_prefill_token_threshold=16,
+        num_speculative_tokens=num_spec or None,
+        use_kv_connector=mock_kv(matched_tokens=16, is_async=True),
+        kv_cache_config=config,
+        mamba_cache_mode="align",
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        side_effect=lambda request, _: (
+            (16, True) if request.request_id == "restore" else (0, False)
+        )
+    )
+    running = create_requests(
+        num_requests=max_num_seqs - 1,
+        num_tokens=16 if num_spec else 128,
+        max_tokens=32,
+        req_ids=[f"running-{i}" for i in range(max_num_seqs - 1)],
+    )
+    for request in running:
+        scheduler.add_request(request)
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first, create_model_runner_output(running, token_id=1000)
+    )
+    (restored,) = create_requests(num_requests=1, num_tokens=32, req_ids=["restore"])
+    scheduler.add_request(restored)
+
+    output = scheduler.schedule()
+
+    assert all(request.request_id in output.num_scheduled_tokens for request in running)
+    assert restored.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert all(scheduler.kv_cache_manager.get_block_ids(restored.request_id))
+    scheduler.update_from_output(
+        output,
+        create_model_runner_output(running, finished_recving={restored.request_id}),
+    )
+    resumed = scheduler.schedule()
+    assert set(resumed.num_scheduled_tokens) == {
+        request.request_id for request in [*running, restored]
+    }
+    assert all(request.num_preemptions == 0 for request in [*running, restored])
 
 
 def _setup_remote_kv_resume(num_prompt_tokens: int, matched_tokens: int):
