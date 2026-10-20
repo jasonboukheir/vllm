@@ -444,6 +444,13 @@ class DFlashQwen3Model(nn.Module):
         self.config = speculative_config.draft_model_config.hf_config
         self.vocab_size = self.config.vocab_size
         self.quant_config = get_draft_quant_config(vllm_config)
+        if self.quant_config is not None:
+            self.quant_config.apply_vllm_mapper(
+                self.hf_to_vllm_mapper.get_rename_mapper()
+            )
+            self.quant_config.packed_modules_mapping.update(
+                Qwen3ForCausalLM.packed_modules_mapping
+            )
         _add_global_draft_layer_exclusions(
             self.quant_config, start_layer_id, self.config.num_hidden_layers
         )

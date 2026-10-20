@@ -573,6 +573,18 @@ class OffloadingConnectorScheduler:
             spec, vllm_config, kv_cache_config
         )
         self.manager: OffloadingManager = spec.get_manager()
+        # IDs are local to each physical pool. Keep transfer fences distinct
+        # when attention and recurrent pools reuse the same numeric ID.
+        self._pool_offsets = []
+        offset = 0
+        assert kv_cache_config.kv_cache_pools is not None
+        for pool in kv_cache_config.kv_cache_pools:
+            self._pool_offsets.append(offset)
+            offset += pool.num_blocks
+        self._group_pool_offsets = tuple(
+            self._pool_offsets[kv_cache_config.pool_id_for_group(group_id)]
+            for group_id in range(len(kv_cache_config.kv_cache_groups))
+        )
         self._connector_stats = OffloadingConnectorStats()
 
         full_attention_groups: list[int] = []
@@ -652,6 +664,9 @@ class OffloadingConnectorScheduler:
         job_id = self._job_counter
         self._job_counter += 1
         return job_id
+
+    def _physical_block_id(self, group_id: int, block_id: int) -> int:
+        return self._group_pool_offsets[group_id] + block_id
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
         for bid in block_ids or ():
@@ -1169,7 +1184,9 @@ class OffloadingConnectorScheduler:
         ):
             group_blocks = blocks.blocks[group_config.group_idx]
             self._current_batch_allocated_block_ids.update(
-                block.block_id for block in group_blocks if block.block_id != 0
+                self._physical_block_id(group_config.group_idx, block.block_id)
+                for block in group_blocks
+                if block.block_id != 0
             )
 
             tokens_per_block = group_config.tokens_per_block
@@ -1304,10 +1321,14 @@ class OffloadingConnectorScheduler:
                     new_blocks = new_block_id_groups[group_config.group_idx]
                     for bid in new_blocks:
                         if bid != 0:
-                            self._current_batch_allocated_block_ids.add(bid)
+                            self._current_batch_allocated_block_ids.add(
+                                self._physical_block_id(group_config.group_idx, bid)
+                            )
 
         for copy in scheduler_output.kv_cache_block_copies or ():
-            self._current_batch_allocated_block_ids.add(copy.dst_block_id)
+            self._current_batch_allocated_block_ids.add(
+                self._physical_block_id(copy.group_id, copy.dst_block_id)
+            )
 
         # Zero out stale block_ids in sliding window groups' pending-store
         # positions. Only sliding window groups can have stale entries (blocks
@@ -1325,7 +1346,10 @@ class OffloadingConnectorScheduler:
                     end = ends[i] if ends is not None else len(group_state.block_ids)
                     for j in range(start, end):
                         if (
-                            group_state.block_ids[j]
+                            self._physical_block_id(
+                                self.config.kv_group_configs[grp_idx].group_idx,
+                                group_state.block_ids[j],
+                            )
                             in self._current_batch_allocated_block_ids
                         ):
                             group_state.block_ids[j] = 0
@@ -1371,13 +1395,16 @@ class OffloadingConnectorScheduler:
 
                 job_id = self._generate_job_id()
                 req_status.transfer_jobs.add(job_id)
-                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+                physical_id = self._physical_block_id(group_idx, block_id)
+                self._block_id_to_pending_jobs.setdefault(physical_id, set()).add(
+                    job_id
+                )
                 self._jobs[job_id] = TransferJobStatus(
                     req_id=req_id,
                     pending_count=self.config.num_workers,
                     keys={key},
                     is_store=True,
-                    fenced_block_ids=[block_id],
+                    fenced_block_ids=[physical_id],
                 )
                 group_sizes = [0] * num_groups
                 group_sizes[config_idx] = 1
@@ -1493,14 +1520,23 @@ class OffloadingConnectorScheduler:
 
             job_id = self._generate_job_id()
             req_status.transfer_jobs.add(job_id)
-            for block_id in source_blocks:
-                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+            source_physical_ids = [
+                self._physical_block_id(
+                    self.config.kv_group_configs[group_idx].group_idx,
+                    block_ids[group_idx],
+                )
+                for group_idx in accepted_groups
+            ]
+            for physical_id in source_physical_ids:
+                self._block_id_to_pending_jobs.setdefault(physical_id, set()).add(
+                    job_id
+                )
             self._jobs[job_id] = TransferJobStatus(
                 req_id=req_id,
                 pending_count=self.config.num_workers,
                 keys=set(store_output.keys_to_store),
                 is_store=True,
-                fenced_block_ids=source_blocks,
+                fenced_block_ids=source_physical_ids,
             )
             store_jobs[job_id] = TransferJob(
                 req_id=req_id,
@@ -1783,10 +1819,13 @@ class OffloadingConnectorScheduler:
                             start_gpu_block_idx = gpu_block_idx + i
                         src_block_ids.append(block_id)
                         num_group_blocks += 1
+                        physical_id = self._physical_block_id(
+                            group_config.group_idx, block_id
+                        )
                         if is_sliding_window:
-                            fenced_block_ids.append(block_id)
+                            fenced_block_ids.append(physical_id)
                         else:
-                            deferred_fence_block_ids.append(block_id)
+                            deferred_fence_block_ids.append(physical_id)
 
                 group_sizes.append(num_group_blocks)
                 block_indices.append(start_gpu_block_idx or 0)

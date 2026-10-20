@@ -648,7 +648,7 @@ def _prepare_dflash_inputs_kernel(
     ).to(tl.int64)
     # A null block is never a writable cache slot. This can occur when a
     # sliding-window block table contains evicted/global padding entries.
-    q_resident = is_query & (q_block_id != 0)
+    q_resident = is_query & (query_pos < max_model_len) & (q_block_id != 0)
     local_q_slot = cp_local_slot(
         query_pos,
         q_block_id,

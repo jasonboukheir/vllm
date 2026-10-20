@@ -71,7 +71,9 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner.dcp_size = 1
     runner.dcp_rank = 0
     runner.cp_interleave = 1
-    runner.cache_config = SimpleNamespace(enable_prefix_caching=True)
+    runner.cache_config = SimpleNamespace(
+        enable_prefix_caching=True, cache_dtype="auto"
+    )
     parallel_config = SimpleNamespace(
         decode_context_parallel_size=1,
         cp_kv_cache_interleave_size=1,
@@ -207,6 +209,7 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
         is_encoder_decoder=False,
         vllm_config=vllm_config,
         parallel_config=parallel_config,
+        cache_config=SimpleNamespace(cache_dtype="auto"),
     )
 
     class _CapturedWidths(Exception):
@@ -400,3 +403,23 @@ def test_standalone_draft_kv_dtype_override(monkeypatch, draft_dtype, expected_d
     assert draft_config.cache_config.cache_dtype == expected_dtype
     assert speculator.attn_vllm_config.cache_config.cache_dtype == expected_dtype
     assert target.cache_config.cache_dtype == "fp8_e4m3"
+
+
+def test_kvarn_fences_preempted_pages_before_request_state_updates():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.cache_config = SimpleNamespace(cache_dtype="kvarn_k4v2_g128_compact")
+    events = []
+    runner.kv_connector = SimpleNamespace(
+        prepare_cache_update=lambda _: events.append("save-fence")
+    )
+
+    class ReachedStateUpdate(Exception):
+        pass
+
+    def update():
+        assert events == ["save-fence"]
+        raise ReachedStateUpdate
+
+    runner.update_pp_decode_requests = update
+    with pytest.raises(ReachedStateUpdate):
+        runner.execute_model(object())
