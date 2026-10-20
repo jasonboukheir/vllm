@@ -153,6 +153,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     AMX_MLA = "vllm.v1.attention.backends.mla.amx_mla.AMXMLABackend"
     TURBOQUANT = "vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend"
     ULTRAQUANT = "vllm.v1.attention.backends.ultraquant_attn.UltraQuantAttentionBackend"
+    KVARN = "vllm.v1.attention.backends.kvarn_attn.KVarNAttentionBackend"
     # Placeholder for third-party/custom backends - must be registered before use
     # set to None to avoid alias with other backend, whose value is an empty string
     CUSTOM = None

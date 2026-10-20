@@ -428,10 +428,9 @@ def derive_canonical_mappings(
         )
 
     my_rank = parallel_config.rank
-    num_blocks = kv_cache_config.num_blocks
-
     mappings: dict[str, CanonicalPageMapping] = {}
-    for kv_cache_group in kv_cache_config.kv_cache_groups:
+    for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+        num_blocks = kv_cache_config.num_blocks_for_group(group_id)
         group_kv_cache_spec = kv_cache_group.kv_cache_spec
         if isinstance(group_kv_cache_spec, UniformTypeKVCacheSpecs):
             per_layer_specs = group_kv_cache_spec.kv_cache_specs
