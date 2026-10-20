@@ -156,6 +156,10 @@ class KVCacheManager:
 
         self.enable_caching = enable_caching
         self.enable_kv_cache_events = enable_kv_cache_events
+        if kv_cache_config.has_independent_kv_cache_pools and enable_kv_cache_events:
+            raise NotImplementedError(
+                "Independent KV cache pools require KV cache events to be disabled"
+            )
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
@@ -200,12 +204,16 @@ class KVCacheManager:
             for manager in self.coordinator.single_type_managers
             if manager.retains_longer_hit
         )
+        self.block_pools = self.coordinator.block_pools
         self.kv_cache_config = kv_cache_config
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        self.watermark_blocks_by_pool = tuple(
+            int(watermark * pool.num_gpu_blocks) for pool in self.block_pools
+        )
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -506,14 +514,14 @@ class KVCacheManager:
             self.max_model_len,
         )
 
-        watermark_blocks = 0
+        watermark_blocks_by_pool = (0,) * len(self.block_pools)
         # The watermark is applied to waiting/preempted requests only, and only
         # when there's at least one request already scheduled.
         if has_scheduled_reqs and request.status in (
             RequestStatus.WAITING,
             RequestStatus.PREEMPTED,
         ):
-            watermark_blocks = self.watermark_blocks
+            watermark_blocks_by_pool = self.watermark_blocks_by_pool
 
         # Matches the scheduler's own prefill boundary: `num_tokens - 1`
         # extends it to resumed requests replaying their output tokens.
@@ -523,19 +531,27 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=full_num_tokens,
-                new_computed_blocks=new_computed_block_list,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=total_computed_tokens,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_tokens_main_model=full_num_tokens,
-                apply_admission_cap=True,
-                prefill_end=prefill_end,
+            num_blocks_to_allocate = (
+                self.coordinator.get_num_blocks_to_allocate_by_pool(
+                    request_id=request.request_id,
+                    num_tokens=full_num_tokens,
+                    new_computed_blocks=new_computed_block_list,
+                    num_encoder_tokens=num_encoder_tokens,
+                    total_computed_tokens=total_computed_tokens,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_tokens_main_model=full_num_tokens,
+                    apply_admission_cap=True,
+                    prefill_end=prefill_end,
+                )
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            if any(
+                required + watermark > pool.get_num_free_blocks()
+                for required, watermark, pool in zip(
+                    num_blocks_to_allocate,
+                    watermark_blocks_by_pool,
+                    self.block_pools,
+                )
+            ):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -558,7 +574,7 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate_by_pool(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -572,9 +588,14 @@ class KVCacheManager:
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
-        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
+        if any(
+            required + watermark > pool.get_num_free_blocks() - reserved_blocks
+            for required, watermark, pool in zip(
+                num_blocks_to_allocate,
+                watermark_blocks_by_pool,
+                self.block_pools,
+            )
+        ):
             # Cannot allocate new blocks
             return None
 
@@ -830,12 +851,23 @@ class KVCacheManager:
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 
-    def take_new_block_ids(self) -> list[int]:
-        """Drain and return new attention block IDs for zeroing."""
-        ids: list[int] = []
-        for mgr in self.coordinator.single_type_managers:
-            ids.extend(mgr.take_new_block_ids())
-        return ids
+    def take_new_block_ids(self) -> list[tuple[int, list[int]]]:
+        """Drain attention allocations with cache-group ownership intact."""
+        result: list[tuple[int, list[int]]] = []
+        for group_id, mgr in enumerate(self.coordinator.single_type_managers):
+            ids = mgr.take_new_block_ids()
+            if ids:
+                result.append((group_id, ids))
+        return result
+
+    def take_new_mamba_block_ids(self) -> list[tuple[int, list[int]]]:
+        """Drain recurrent allocations with cache-group ownership intact."""
+        result: list[tuple[int, list[int]]] = []
+        for group_id, mgr in enumerate(self.coordinator.single_type_managers):
+            ids = mgr.take_new_mamba_block_ids()
+            if ids:
+                result.append((group_id, ids))
+        return result
 
     def record_blocks_for_zeroing(self, request_id: str, start_token: int) -> None:
         """Re-record the request's blocks from start_token onwards for
@@ -855,17 +887,25 @@ class KVCacheManager:
         self,
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
         """Drain pending copies and return their retained endpoints."""
-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
-        for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
+        pending_copies: list[tuple[int, KVCacheBlock, KVCacheBlock]] = []
+        for group_id, mgr in enumerate(self.coordinator.single_type_managers):
+            pending_copies.extend(
+                (group_id, source_block, cow_block)
+                for source_block, cow_block in mgr.take_pending_cow_copies()
+            )
         copies = [
             KVCacheBlockCopy(
                 src_block_id=source_block.block_id,
                 dst_block_id=cow_block.block_id,
+                group_id=group_id,
             )
-            for source_block, cow_block in pending_copies
+            for group_id, source_block, cow_block in pending_copies
         ]
-        retained_blocks = [block for pair in pending_copies for block in pair]
+        retained_blocks = [
+            block
+            for _group_id, source_block, cow_block in pending_copies
+            for block in (source_block, cow_block)
+        ]
         return copies, retained_blocks
 
     def take_boundary_state_offloads(
