@@ -1012,3 +1012,44 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+def test_sliding_dflash_pool_reserves_lookahead_at_unaligned_chunk_boundary():
+    from types import SimpleNamespace
+
+    from vllm.config import VllmConfig
+
+    config = SimpleNamespace(
+        max_concurrent_batches=1,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
+        num_lookahead_tokens=8,
+    )
+    inflight = VllmConfig.max_in_flight_tokens.fget(config)
+    spec = SlidingWindowSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+    )
+    cap = spec.max_admission_blocks_per_request(inflight, 262144)
+    pool = BlockPool(num_gpu_blocks=cap + 1, enable_caching=False, hash_block_size=128)
+    manager = SlidingWindowManager(
+        spec,
+        block_pool=pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=128,
+        max_admission_blocks_per_request=cap,
+    )
+    computed = 0
+    held = []
+    for chunk in (2048, 2048, 121, 2048):
+        manager.remove_skipped_blocks("draft", computed)
+        computed += chunk
+        manager.allocate_new_blocks("draft", computed + 8, computed)
+        held.append(
+            sum(b is not pool.null_block for b in manager.req_to_blocks["draft"])
+        )
+    assert max(held) == 34
+    assert max(held) <= cap

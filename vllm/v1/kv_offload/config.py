@@ -16,6 +16,9 @@ class OffloadingGroupConfig:
     layer_names: tuple[str, ...]
     # Original KVCacheConfig group index.
     group_id: int
+    # Actual per-group storage for independent physical pools.
+    page_size_bytes: int = 0
+    sink_size_bytes: int = 0
 
 
 @dataclass(frozen=True)
