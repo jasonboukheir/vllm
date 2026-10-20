@@ -78,6 +78,59 @@ def test_external_computed_blocks_do_not_corrupt_free_pool():
     assert len(manager.req_to_blocks[request_id]) == 3
 
 
+@pytest.mark.parametrize(
+    "ownership,expected",
+    [
+        ("private", 0),
+        ("cached_private", 0),
+        ("shared", 1),
+        ("partial_hit", 1),
+        ("pending_cow", 1),
+        ("future_partial_checkpoint", 1),
+        ("duplicate_and_null", 1),
+    ],
+)
+def test_mamba_future_reservation_credits_only_recyclable_states(ownership, expected):
+    spec = MambaSpec(
+        block_size=4,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=4)
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+    blocks = pool.get_new_blocks(2)
+    manager.req_to_blocks["request"] = blocks
+    if ownership == "cached_private":
+        blocks[0].set_block_hash(make_block_hash_with_group_id(BlockHash(b"cached"), 0))
+    elif ownership == "shared":
+        # The same refcount rule covers another request or an offload pin.
+        pool.touch((blocks[0],))
+    elif ownership == "partial_hit":
+        manager._partial_hit_reqs["request"] = (0, blocks[0])
+    elif ownership == "pending_cow":
+        manager._pending_cow_copies.append((blocks[0], pool.get_new_blocks(1)[0]))
+    elif ownership == "future_partial_checkpoint":
+        pool.hash_block_size = 2
+    elif ownership == "duplicate_and_null":
+        manager.req_to_blocks["request"] = [blocks[0], blocks[0], pool.null_block]
+    free_before = pool.get_num_free_blocks()
+
+    assert manager.cap_future_reservation("request", 1) == expected
+    assert pool.get_num_free_blocks() == free_before
+    assert manager.get_num_blocks_to_allocate("request", 12, [], 8, 8, 12) == (
+        2
+        if ownership == "partial_hit"
+        else (0 if ownership == "duplicate_and_null" else 1)
+    )
+
+
 def test_mamba_speculative_block_relocation_requires_exclusive_ownership():
     spec = MambaSpec(
         block_size=4,
@@ -1012,3 +1065,44 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+def test_sliding_dflash_pool_reserves_lookahead_at_unaligned_chunk_boundary():
+    from types import SimpleNamespace
+
+    from vllm.config import VllmConfig
+
+    config = SimpleNamespace(
+        max_concurrent_batches=1,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
+        num_lookahead_tokens=8,
+    )
+    inflight = VllmConfig.max_in_flight_tokens.fget(config)
+    spec = SlidingWindowSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+    )
+    cap = spec.max_admission_blocks_per_request(inflight, 262144)
+    pool = BlockPool(num_gpu_blocks=cap + 1, enable_caching=False, hash_block_size=128)
+    manager = SlidingWindowManager(
+        spec,
+        block_pool=pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=128,
+        max_admission_blocks_per_request=cap,
+    )
+    computed = 0
+    held = []
+    for chunk in (2048, 2048, 121, 2048):
+        manager.remove_skipped_blocks("draft", computed)
+        computed += chunk
+        manager.allocate_new_blocks("draft", computed + 8, computed)
+        held.append(
+            sum(b is not pool.null_block for b in manager.req_to_blocks["draft"])
+        )
+    assert max(held) == 34
+    assert max(held) <= cap

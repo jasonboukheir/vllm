@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
-from functools import cached_property
+from functools import cached_property, partial
 from typing import Any
 
 import torch
@@ -40,8 +40,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 )
 from vllm.forward_context import ForwardContext
 from vllm.v1.attention.backend import AttentionMetadata
-from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_coordinator import (
+    HybridKVCacheCoordinator,
+    replay_boundaries,
+)
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
@@ -51,6 +54,23 @@ from vllm.v1.request import Request
 
 
 class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+    def bind_kv_cache_manager(self, kv_cache_manager: KVCacheManager) -> None:
+        super().bind_kv_cache_manager(kv_cache_manager)
+        if self.connector_scheduler is not None:
+            coordinator = kv_cache_manager.coordinator
+            self.connector_scheduler.replay_boundaries = partial(
+                replay_boundaries,
+                scheduler_block_size=coordinator.scheduler_block_size,
+                use_eagle=bool(coordinator.eagle_group_ids),
+            )
+        config = getattr(self, "_kv_transfer_config", None)
+        extra = config.kv_connector_extra_config if config is not None else {}
+        if extra.get("gpu_cache_policy") == "active_only":
+            if extra.get("spec_name") != "IndependentCPUOffloadingSpec":
+                raise ValueError("active_only requires IndependentCPUOffloadingSpec")
+            for pool in kv_cache_manager.block_pools:
+                pool.retain_idle_cache = False
+
     @cached_property
     def _bounding_group_ids(self) -> tuple[int, ...]:
         """Prefix-cacheable groups this connector does not offload.
