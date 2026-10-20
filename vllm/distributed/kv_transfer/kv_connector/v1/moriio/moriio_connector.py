@@ -1304,10 +1304,17 @@ class MoRIIOConnectorScheduler:
                 for _, block_ids in self._reqs_need_recv.values()
                 for b in block_ids[0]
             }
+            attention_group_id = self.kv_cache_config.transfer_group_ids[
+                self._attn_group_ids[0]
+            ]
             scheduler_output.new_block_ids_to_zero = [
-                b
-                for b in scheduler_output.new_block_ids_to_zero
-                if b not in read_dst_block_ids
+                (
+                    group_id,
+                    [b for b in ids if b not in read_dst_block_ids]
+                    if group_id == attention_group_id
+                    else ids,
+                )
+                for group_id, ids in scheduler_output.new_block_ids_to_zero
             ]
 
         for req_id, (req, block_ids) in self._reqs_need_save.items():

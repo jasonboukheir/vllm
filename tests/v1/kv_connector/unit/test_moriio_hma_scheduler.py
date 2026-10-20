@@ -58,6 +58,7 @@ class _FakeScheduler(moriio_connector.MoRIIOConnectorScheduler):  # type: ignore
         self._is_hma_required = False
         self.kv_cache_config = SimpleNamespace(
             kv_cache_groups=[None, None],
+            transfer_group_ids=(0, 1),
             select_transfer_block_ids=lambda block_ids: tuple(block_ids),
         )
         for k, v in attrs.items():
@@ -561,19 +562,34 @@ def test_update_state_drops_decode_recompute_tail_block(
     assert sched._req_kv_params["req"]["remote_block_ids"] == remote_blocks
 
     output = SchedulerOutput.make_empty()
-    output.new_block_ids_to_zero = None if zero_ids is None else list(zero_ids)
+    output.new_block_ids_to_zero = (
+        None if zero_ids is None else [(0, list(zero_ids)), (2, list(zero_ids))]
+    )
     before = asdict(output)
     meta = sched.build_connector_meta(output)
     assert meta.reqs_to_recv["req"].local_block_ids == expected_blocks
     if zero_ids and has_mamba and external_tokens:
-        before["new_block_ids_to_zero"] = zero_ids[1:]
+        before["new_block_ids_to_zero"] = [(0, zero_ids[1:]), (2, zero_ids)]
     assert asdict(output) == before
 
     # A later local allocation of the same pages must still be zeroed.
-    output.new_block_ids_to_zero = [100, 101, 102]
+    output.new_block_ids_to_zero = [(0, [100, 101, 102])]
     meta = sched.build_connector_meta(output)
     assert not meta.reqs_to_recv
-    assert output.new_block_ids_to_zero == [100, 101, 102]
+    assert output.new_block_ids_to_zero == [(0, [100, 101, 102])]
+
+
+def test_hybrid_read_zeroing_uses_global_group_ids_after_transfer_filtering():
+    sched = _make_read_scheduler()
+    sched.kv_cache_config.transfer_group_ids = (2, 1)
+    request = _make_read_request([[10], [91]])
+    sched._reqs_need_recv["req"] = (request, [[101], [202]])
+    output = SchedulerOutput.make_empty()
+    output.new_block_ids_to_zero = [(0, [101]), (2, [101, 102])]
+
+    sched.build_connector_meta(output)
+
+    assert output.new_block_ids_to_zero == [(0, [101]), (2, [102])]
 
 
 def test_update_state_pairs_shorter_local_blocks_with_remote_suffix():

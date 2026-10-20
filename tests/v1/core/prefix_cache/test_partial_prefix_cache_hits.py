@@ -436,6 +436,7 @@ def test_hybrid_mamba_align_partial_hash_hit():
         KVCacheBlockCopy(
             src_block_id=partial_mamba_block[0].block_id,
             dst_block_id=mamba_new_block_ids[0],
+            group_id=1,
         )
         in copies
     )
@@ -624,7 +625,7 @@ def test_partial_hit_then_internal_checkpoint_uses_distinct_mamba_blocks():
     assert realigned_blocks is not None
     mamba_cow_block_id = realigned_blocks.get_block_ids()[1][0]
     copies, retained = manager.take_kv_cache_block_copies()
-    assert KVCacheBlockCopy(partial_block_id, mamba_cow_block_id) in copies
+    assert KVCacheBlockCopy(partial_block_id, mamba_cow_block_id, group_id=1) in copies
     manager.block_pool.free_blocks(retained)
 
     replay.num_computed_tokens = 8
@@ -1457,6 +1458,7 @@ def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
         KVCacheBlockCopy(
             src_block_id=moved_block_id,
             dst_block_id=mamba_new_block_ids[0],
+            group_id=1,
         )
         in copies
     )
@@ -1995,6 +1997,8 @@ def test_mamba_align_split_stops_below_eagle_proof_boundary():
         mamba_partial_cache_hit=True,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_prefill_alignment=block_size,
+        needs_mamba_cache_alignment=True,
     )
     split = Scheduler._mamba_block_aligned_split
 
@@ -2446,7 +2450,10 @@ def test_hybrid_partial_hash_hit_uses_cow_under_dcp(dcp_world_size: int):
     copies, retained = manager.take_kv_cache_block_copies()
     assert KVCacheBlockCopy(partial_full_block[0].block_id, full_new_block_id) in copies
     assert (
-        KVCacheBlockCopy(partial_mamba_block[0].block_id, mamba_new_block_id) in copies
+        KVCacheBlockCopy(
+            partial_mamba_block[0].block_id, mamba_new_block_id, group_id=1
+        )
+        in copies
     )
     manager.block_pool.free_blocks(retained)
 

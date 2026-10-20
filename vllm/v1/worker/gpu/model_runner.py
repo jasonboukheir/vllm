@@ -184,6 +184,8 @@ from vllm.v1.worker.utils import (
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
+    prepare_kernel_block_sizes,
+    zero_mamba_block_ids,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
@@ -612,6 +614,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        if self.cache_config.cache_dtype.startswith("kvarn_"):
+            from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
+
+            KVarNAttentionImpl.reset_cache_state()
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -671,6 +677,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.vllm_config,
                 self.device,
                 draft_layer_names=draft_attn_layer_names,
+                active_layer_names=(
+                    target_attn_layer_names
+                    if self.cache_config.cache_dtype.startswith("kvarn_")
+                    else None
+                ),
             )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
@@ -765,6 +776,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers,
                 self.attn_groups,
             )
+            self.kernel_block_sizes = prepare_kernel_block_sizes(
+                self.kv_cache_config,
+                [
+                    target + draft
+                    for target, draft in zip(
+                        self.attn_groups, self.speculator.attn_groups
+                    )
+                ],
+            )
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
@@ -807,10 +827,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
         self.kv_block_zeroer = KVBlockZeroer(
             self.device,
-            attn_groups_iter=(g for groups in self.attn_groups for g in groups),
+            attn_groups_iter=(
+                g
+                for groups in self.attn_groups
+                + getattr(self.speculator, "attn_groups", [])
+                for g in groups
+            ),
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
-            num_blocks=self.kv_cache_config.num_blocks,
+            num_blocks=[
+                self.kv_cache_config.num_blocks_for_group(group_id)
+                for group_id in range(self.kv_cache_config.num_managed_groups)
+            ],
+            group_pool_ids=[
+                self.kv_cache_config.pool_id_for_group(group_id)
+                for group_id in range(self.kv_cache_config.num_managed_groups)
+            ],
+        )
+        # Every physical pool owns block zero as a null/sentinel page. Graph
+        # padding can read it, so initialize attention and recurrent storage
+        # once before warmup rather than treating a new request as ownership.
+        self.kv_block_zeroer.zero_block_ids([0])
+        zero_mamba_block_ids(
+            self.kv_cache_config,
+            self.compilation_config.static_forward_context,
+            [
+                (group_id, [0])
+                for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ],
+            self.device,
         )
 
     @torch.inference_mode()
@@ -1258,14 +1304,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
-            self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            self.kv_block_zeroer.zero_block_ids_by_group(
+                scheduler_output.new_block_ids_to_zero
+            )
+        if scheduler_output.new_mamba_block_ids_to_zero:
+            zero_mamba_block_ids(
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
+                scheduler_output.new_mamba_block_ids_to_zero,
+                self.device,
+            )
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
                 scheduler_output.kv_cache_block_copies,
             )
 
@@ -1728,6 +1783,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            if self.cache_config.cache_dtype.startswith("kvarn_"):
+                # Deferred stores must finish before zeroing/COW can reuse a
+                # preempted page. Restores run after those writes, below.
+                self.kv_connector.prepare_cache_update(scheduler_output)
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
@@ -1883,6 +1942,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_reqs_padded=input_batch.num_reqs_after_padding,
             )
 
+        # KVarN metadata claims mutable resident pages. Complete required RAM
+        # restores and preemption fences before those claims observe the cache.
+        early_kv_load = self.cache_config.cache_dtype.startswith("kvarn_")
+        if early_kv_load:
+            self.kv_connector.pre_forward(scheduler_output, input_batch)
+
         attn_metadata = None
         slot_mappings_by_layer = None
         ubatch_state: UBatchState | None = None
@@ -2000,9 +2065,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(
-                scheduler_output, input_batch, attn_metadata=attn_metadata
-            )
+            if not early_kv_load:
+                self.kv_connector.pre_forward(
+                    scheduler_output, input_batch, attn_metadata=attn_metadata
+                )
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
@@ -2025,7 +2091,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
             ):
-                self.kv_connector.pre_forward(scheduler_output, input_batch)
+                if not early_kv_load:
+                    self.kv_connector.pre_forward(scheduler_output, input_batch)
                 if ubatch_state is not None:
                     assert self.ubatch_runner is not None
                     model_output = self.ubatch_runner.run(
@@ -2338,6 +2405,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        if self.cache_config.cache_dtype.startswith("kvarn_"):
+            from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
+
+            KVarNAttentionImpl.reset_process_state()
         if self.aux_output_connector is not None:
             self.aux_output_connector.close()
         set_offloader(None)

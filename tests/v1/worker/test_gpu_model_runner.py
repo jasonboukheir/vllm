@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -417,6 +418,136 @@ def test_sample_tokens_skips_pp_group_lookup_without_async_scheduling(
 
     output = GPUModelRunner.sample_tokens(runner, None)
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("profile_change", "seq_len", "expected_draft_count"),
+    [
+        (None, 4095, 0),
+        (None, 4096, 0),
+        (None, 4094, 2),
+        (None, 4097, None),
+        ("no_connector", 4095, None),
+        ("other_connector", 4095, None),
+        ("other_offload_spec", 4095, None),
+        ("other_cache_dtype", 4095, None),
+        ("other_drafter", 4095, None),
+    ],
+)
+def test_sample_tokens_populates_offloaded_mtp_cache_at_context_limit(
+    profile_change, seq_len, expected_draft_count
+):
+    """A cache-only MTP forward must never publish its empty draft tensor."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    transfer_config = SimpleNamespace(
+        kv_connector="OffloadingConnector",
+        kv_connector_extra_config={"spec_name": "IndependentCPUOffloadingSpec"},
+    )
+    runner.vllm_config = SimpleNamespace(kv_transfer_config=transfer_config)
+    runner.cache_config = SimpleNamespace(cache_dtype="kvarn_k4v2_g128_compact")
+    runner.speculative_config = SimpleNamespace(
+        method="mtp",
+        disable_padded_drafter_batch=False,
+        use_eagle=lambda: True,
+        use_dflash=lambda: False,
+        uses_draft_model=lambda: False,
+        uses_extract_hidden_states=lambda: False,
+        use_ngram_gpu=lambda: False,
+    )
+    if profile_change == "no_connector":
+        runner.vllm_config.kv_transfer_config = None
+    elif profile_change == "other_connector":
+        transfer_config.kv_connector = "OtherConnector"
+    elif profile_change == "other_offload_spec":
+        transfer_config.kv_connector_extra_config["spec_name"] = "CPUOffloadingSpec"
+    elif profile_change == "other_cache_dtype":
+        runner.cache_config.cache_dtype = "auto"
+    elif profile_change == "other_drafter":
+        runner.speculative_config.method = "eagle"
+
+    runner.num_spec_tokens = 2
+    runner.effective_drafter_max_model_len = 4096
+    runner.use_async_scheduling = False
+    runner.use_aux_hidden_state_outputs = False
+    runner.supports_mm_inputs = False
+    runner.device = torch.device("cpu")
+    runner.parallel_config = SimpleNamespace(data_parallel_size=1)
+    runner.input_batch = SimpleNamespace(req_ids=["request"], sampling_metadata=Mock())
+    runner.input_ids = SimpleNamespace(gpu=torch.arange(128))
+    runner.requests = {}
+    runner.discard_request_mask = SimpleNamespace(gpu=torch.tensor([False]))
+    runner.valid_sampled_token_count_event = object()
+    runner._get_positions = lambda count: torch.arange(count)
+    runner.get_model = lambda: SimpleNamespace()
+    runner._copy_valid_sampled_token_count = Mock()
+    runner._update_states_after_model_execute = Mock()
+    runner.finalize_kv_connector = Mock()
+    runner.eplb_step = Mock()
+    runner.kv_connector_output = None
+
+    sampled = torch.tensor([[7]], dtype=torch.int64)
+    runner._sample = Mock(return_value=SimpleNamespace(sampled_token_ids=sampled))
+    runner.drafter = Mock(spec=gpu_model_runner_module.EagleProposer)
+    runner.drafter.prepare_next_token_ids_padded.return_value = (
+        sampled[:, 0],
+        torch.ones(1, dtype=torch.int32),
+    )
+    runner.drafter.propose.side_effect = lambda **kwargs: torch.full(
+        (1, kwargs["num_speculative_tokens"]), 11, dtype=torch.int64
+    )
+    runner.drafter.take_last_draft_probs.return_value = None
+    copied_drafts = []
+
+    def copy_draft_token_ids(scheduler_output, *, zeros_only=False):
+        copied_drafts.append((runner._draft_token_ids.clone(), zeros_only))
+
+    runner._copy_draft_token_ids_to_cpu = copy_draft_token_ids
+    scheduler_output = _schedule_cached_requests(
+        ["request"], {"request": 128}, [[]], [seq_len - 128], [0]
+    )
+    scheduler_output.num_spec_tokens_to_schedule = 2
+    common_metadata = SimpleNamespace(max_seq_len=seq_len, num_actual_tokens=128)
+    hidden_states = torch.zeros(128, 4)
+    runner.execute_model_state = gpu_model_runner_module.ExecuteModelState(
+        scheduler_output,
+        torch.zeros(1, 16),
+        None,
+        common_metadata,
+        hidden_states,
+        hidden_states[-1:],
+        None,
+        None,
+        None,
+        None,
+    )
+    runner._bookkeeping_sync = Mock(
+        return_value=(0, None, None, [[7]], {}, ["request"], {"request": 0}, [])
+    )
+
+    output = runner.sample_tokens(None)
+
+    assert output.sampled_token_ids == [[7]]
+    assert scheduler_output.num_spec_tokens_to_schedule == 2
+    if expected_draft_count is None:
+        runner.drafter.propose.assert_not_called()
+    else:
+        runner.drafter.propose.assert_called_once()
+        assert (
+            runner.drafter.propose.call_args.kwargs["num_speculative_tokens"]
+            == expected_draft_count
+        )
+        assert (
+            runner.drafter.propose.call_args.kwargs["common_attn_metadata"]
+            is common_metadata
+        )
+    runner._copy_valid_sampled_token_count.assert_called_once()
+    runner.finalize_kv_connector.assert_called_once()
+    assert len(copied_drafts) == 1
+    draft_ids, zeros_only = copied_drafts[0]
+    assert draft_ids.shape == (1, 2)
+    assert zeros_only is (expected_draft_count != 2)
+    assert torch.all(draft_ids == (11 if expected_draft_count == 2 else 0))
 
 
 def test_select_common_block_size_no_valid_option():
@@ -1779,6 +1910,55 @@ def test_hybrid_cache_integration(default_vllm_config, dist_init):
     assert _is_req_state_block_table_match(runner, req_id)
 
 
+@pytest.mark.parametrize(
+    ("backend_name", "drafter_state", "expected_layers"),
+    [
+        ("KVARN", "present", ["target.attn"]),
+        ("KVARN", "none", ["target.attn", "draft.attn"]),
+        ("KVARN", "absent", ["target.attn", "draft.attn"]),
+        ("FLASH_ATTN", "present", ["target.attn", "draft.attn"]),
+        ("FLASH_ATTN", "absent", ["target.attn", "draft.attn"]),
+    ],
+)
+def test_target_kvarn_builder_does_not_own_draft_cache(
+    monkeypatch, backend_name, drafter_state, expected_layers
+):
+    """A target flush must not retag or flush the drafter's independent pool."""
+    backend = Mock()
+    backend.get_name.return_value = backend_name
+    backend.full_cls_name.return_value = ("test", backend_name)
+    layers = {name: Mock(num_heads=24) for name in ["target.attn", "draft.attn"]}
+    for layer in layers.values():
+        layer.get_attn_backend.return_value = backend
+    monkeypatch.setattr(
+        gpu_model_runner_module, "get_layers_from_vllm_config", lambda *args: layers
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module, "check_attention_cp_compatibility", lambda *args: None
+    )
+    runner = SimpleNamespace(
+        attn_groups=[],
+        vllm_config=Mock(),
+        kv_sharing_fast_prefill_eligible_layers=set(),
+        _check_and_update_cudagraph_mode=Mock(),
+    )
+    # MTP-off and non-final pipeline ranks do not create a drafter attribute.
+    if drafter_state != "absent":
+        runner.drafter = (
+            SimpleNamespace(_draft_attn_layer_names={"draft.attn"})
+            if drafter_state == "present"
+            else None
+        )
+    spec = FullAttentionSpec(
+        block_size=128, num_kv_heads=4, head_size=256, dtype=torch.uint8
+    )
+    group = KVCacheGroupSpec(layer_names=list(layers), kv_cache_spec=spec)
+    config = KVCacheConfig(num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[group])
+    GPUModelRunner.initialize_attn_backend(runner, config)
+    assert runner.attn_groups[0][0].layer_names == expected_layers
+    assert group.layer_names == ["target.attn", "draft.attn"]
+
+
 def test_is_uniform_decode() -> None:
     # Normal
     assert GPUModelRunner._is_uniform_decode(
@@ -1967,3 +2147,71 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_kvarn_cleanup_releases_target_and_draft_cache_owners(monkeypatch, shutdown):
+    from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: False)
+    monkeypatch.setattr(
+        "vllm.v1.worker.workspace.reset_workspace_manager", lambda: None
+    )
+    KVarNAttentionImpl.reset_process_state()
+    try:
+        runner = object.__new__(GPUModelRunner)
+        runner.cache_config = SimpleNamespace(
+            cache_dtype="kvarn_k4v2_g128_compact", num_gpu_blocks=2
+        )
+        runner.kv_cache_config = object()
+        runner.attn_groups = []
+        runner.kv_caches = []
+        context = {}
+        owners: list[weakref.ReferenceType[torch.Tensor]] = []
+        layers = []
+        generation = KVarNAttentionImpl._process_generation
+        for name in ("target", "draft"):
+            impl = object.__new__(KVarNAttentionImpl)
+            impl._group_key = (name,)
+            impl._tails = {1: torch.ones(2)}
+            impl._kv_cache_ref = torch.ones(2, 4)
+            impl._tail_K_pool = torch.ones(2, 4)
+            impl._native_decode_scratch = (torch.ones(2),)
+            impl._bound_qlen1_inline_v2_plan = SimpleNamespace(
+                cache_owner=impl._kv_cache_ref
+            )
+            owners.extend(
+                weakref.ref(value)
+                for value in (
+                    impl._tails[1],
+                    impl._kv_cache_ref,
+                    impl._tail_K_pool,
+                    impl._native_decode_scratch[0],
+                )
+            )
+            context[name] = SimpleNamespace(impl=impl, kv_cache=impl._kv_cache_ref)
+            runner.kv_caches.append(impl._kv_cache_ref)
+            KVarNAttentionImpl._all_impls.append(impl)
+            layers.append(impl)
+        runner.compilation_config = SimpleNamespace(static_forward_context=context)
+        runner.model = object()
+        if shutdown:
+            runner.shutdown()
+        else:
+            runner._cleanup_profiling_kv_cache()
+        assert all(owner() is None for owner in owners)
+        assert KVarNAttentionImpl._process_generation > generation
+        assert not runner.kv_caches
+        assert not hasattr(runner, "kv_cache_config")
+        assert all(layer._bound_qlen1_inline_v2_plan is None for layer in layers)
+        if shutdown:
+            assert not KVarNAttentionImpl._all_impls
+            assert not context
+            assert runner.model is None
+        else:
+            assert KVarNAttentionImpl._all_impls == layers
+            assert KVarNAttentionImpl._impls_for_group(("draft",)) == layers[1:]
+    finally:
+        KVarNAttentionImpl.reset_process_state()

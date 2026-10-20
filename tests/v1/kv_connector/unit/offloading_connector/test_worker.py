@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
+    KVCachePoolSpec,
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
@@ -519,6 +520,48 @@ def test_register_kv_caches(backend):
             assert actual.page_size_bytes == expected.page_size_bytes
             # Every layer gets a canonical mapping, certified or opaque
             assert actual.mapping is not None
+
+
+def test_register_independent_kv_pools_preserves_each_tensor_capacity():
+    """A small recurrent pool must not truncate the larger attention pool."""
+    attention = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    recurrent = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((32,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attention"], attention),
+            KVCacheGroupSpec(["recurrent"], recurrent),
+        ],
+        kv_cache_pools=[
+            KVCachePoolSpec(num_blocks=11, group_ids=[0]),
+            KVCachePoolSpec(num_blocks=3, group_ids=[1]),
+        ],
+    )
+    tensors = {
+        "attention": torch.zeros((11, attention.page_size_bytes), dtype=torch.uint8),
+        "recurrent": torch.zeros((3, recurrent.page_size_bytes), dtype=torch.uint8),
+    }
+    worker, spec = _make_worker(config)
+    worker.register_kv_caches(tensors)
+    canonical = spec.get_worker.call_args.args[0]
+    for group_id, (name, original) in enumerate(tensors.items()):
+        [ref] = canonical.group_data_refs[group_id]
+        view = canonical.tensors[ref.tensor_idx].tensor
+        assert view.shape == original.shape
+        assert view.data_ptr() == original.data_ptr()
+        view[-1].fill_(group_id + 1)
+        assert torch.all(original[-1] == group_id + 1)
 
 
 def test_register_packed_kv_caches_skips_scratch_group():
